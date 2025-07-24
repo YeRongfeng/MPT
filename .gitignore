@@ -1,5 +1,8 @@
 # Cache files
 .vscode
+.codebuddy
+.history
+.Trash-0
 
 # 3rd party files
 vision_transformer/**
