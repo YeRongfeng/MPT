@@ -8,6 +8,7 @@ vision_transformer/**
 vit-pytorch/**
 pytorch-receptive-field/**
 torch_receptive_field/**
+ompl
 
 # Jupyter notebooks
 .ipynb_checkpoints/**
@@ -15,5 +16,6 @@ torch_receptive_field/**
 
 
 **/__pycache__/**
+__pycache__
 
 *.png

@@ -7,12 +7,8 @@ import io
 
 import numpy as np
 
-try:
-    from ompl import base as ob
-    from ompl import geometric as og
-    from ompl import util as ou
-except ImportError:
-    raise ImportError("Container does not have OMPL installed")
+# OMPL imports moved to where they're actually needed
+# This allows the module to be imported even without OMPL installed
 
 
 def png_decoder(key, value):
@@ -63,7 +59,7 @@ def geom2pix(pos, res=0.05, size=(480, 480)):
     return (np.int(np.floor(pos[0]/res)), np.int(size[0]-1-np.floor(pos[1]/res)))
 
 
-class ValidityChecker(ob.StateValidityChecker):
+class ValidityChecker:
     '''A class to check if an obstacle is in collision or not.
     '''
     def __init__(self, si, CurMap, MapMask=None, res=0.05, robot_radius=0.1):

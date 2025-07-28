@@ -995,7 +995,7 @@ class Transformer(nn.Module):
             torch.Tensor: 路径概率预测结果
                 形状：(batch_size, seq_len, num_classes)
                 内容：每个位置的类别概率分布
-                  - seq_len：等于height×width，地图展平后的序列长度
+                  - seq_len：等于3×3=9，表示卷积后的空间位置数量
                   - num_classes：通常为2(可通行/不可通行)
                 数值范围：经过softmax后的概率值[0,1]
                 用途：可用于路径规划、可达性分析等下游任务
@@ -1025,7 +1025,7 @@ class Transformer(nn.Module):
         ```python
         model = Transformer(...)
         input_map = torch.randn(4, 2, 64, 64)  # 4个64×64地图
-        output = model(input_map)  # 形状：(4, 4096, 2)
+        output = model(input_map)  # 形状：(4, 9, 2)
         probabilities = torch.softmax(output, dim=-1)  # 转换为概率
         ```
         

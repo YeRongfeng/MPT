@@ -1,16 +1,16 @@
-FROM ompl_bionic as BUILDER
+FROM ompl_bionic AS builder
 
-FROM nvidia/cuda:11.0-cudnn8-runtime-ubuntu18.04 AS BASE
+FROM nvidia/cuda:11.0-cudnn8-runtime-ubuntu18.04 AS base
 
-COPY --from=BUILDER /usr/local/include/ompl /usr/local/include/ompl
-COPY --from=BUILDER /usr/local/lib/libompl* /usr/local/lib/
-COPY --from=BUILDER /usr/local/share/ompl /usr/local/share/ompl
-COPY --from=BUILDER /usr/local/bin/ompl_benchmark_statistics.py /usr/local/bin/ompl_benchmark_statistics.py
-COPY --from=BUILDER /usr/local/share/man/man1/ompl_benchmark_statistics.1 /usr/local/share/man/man1/ompl_benchmark_statistics.1
-COPY --from=BUILDER /usr/local/share/man/man1/plannerarena.1 /usr/local/share/man/man1/plannerarena.1
-COPY --from=BUILDER /root/ompl /root/ompl
-COPY --from=BUILDER /usr/local/lib/pkgconfig/ompl.pc /usr/local/lib/pkgconfig/ompl.pc
-COPY --from=BUILDER /usr/lib/python3/dist-packages/ompl /usr/lib/python3/dist-packages/ompl
+COPY --from=builder /usr/local/include/ompl /usr/local/include/ompl
+COPY --from=builder /usr/local/lib/libompl* /usr/local/lib/
+COPY --from=builder /usr/local/share/ompl /usr/local/share/ompl
+COPY --from=builder /usr/local/bin/ompl_benchmark_statistics.py /usr/local/bin/ompl_benchmark_statistics.py
+COPY --from=builder /usr/local/share/man/man1/ompl_benchmark_statistics.1 /usr/local/share/man/man1/ompl_benchmark_statistics.1
+COPY --from=builder /usr/local/share/man/man1/plannerarena.1 /usr/local/share/man/man1/plannerarena.1
+COPY --from=builder /root/ompl /root/ompl
+COPY --from=builder /usr/local/lib/pkgconfig/ompl.pc /usr/local/lib/pkgconfig/ompl.pc
+COPY --from=builder /usr/lib/python3/dist-packages/ompl /usr/lib/python3/dist-packages/ompl
 
 # Files required for OMPL
 RUN apt-get update && apt-get install -y \
