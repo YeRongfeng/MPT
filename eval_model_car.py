@@ -395,17 +395,17 @@ class ValidityChecker(ob.StateValidityChecker):
         # 【有效性查询】查询预处理的有效性表
         return self.MaskMapDilate[pix_dim[1], pix_dim[0]]  # 返回该位置的有效性（True/False）
 
-# def get_path_sst(start, goal, input_map, patch_map):
-#     '''
-#     Plan a path using SST, but invert the start and goal location.
-#     :param start: The starting position on map co-ordinates.
-#     :param goal: The goal position on the map co-ordinates.
-#     :param input_map: The input map 
-#     :param patch_map: The patch map
-#     :returns 
-#     '''
-#     success, time, _, path = get_path(start, goal, input_map, patch_map, use_valid_sampler=True)
-#     return path, time, [], success
+def get_path_sst(start, goal, input_map, patch_map):
+    '''
+    Plan a path using SST, but invert the start and goal location.
+    :param start: The starting position on map co-ordinates.
+    :param goal: The goal position on the map co-ordinates.
+    :param input_map: The input map 
+    :param patch_map: The patch map
+    :returns 
+    '''
+    success, time, _, path = get_path(start, goal, input_map, patch_map, use_valid_sampler=True)
+    return path, time, [], success
 
 
 def get_path(start, goal, input_map, patch_map, step_time=0.1, max_time=300, exp=False):

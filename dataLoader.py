@@ -1074,6 +1074,161 @@ class PathDataLoader(Dataset):
         
         # 失败路径返回None，会在批处理时被过滤
         return None
+    
+class PathSE2DataLoader(Dataset):
+    """
+    PathSE2DataLoader - 基础路径数据加载器
+    """
+    
+    def __init__(self, env_list, dataFolder):
+        """
+        初始化基础路径数据加载器
+        
+        用于加载sst_map数据集中的路径数据，支持SE(2)坐标系的锚点分类任务。
+        在path_*.p文件中，路径数据以SE(2)坐标系表示，包含位置和朝向信息，比原来多了朝向信息。
+        
+        对于正样本而言，我们将它对应的朝向信息，设置为附近0.7倍的锚点距离内所有锚点的朝向的平均值。
+        """
+        assert isinstance(env_list, list), "env_list必须是列表类型"
+        
+        # 基本参数设置
+        self.num_env = len(env_list)
+        self.env_list = env_list
+        self.dataFolder = dataFolder
+        
+        # 构建完整路径索引（包含所有路径，不筛选成功性）
+        self.indexDict = [(envNum, i) 
+            for envNum in env_list 
+                for i in range(len(os.listdir(osp.join(dataFolder, f'env{envNum:06d}')))-1)
+            ]
+
+        print(f"基础数据加载器初始化完成：{len(self.indexDict)}个路径样本")
+    
+    def __len__(self):
+        """返回数据集大小"""
+        return len(self.indexDict)
+    
+    def __getitem__(self, idx):
+        """
+        获取指定索引的分类训练样本
+        
+        【核心功能】
+        生成用于锚点分类的训练样本，包括正负样本的平衡采样。
+        仅处理成功的路径数据，失败路径返回None。
+        
+        【处理流程】
+        1. 数据加载和验证
+        2. 输入编码生成
+        3. 正样本锚点提取
+        4. 负样本随机采样
+        5. 样本标签构建
+        
+        Args:
+            idx (int): 样本索引
+        
+        Returns:
+            dict or None: 分类训练样本或None（失败路径）
+                'map': 编码后的地图输入，形状(2, H, W)
+                'anchor': 锚点索引序列，形状(N,)
+                'labels': 锚点标签序列，形状(N,)
+        
+        【样本平衡策略】
+        1. 正样本：路径经过的锚点，标签为1
+        2. 负样本：路径未经过的锚点，标签为0
+        3. 数量比例：负样本数量 = min(可用负样本, 2×正样本数量)
+        4. 随机采样：负样本随机选择，增加多样性
+        
+        【技术细节】
+        1. 成功性检查：仅处理success=True的路径
+        2. 去重处理：正样本锚点去重，避免重复
+        3. 集合运算：使用集合差集快速找到负样本候选
+        4. 无重复采样：replace=False确保负样本不重复
+        """
+        # 【步骤1】解析索引并加载数据
+        env, idx_sample = self.indexDict[idx]
+        
+        # 加载地图
+        map_path = osp.join(self.dataFolder, f'env{env:06d}', f'map_{env}.png')
+        mapEnvg = skimage.io.imread(map_path, as_gray=True)
+        
+        # 加载路径数据
+        path_file = osp.join(self.dataFolder, f'env{env:06d}', f'path_{idx_sample}.p')
+        with open(path_file, 'rb') as f:
+            data = pickle.load(f)
+
+        # 【步骤2】仅处理成功的路径
+        if data['success']:
+            path = data['path_interpolated']
+            
+            # 【步骤3】生成编码输入（4通道：地图、起终点坐标、sin(theta)、cos(theta)）
+            goal_index = geom2pix(path[-1, :])   # 终点坐标转换
+            start_index = geom2pix(path[0, :])   # 起点坐标转换
+            map_size = mapEnvg.shape
+            context_map = np.zeros(map_size)  # 起终点坐标通道
+            sin_map = np.zeros(map_size)      # 起终点sin(theta)通道
+            cos_map = np.zeros(map_size)      # 起终点cos(theta)通道
+            receptive_field = 32
+            # 起点区域
+            start_theta = path[0, 2]
+            start_start_y = max(0, start_index[0] - receptive_field//2)
+            start_start_x = max(0, start_index[1] - receptive_field//2)
+            start_end_y = min(map_size[0], start_index[0] + receptive_field//2)
+            start_end_x = min(map_size[1], start_index[1] + receptive_field//2)
+            context_map[start_start_y:start_end_y, start_start_x:start_end_x] = -1.0
+            sin_map[start_start_y:start_end_y, start_start_x:start_end_x] = np.sin(start_theta)
+            cos_map[start_start_y:start_end_y, start_start_x:start_end_x] = np.cos(start_theta)
+            # 终点区域
+            goal_theta = path[-1, 2]
+            goal_start_y = max(0, goal_index[0] - receptive_field//2)
+            goal_start_x = max(0, goal_index[1] - receptive_field//2)
+            goal_end_y = min(map_size[0], goal_index[0] + receptive_field//2)
+            goal_end_x = min(map_size[1], goal_index[1] + receptive_field//2)
+            context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x] = 1.0
+            sin_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x] = np.sin(goal_theta)
+            cos_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x] = np.cos(goal_theta)
+            # 拼接为4通道
+            mapEncoder = np.concatenate((mapEnvg[None, :], context_map[None, :], sin_map[None, :], cos_map[None, :]), axis=0)
+
+            # 【步骤4】提取正样本锚点及其朝向
+            AnchorPointsPos = []      # 正样本锚点索引列表
+            AnchorPointsTheta = []    # 正样本锚点对应的平均朝向
+            path_xy = path[:, :2]     # 轨迹的xy坐标
+            path_theta = path[:, 2]   # 轨迹的朝向（假定第三维为theta）
+            for i, pos in enumerate(path):
+                indices, = geom2pixMatpos(pos)
+                for index in indices:
+                    if index not in AnchorPointsPos:
+                        # 计算该锚点附近0.7米范围内所有轨迹点的平均朝向
+                        dists = np.linalg.norm(path_xy - pos[:2], axis=1)
+                        nearby_theta = path_theta[dists < 0.7]
+                        if len(nearby_theta) > 0:
+                            avg_theta = np.mean(nearby_theta)
+                        else:
+                            avg_theta = pos[2]  # 若无邻近点则用自身朝向
+                        AnchorPointsPos.append(index)
+                        AnchorPointsTheta.append(avg_theta)
+
+            # 【步骤5】生成负样本锚点（不关联朝向）
+            backgroundPoints = list(set(range(len(hashTable))) - set(AnchorPointsPos))
+            numBackgroundSamp = min(len(backgroundPoints), 2 * len(AnchorPointsPos))
+            AnchorPointsNeg = np.random.choice(backgroundPoints, size=numBackgroundSamp, replace=False).tolist()
+            # 负样本朝向用0填充（或可用nan）
+            AnchorPointsThetaNeg = [0.0] * len(AnchorPointsNeg)
+            # 【步骤6】构建最终的锚点序列、标签和朝向
+            anchor = torch.cat((torch.tensor(AnchorPointsPos), torch.tensor(AnchorPointsNeg)))
+            labels = torch.zeros_like(anchor)
+            labels[:len(AnchorPointsPos)] = 1
+            # 拼接正负样本的朝向
+            anchor_theta = torch.tensor(AnchorPointsTheta + AnchorPointsThetaNeg)
+            return {
+                'map': torch.as_tensor(mapEncoder),      # 编码后的地图输入
+                'anchor': anchor,                        # 锚点索引序列
+                'labels': labels,                        # 锚点分类标签
+                'anchor_theta': anchor_theta              # 锚点对应的平均朝向
+            }
+        
+        # 失败路径返回None，会在批处理时被过滤
+        return None
 
 class PathMixedDataLoader(Dataset):
     """

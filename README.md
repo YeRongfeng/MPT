@@ -35,12 +35,20 @@ To generate training or validation data set for the point environment you can ru
 
 ```
 python3 rrt_star_map.py --start=... --numEnv=... --envType=... --numPaths=... --fileDir=... --mapFile
+
+uv run rrt_star_map.py --start=0 --numEnv=100 --envType=forest --numPaths=25 --fileDir=data/forest
+
+uv run rrt_star_map.py --start=0 --numEnv=1750 --envType=forest --numPaths=25 --fileDir=data/forest/train
 ```
 
 To collect data samples for the car environment you can run the following command:
 
 ```
 python3 sst_map.py --start=... --numEnv=... --numPaths=... --fileDir=...
+
+uv run sst_map.py --start=... --numEnv=... --numPaths=... --fileDir=...
+
+uv run se2_map_gpu.py --start=0 --numEnv=300 --numPaths=25 --fileDir=data/forest/train --workers=12
 ```
 
 You can download all the data we used for training from [here](https://drive.google.com/drive/folders/1uP_l_pLLljRv6sn5xlcCkq3iTiuKHdDA?usp=sharing).
@@ -51,6 +59,8 @@ To train the data, run the following command:
 
 ```
 python3 train.py --batchSize=... --mazeDir=... --forestDir=... --fileDir=...
+
+uv run train.py --batchSize=32 --forestDir=data/forest --fileDir=data/point_robot
 ```
 
 ### Pre-trained Models
@@ -62,6 +72,8 @@ To evaluate a set of validation paths, you can run the following code:
 
 ```
 python3 eval_model.py --modelFolder=... --valDataFolder=... --start=... --numEnv=... --epoch=... --numPaths=...
+
+uv run eval_model.py --modelFolder=data/point_robot --valDataFolder=data/forest/val --start=0 --numEnv=11 --epoch=5 --numPaths=25 --segmentType=mpt --plannerType=rrtstar
 ```
 
 

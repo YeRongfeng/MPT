@@ -119,6 +119,7 @@ dependencies = [
     "torchaudio",
     "torchvision",
     # "ompl-thin==0.0.18",
+    "cupy-cuda12x>=12.0.0",
 ]
 
 [tool.uv.sources]

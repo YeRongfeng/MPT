@@ -128,6 +128,11 @@ def get_path(start, goal, input_map, patch_map, plannerType, cost, exp=False):
         solved = planner.solve(1.0)
         if not pdef.hasExactSolution():
             NewValidityCheckerObj = ValidityChecker(si, input_map)
+            # NewValidityCheckerObj = ValidityChecker(
+            #     si, input_map, patch_map,
+            #     res=ValidityCheckerObj.resolution,
+            #     robot_radius=ValidityCheckerObj.robot_radius
+            # )
             si.setStateValidityChecker(NewValidityCheckerObj)
             solved = planner.solve(89.0)
         planTime = time.time()-startTime

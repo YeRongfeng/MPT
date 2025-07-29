@@ -1,36 +1,5 @@
 """
-train.py - Transformer路径规划模型训练脚本
-
-【核心功能】
-本脚本实现了基于Transformer架构的路径规划神经网络模型的训练流程，
-支持在迷宫(Maze)和随机森林(Random Forest)两种环境下进行训练和验证。
-
-【技术特点】
-1. 多环境训练：支持单一环境或混合环境(迷宫+随机森林)的训练
-2. 分布式训练：自动检测并利用多GPU进行数据并行训练
-3. 学习率调度：实现warm-up和衰减策略的学习率优化
-4. 训练监控：使用TensorBoard记录训练过程中的损失和准确率
-5. 模型保存：定期保存模型检查点，支持训练中断后恢复
-
-【训练流程】
-- 数据加载：从指定目录加载训练和验证数据
-- 模型初始化：构建Transformer模型并配置优化器
-- 训练循环：执行多轮训练-验证循环
-- 性能评估：计算损失和准确率指标
-- 结果保存：保存模型参数、训练进度和性能指标
-
-技术栈：
-- PyTorch 深度学习框架
-- TensorBoard 可视化工具
-- tqdm 进度显示
-- 自定义Transformer模型
-- 自定义数据加载器
-
-使用场景：
-- 路径规划模型训练
-- 深度学习模型性能评估
-- 多环境泛化能力测试
-- 模型超参数调优
+train_se2.py - 在原有的训练脚本上拓展了对锚点朝向的处理，以适应SE(2)环境的训练需求。
 """
 
 import numpy as np
@@ -49,7 +18,7 @@ from tqdm import tqdm
 from os import path as osp
 
 from transformer import Models, Optim
-from dataLoader import PathDataLoader, PaddedSequence, PathMixedDataLoader
+from dataLoader import PathSE2DataLoader, PaddedSequence, PathMixedDataLoader
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -107,9 +76,15 @@ def focal_loss(predVals, trueLabels, gamma, eps=1e-8):
     loss = torch.sum(target_one_hot*focal, dim=1).sum()  # 对所有样本和类别求和得到总损失
     return loss
 
-def cal_performance(predVals, anchorPoints, trueLabels, lengths):
+def cal_performance(predVals, anchorPoints, trueLabels, lengths, anchorThetas):
     """
-    计算模型性能指标
+    计算模型性能指标（支持SE2朝向损失）
+    
+    【新增】
+    在原有的性能计算基础上，增加了对锚点朝向的处理，以适应SE(2)环境的训练需求。
+    “maximizing cosine similarity measure for the orientation”
+    最大化余弦相似度度量朝向，鼓励模型学习到更准确的朝向信息，也就是新的loss，我们称它为orientation loss。
+    这个新的loss我们会在原有的交叉熵损失上加权求和。
     
     【核心功能】
     评估模型在给定批次数据上的性能，计算损失和正确预测的数量。
@@ -156,14 +131,25 @@ def cal_performance(predVals, anchorPoints, trueLabels, lengths):
     """
     n_correct = 0  # 初始化正确预测计数器
     total_loss = 0  # 初始化总损失
-    for predVal, anchorPoint, trueLabel, length in zip(predVals, anchorPoints, trueLabels, lengths):  # 遍历批次中的每个样本
-        predVal = predVal.index_select(0, anchorPoint[:length])  # 根据锚点索引提取对应位置的预测值，只考虑有效长度
-        trueLabel = trueLabel[:length]  # 截取有效长度的真实标签
-        loss = F.cross_entropy(predVal, trueLabel)  # 计算交叉熵损失
-        total_loss += loss  # 累加损失
-        classPred = predVal.max(1)[1]  # 获取预测类别：取每个位置预测分数最高的类别索引
-        n_correct += classPred.eq(trueLabel[:length]).sum().item()/length  # 计算正确预测的比例并累加
-    return total_loss, n_correct  # 返回总损失和平均正确预测数
+    orientation_weight = 0.2  # 朝向损失权重，可根据实验调整
+    for i, (predVal, anchorPoint, trueLabel, length, anchor_theta) in enumerate(zip(predVals, anchorPoints, trueLabels, lengths, anchorThetas)):
+        predVal_cls = predVal.index_select(0, anchorPoint[:length])
+        trueLabel = trueLabel[:length]
+        loss_cls = F.cross_entropy(predVal_cls[:, :2], trueLabel)
+        device = trueLabel.device if hasattr(trueLabel, 'device') else 'cpu'
+        pos_mask = (trueLabel == 1)
+        if pos_mask.sum() > 0:
+            pred_theta = predVal_cls[pos_mask, 2]
+            true_theta = anchor_theta[:length][pos_mask].to(device)
+            cos_sim = torch.cos(pred_theta - true_theta)
+            loss_orientation = 1.0 - cos_sim.mean()
+        else:
+            loss_orientation = torch.tensor(0.0, device=device)
+        loss = loss_cls + orientation_weight * loss_orientation
+        total_loss += loss
+        classPred = predVal_cls[:, :2].max(1)[1]
+        n_correct += classPred.eq(trueLabel).sum().item()/length
+    return total_loss, n_correct
 
 def train_epoch(model, trainingData, optimizer, device):
     """
@@ -410,20 +396,18 @@ if __name__ == "__main__":
         batch_sampler_val = list(partition(batch_size, allValData))  # 创建验证批次采样器
         validationData = DataLoader(valDataset, num_workers=5, batch_sampler=batch_sampler_val, collate_fn=PaddedSequence)  # 创建验证数据加载器：5个工作线程
     else:  # 如果只有一种环境      
-        trainDataset = PathDataLoader(  # 创建单一环境训练数据加载器
-            env_list=list(range(500)),  # 环境列表：0-1749
-            # env_list=list(range(100)),  # 环境列表：0-1749
-            dataFolder=osp.join(dataFolder, 'train')  # 训练数据文件夹
+        trainDataset = PathSE2DataLoader(  # 创建单一环境训练数据加载器（SE2）
+            env_list=list(range(500)),
+            dataFolder=osp.join(dataFolder, 'train')
         )
-        trainingData = DataLoader(trainDataset, num_workers=15, collate_fn=PaddedSequence, batch_size=batch_size)  # 创建训练数据加载器：15个工作线程
+        trainingData = DataLoader(trainDataset, num_workers=15, collate_fn=PaddedSequence, batch_size=batch_size)
 
         # Validation Data
-        valDataset = PathDataLoader(  # 创建单一环境验证数据加载器
-            # env_list=list(range(2500)),  # 环境列表：0-2499
-            env_list=list(range(500)),  # 环境列表：0-2499
-            dataFolder=osp.join(dataFolder, 'val')  # 验证数据文件夹
+        valDataset = PathSE2DataLoader(
+            env_list=list(range(500)),
+            dataFolder=osp.join(dataFolder, 'val')
         )
-        validationData = DataLoader(valDataset, num_workers=5, collate_fn=PaddedSequence, batch_size=batch_size)  # 创建验证数据加载器：5个工作线程
+        validationData = DataLoader(valDataset, num_workers=5, collate_fn=PaddedSequence, batch_size=batch_size)
 
     # Increase number of epochs.
     n_epochs = 70  # 设置训练轮数：70轮
