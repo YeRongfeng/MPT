@@ -1589,3 +1589,201 @@ class PathHardMineDataLoader(Dataset):
         
         # 失败路径返回None
         return None
+
+class UnevenPathDataLoader(Dataset):
+    """
+    UnevenPathDataLoader: 不平坦地面的路径数据加载器
+    
+    【核心功能】
+    从不平坦地面的路径规划数据集中加载训练样本，用于训练模型在复杂地形下的路径规划能力。
+    
+    【数据集特点】
+    1. 地图类型：包含不平坦地面的复杂环境
+    2. 地图尺寸：10m×10m，分辨率0.01m
+    3. 路径类型：包含成功和失败的路径规划任务
+    4. 数据格式：Pickle文件，包含地图和路径信息:
+    (1)地图文件：`map.p`
+    ```python
+    {
+        'tensor': np.array,          # [H, W, 4] 四通道张量
+        'bounds': (min_x, max_x, min_y, max_y),
+        'resolution': 0.2,           # 栅格分辨率
+        'map_name': 'desert',        # 地图名称
+        'channels': ['elevation', 'normal_x', 'normal_y', 'normal_z'],
+        'shape': (height, width, 4)
+    }
+    ```
+    例如：
+    ```python
+    {'tensor': array([
+        [[ 1.91332285e+00,  1.66046888e-01, -2.47567687e-02, 9.85807061e-01],
+         [ 1.89383935e+00,  1.66046888e-01, -2.47567687e-02, 9.85807061e-01],
+         [ 1.87698874e+00,  1.80939287e-01, -3.28837261e-02, 9.82944369e-01],
+         ...,
+         [ 7.89104671e-01,  7.29798600e-02, -3.43800820e-02, 9.96740639e-01],
+         [ 7.80242312e-01,  9.87786874e-02, -4.03737016e-02, 9.94290054e-01],
+         [ 7.70666865e-01,  9.87786874e-02, -4.03737016e-02, 9.94290054e-01]],
+
+        ...,
+
+        [[ 1.12184868e+00, -3.71789820e-02,  4.94028963e-02, 9.98086691e-01],
+         [ 1.12459070e+00, -3.71789820e-02,  4.94028963e-02, 9.98086691e-01],
+         [ 1.12810575e+00, -5.22360252e-03,  3.20198573e-02, 9.99473572e-01],
+         ...,  
+         [ 8.72300527e-01,  9.26663429e-02, -1.00500155e-02, 9.95646477e-01],
+         [ 8.60928348e-01,  1.48325890e-01,  3.07161896e-03, 9.88933742e-01],
+         [ 8.48599134e-01,  1.48325890e-01,  3.07161896e-03, 9.88933742e-01]]], shape=(100, 100, 4)), 
+      'bounds': (-5.0, 5.0, -5.0, 5.0), 
+      'resolution': 0.1, 
+      'map_name': 'desert', 
+      'channels': ['elevation', 'normal_x', 'normal_y', 'normal_z'], 
+      'shape': (100, 100, 4)}
+    ```
+    (2)轨迹文件：`path_{id}.p`
+    ```python
+    {
+        'path': np.array,            # [N, 3] 轨迹点 [x, y, yaw]
+        'map_name': 'desert'         # 关联的地图名称
+    }
+    ```
+    (3)目录格式：
+    ```
+    ├── desert/
+        |── map.p
+        ├── path_0.p
+        ├── path_1.p
+        └── ...
+    ├── forest/
+        ├── map.p
+        ├── path_0.p
+        ├── path_1.p
+        └── ...
+    └── ...
+    ```
+    
+    【数据加载示例】
+    ```python
+    import pickle
+    import numpy as np
+
+    # 加载地图数据
+    with open('map.p', 'rb') as f:
+        map_data = pickle.load(f)
+
+    tensor = map_data['tensor']  # [H, W, 4]
+    elevation = tensor[:, :, 0]
+    normal_x = tensor[:, :, 1]
+    normal_y = tensor[:, :, 2]
+    normal_z = tensor[:, :, 3]
+
+    # 加载轨迹数据
+    with open('path_0.p', 'rb') as f:
+        path_data = pickle.load(f)
+
+    trajectory = path_data['path']  # [N, 3]
+    map_name = path_data['map_name']  # 'desert'
+    ```
+
+    """
+
+    def __init__(self, env_list, dataFolder):
+        self.num_env = len(env_list)
+        self.env_list = env_list
+        self.dataFolder = dataFolder
+        self.env_index = {env_name: i for i, env_name in enumerate(env_list)}
+        self.indexDict = [(self.env_index[env_name], i) 
+            for env_name in env_list 
+                for i in range(len(os.listdir(osp.join(dataFolder, f'{env_name}')))-1)
+            ]
+        print(f"不平坦地面数据加载器初始化完成：{self.num_env}个环境，{len(self.indexDict)}个路径样本")
+    
+    def __len__(self):
+        return len(self.indexDict)
+    
+    def __getitem__(self, idx):
+        env_index, path_index = self.indexDict[idx]
+        env_name = self.env_list[env_index]
+        env_path = osp.join(self.dataFolder, env_name)
+        map_file = osp.join(env_path, 'map.p')
+        path_file = osp.join(env_path, f'path_{path_index}.p')
+        
+        # 1. 加载地图数据
+        with open(map_file, 'rb') as f:
+            map_data = pickle.load(f)
+        map_tensor = map_data['tensor']  # [H, W, 4]
+        elevation = map_tensor[:, :, 0]
+        normal_x = map_tensor[:, :, 1]
+        normal_y = map_tensor[:, :, 2]
+        normal_z = map_tensor[:, :, 3]
+        
+        # 2. 加载路径数据
+        with open(path_file, 'rb') as f:
+            path_data = pickle.load(f)
+        trajectory = path_data['path']  # [N, 3]
+        
+        # 3. 生成编码输入
+        path = trajectory[:, :3]  # [N, 3]
+        
+        goal_index = geom2pix(path[-1, :2], res=map_data['resolution'], size=map_tensor.shape[:2])
+        start_index = geom2pix(path[0, :2], res=map_data['resolution'], size=map_tensor.shape[:2])
+        
+        goal_start_x = max(0, start_index[0]- receptive_field//2)
+        goal_start_y = max(0, start_index[1]- receptive_field//2)
+        goal_end_x = min(map_tensor.shape[0], start_index[0]+ receptive_field//2)
+        goal_end_y = min(map_tensor.shape[1], start_index[1]+ receptive_field//2)
+        
+        start_start_x = max(0, goal_index[0]- receptive_field//2)
+        start_start_y = max(0, goal_index[1]- receptive_field//2)
+        start_end_x = min(map_tensor.shape[0], goal_index[0]+ receptive_field//2)
+        start_end_y = min(map_tensor.shape[1], goal_index[1]+ receptive_field//2)
+        
+        # 构造编码输入
+        context_map = np.zeros(map_tensor.shape[:2])  # [H, W]
+        context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x] = 1.0
+        context_map[start_start_y:start_end_y, start_start_x:start_end_x] = -1.0
+        
+        # 构造θ=<nx,ny>->(cosθ, sinθ)的映射
+        angle_map = np.zeros((map_tensor.shape[0], map_tensor.shape[1], 2))  # [H, W, 2]
+        for i in range(map_tensor.shape[0]):
+            for j in range(map_tensor.shape[1]):
+                theta = np.arctan2(normal_y[i, j], normal_x[i, j])
+                angle_map[i, j, 0] = np.cos(theta)
+                angle_map[i, j, 1] = np.sin(theta)
+        
+        # 拼接为4通道
+        encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, None], angle_map), axis=2)  # [H, W, 4]
+        
+        # 4. 提取正/负样本锚点
+        # 以轨迹的第n个点为中心，半径为0.7m的圆内所有锚点为正样本的第n个通道
+        AnchorPointsPos = []  # 正样本锚点索引列表
+        AnchorPointsNeg = []  # 负样本锚点索引列表
+        path_xy = trajectory[:, :2]  # [N, 2]
+        for i, pos in enumerate(path_xy):
+            indices, = geom2pixMatpos(pos, res=map_data['resolution'], size=map_tensor.shape[:2])
+            for index in indices:
+                if index not in AnchorPointsPos:
+                    dists = np.linalg.norm(path_xy - pos, axis=1)
+                    nearby_indices = np.where(dists < 0.7)[0]  # 找到距离小于0.7m的点
+                    # 先进行去重
+                    nearby_indices = list(set(nearby_indices))
+                    AnchorPointsPos.extend(nearby_indices.tolist())
+        # 最后拿到的AnchorPointsPos的尺寸是[N, M]，N是轨迹点的个数，M是每个轨迹点对应的锚点个数M_n对应的最大值
+        # 先求出AnchorPointsPos中每个轨迹点对应的锚点个数的最大值
+        max_num_anchor = max([len(indices) for indices in AnchorPointsPos]) # M = max(M_n)
+        # 生成负样本，分别对第n个通道进行随机采样
+        for i, pos in enumerate(AnchorPointsPos):
+            backgroundPoints = list(set(range(len(hashTable))) - set(pos))
+            numBackgroundSamp = min(len(backgroundPoints), max_num_anchor)
+            AnchorPointsNeg.append(np.random.choice(backgroundPoints, size=numBackgroundSamp, replace=False).tolist())
+        
+        # 5. 构造样本
+        anchor = torch.cat((torch.tensor(AnchorPointsPos), torch.tensor(AnchorPointsNeg)))
+        labels = torch.zeros_like(anchor)
+        labels[:len(AnchorPointsPos)] = 1      
+        
+        # 转换为PyTorch张量
+        return {
+            'map': torch.as_tensor(encoded_input[None, :], dtype=torch.float),  # 地图：(1, H, W, 4)
+            'anchor': anchor,  # 锚点索引：(N, M)
+            'labels': labels  # 锚点标签：(N, M)
+        }

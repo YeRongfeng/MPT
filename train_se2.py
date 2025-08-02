@@ -205,10 +205,12 @@ def train_epoch(model, trainingData, optimizer, device):
         predVal = model(encoder_input)  # 前向传播：获取模型预测值
 
         # Calculate the cross-entropy loss
-        loss, n_correct = cal_performance(  # 计算性能指标：损失和正确预测数
-            predVal, batch['anchor'].to(device),  # 预测值和锚点索引
-            batch['labels'].to(device),  # 真实标签
-            batch['length'].to(device)  # 序列有效长度
+        # 增加 anchor_theta 参数
+        loss, n_correct = cal_performance(
+            predVal, batch['anchor'].to(device),
+            batch['labels'].to(device),
+            batch['length'].to(device),
+            batch['anchor_theta'].to(device)
         )
         loss.backward()  # 反向传播：计算梯度
         optimizer.step_and_update_lr()  # 参数更新：同时更新模型参数和学习率
@@ -267,11 +269,13 @@ def eval_epoch(model, validationData, device):
             encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
             predVal = model(encoder_input)  # 前向传播：获取模型预测值
 
-            loss, n_correct = cal_performance(  # 计算性能指标：损失和正确预测数
-                predVal, 
-                batch['anchor'].to(device),  # 锚点索引
-                batch['labels'].to(device),  # 真实标签
-                batch['length'].to(device)  # 序列有效长度
+            # 增加 anchor_theta 参数
+            loss, n_correct = cal_performance(
+                predVal,
+                batch['anchor'].to(device),
+                batch['labels'].to(device),
+                batch['length'].to(device),
+                batch['anchor_theta'].to(device)
             )
 
             total_loss += loss.item()  # 累加批次损失
@@ -458,7 +462,7 @@ if __name__ == "__main__":
                 'valNCorrect':val_n_correct_list  # 验证正确预测历史
             }, 
             open(osp.join(trainDataFolder, 'progress.pkl'), 'wb')  # 以二进制写入模式保存到progress.pkl文件
-            )
+        )
         writer.add_scalar('Loss/train', train_total_loss, n)  # 记录训练损失到TensorBoard
         writer.add_scalar('Loss/test', val_total_loss, n)  # 记录验证损失到TensorBoard
         writer.add_scalar('Accuracy/train', train_n_correct/len(trainDataset), n)  # 记录训练准确率到TensorBoard

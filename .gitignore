@@ -9,7 +9,10 @@ vit-pytorch/**
 pytorch-receptive-field/**
 torch_receptive_field/**
 ompl
+
+# data files
 data/**
+predictions
 
 # Jupyter notebooks
 .ipynb_checkpoints/**

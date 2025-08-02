@@ -8,7 +8,7 @@ All our experiments were conducted on `Ubuntu18.04` with `Python3.6` with `CUDA1
 
 Other python dependencies are given in `requirements.txt`. You can install the package using pip:
 
-```
+```bash
 pip3 install -r requirments.txt
 ```
 
@@ -18,13 +18,13 @@ We highly recommend that to replicate our testing environment, users can use our
 
 To load the image from the `tar` file, run the following:
 
-```
+```bash
 docker load -i mpt_container.tar
 ```
 
 To run the container, run the following command:
 
-```
+```bash
 docker run -it --gpus all --shm-size="16G" -v ~/global_planner_data:/root/data -v <link-to-code-base>:/workspace bash
 ```
 
@@ -33,7 +33,7 @@ You can run the script in `docker/ompl_torch_docker.sh`. Attach the folder conta
 ### Creating Dataset
 To generate training or validation data set for the point environment you can run the following command:
 
-```
+```bash
 python3 rrt_star_map.py --start=... --numEnv=... --envType=... --numPaths=... --fileDir=... --mapFile
 
 uv run rrt_star_map.py --start=0 --numEnv=100 --envType=forest --numPaths=25 --fileDir=data/forest
@@ -43,7 +43,7 @@ uv run rrt_star_map.py --start=0 --numEnv=1750 --envType=forest --numPaths=25 --
 
 To collect data samples for the car environment you can run the following command:
 
-```
+```bash
 python3 sst_map.py --start=... --numEnv=... --numPaths=... --fileDir=...
 
 uv run sst_map.py --start=... --numEnv=... --numPaths=... --fileDir=...
@@ -57,10 +57,13 @@ You can download all the data we used for training from [here](https://drive.goo
 
 To train the data, run the following command:
 
-```
+```bash
 python3 train.py --batchSize=... --mazeDir=... --forestDir=... --fileDir=...
 
 uv run train.py --batchSize=32 --forestDir=data/forest --fileDir=data/point_robot
+
+uv run train_uneven.py --batchSize=32 --env_list=desert --dataFolder=data/test_training --fileDir=data/uneven
+
 ```
 
 ### Pre-trained Models
@@ -70,7 +73,7 @@ You can download the pretrained models for the point robot and Dubins Car Model 
 
 To evaluate a set of validation paths, you can run the following code:
 
-```
+```bash
 python3 eval_model.py --modelFolder=... --valDataFolder=... --start=... --numEnv=... --epoch=... --numPaths=...
 
 uv run eval_model.py --modelFolder=data/point_robot --valDataFolder=data/forest/val --start=0 --numEnv=11 --epoch=5 --numPaths=25 --segmentType=mpt --plannerType=rrtstar
@@ -167,7 +170,7 @@ uv run eval_model.py --modelFolder=data/point_robot --valDataFolder=data/forest/
 ### Visualizing Trajectories
 To visualize trajectories, you can use the `VisualizeTrajectories.ipynb` notebook to view the paths. To spin up the jupyter notebook, you can run the following command inside the container environment.
 
-```
+```bash
 export JUPYTER_TOKEN=mpt
 jupyter notebook --allow-root --no-browser --ip=0.0.0.0. --port=8888
 ```
