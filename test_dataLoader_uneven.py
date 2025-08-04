@@ -20,11 +20,11 @@ sys.modules['numpy._core.multiarray'] = np.core.multiarray
 if __name__ == '__main__':
     # 测试加载数据集
     env_list = ['desert']
-    dataFolder = '/home/yrf/MPT/data'
+    dataFolder = '/home/yrf/MPT/data/test_training/val'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
     
     # 测试数据集idx=0的返回值
-    path_index = 333
+    path_index = 111
     sample = dataset[path_index]
     print(sample['map'].shape)
     print(sample['anchor'].shape)
@@ -35,7 +35,7 @@ if __name__ == '__main__':
     path_file = os.path.join(env_path, f'path_{path_index}.p')
     with open(path_file, 'rb') as f:
         path_data = pickle.load(f)
-    trajectory = path_data['path']  # [N, 3]
+    trajectory = path_data['path']  # [N+2, 3]
     
     # 可视化
     # 创建坐标网格
@@ -60,18 +60,18 @@ if __name__ == '__main__':
 
     for i in range(0, 100, step):
         for j in range(0, 100, step):
-            # 修正索引：normal_z是第0通道，cos是第2通道，sin是第3通道
+            # 修正索引：normal_z是第0通道，cos是第4通道，sin是第5通道
             if not (np.isnan(sample['map'][0, 0, i, j]) or
-                    np.isnan(sample['map'][0, 2, i, j]) or
-                    np.isnan(sample['map'][0, 3, i, j])):
+                    np.isnan(sample['map'][0, 4, i, j]) or
+                    np.isnan(sample['map'][0, 5, i, j])):
 
                 # 栅格中心坐标
                 cx = x[j]
                 cy = y[i]
 
                 # 法向量的XY分量合成向量对应的cos和sin
-                cos = sample['map'][0, 2, i, j]  # 第2通道是cos
-                sin = sample['map'][0, 3, i, j]  # 第3通道是sin
+                cos = sample['map'][0, 4, i, j]  # 第4通道是cos
+                sin = sample['map'][0, 5, i, j]  # 第5通道是sin
                 
                 nxy_norm = 1 - (sample['map'][0, 0, i, j]) ** 2  # 第0通道是normal_z
                 
@@ -186,7 +186,8 @@ if __name__ == '__main__':
                  marker='s', label='Goal', zorder=10, edgecolor='red', linewidth=2)
     
     # 绘制方向箭头（每隔几个点绘制一个，避免过于密集）
-    arrow_step = max(1, n_points // 10)  # 大约显示10个箭头
+    # arrow_step = max(1, n_points // 10)  # 大约显示10个箭头
+    arrow_step = 1
     path_theta = trajectory[:, 2]  # 取方向角度
     for i in range(0, n_points, arrow_step):
         arrow_scale = 0.2  # 箭头长度
@@ -200,7 +201,7 @@ if __name__ == '__main__':
 
     ax[2].set_xlim([-5, 5])
     ax[2].set_ylim([-5, 5])
-    ax[2].set_title(f'Anchor Points ({num_trajectory_points} trajectory points)')
+    ax[2].set_title(f'Anchor Points ({num_trajectory_points}+2 trajectory points)')
     ax[2].grid(True, alpha=0.3)
     
     plt.show()

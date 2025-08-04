@@ -37,10 +37,17 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
     
     loss_count = 0  # 计算实际损失的数量
     
+    # 分离起点和终点
+    start_state = trajectory[:, 0, :]  # 起点坐标 [batch_size, 3]
+    goal_state = trajectory[:, -1, :]  # 终点坐标 [batch_size, 3]
+    trajectory_copy = trajectory.clone() # 深拷贝轨迹数据，避免修改原始数据
+    trajectory = trajectory[:, 0:-1, :]  # 只保留中间的轨迹点 [batch_size, num_steps, 3]
+    
     # 各损失的权重
     loss_weights = {
-        'classification': 1.0,  # 分类损失权重(L_ce)
-        'regression': 10e-3,      # 回归损失权重(L_mse)
+        'classification': 4e-1, # 分类损失权重(L_ce)
+        'regression': 2e-2,     # 回归损失权重(L_mse)
+        'uniformity': 1e1,      # 轨迹点分布均匀性损失权重(L_uni)
     }
 
     # 用于统计标签分布
@@ -87,11 +94,23 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
             loss = F.binary_cross_entropy_with_logits(step_pred, full_labels)
             total_loss += loss * loss_weights['classification']  # 分类损失(L_ce)
             loss_count += 1
+            total_loss += loss * loss_weights['classification']  # 分类损失(L_ce)
+            loss_count += 1
+            
+            # # 改动：对背景位置计算BCE loss，保证概率集中于正样本锚点区域
+            # background_mask = (full_labels == 0)  # 背景位置的掩码
+            # if background_mask.any():  # 如果有背景位置
+            #     background_preds = step_pred[background_mask]
+            #     background_labels = full_labels[background_mask]
+            #     if len(background_preds) > 0:  # 确保有背景位置
+            #         loss = F.binary_cross_entropy_with_logits(background_preds, background_labels)
+            #         total_loss += loss * loss_weights['classification']  # 分类损失(L_ce)
+            #         loss_count += 1
             
             # 计算准确率 - 只在锚点位置计算准确率
             selected_preds = step_pred.index_select(0, valid_anchors)
             selected_probs = torch.sigmoid(selected_preds)
-            classPred = (selected_probs > 0.5).long()  # 将概率转换为预测类别
+            classPred = (selected_probs > 0.2).long()  # 将概率转换为预测类别
             
             # 统计正确预测数（只统计锚点位置）
             correct_predictions = classPred.eq(valid_labels.long()).sum().item()
@@ -138,7 +157,22 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
             mse_loss = F.mse_loss(weighted_coords.t(), true_coords)
             total_loss += mse_loss * loss_weights['regression'] * steps_to_process  # 回归损失(L_mse)
             loss_count += steps_to_process
-    
+            
+        # 损失3: 轨迹点分布均匀性损失(L_uni)
+        # trajectory_copy中包含起点和终点，对于每两个点之间的距离，归一化后计算均匀性损失
+        if trajectory_copy.shape[1] > 2:
+            # 计算每两个点之间的距离
+            distances = torch.norm(trajectory_copy[i, 1:, :2] - trajectory_copy[i, :-1, :2], dim=1)
+            avg_distance = distances.mean()
+            
+            # 归一化距离
+            distances = distances / avg_distance if avg_distance > 0 else distances
+            
+            # 计算均匀性损失
+            uniformity_loss = F.mse_loss(distances, torch.full_like(distances, 1.0))
+            total_loss += uniformity_loss * loss_weights['uniformity']  # 均匀性损失(L_uni)
+            loss_count += 1
+
     # 确保返回张量类型的损失
     if loss_count == 0:
         # 如果没有计算任何损失，返回一个零损失张量

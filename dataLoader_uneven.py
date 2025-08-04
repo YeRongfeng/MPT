@@ -67,7 +67,14 @@ def geom2pixMatpos(pos, res=0.1, size=(100, 100)):
     distances = np.linalg.norm(grid_points - pos, axis=1)  # 形状：(100,)
     
     # 筛选距离阈值内的锚点索引
+    # indices = np.where(distances <= receptive_field * res * np.sqrt(5)/2)  # 阈值：18 * 0.1 * sqrt(5)/2 = 2.012米
     indices = np.where(distances <= receptive_field * res * 0.4)  # 阈值：18 * 0.1 * 0.4 = 0.72米
+
+    # # 筛选感受野区域内包含输入位置的锚点索引（感受野区域是矩形）
+    # indices = np.where((grid_points[:, 0] >= pos[0] - receptive_field * res / 2) &
+    #                    (grid_points[:, 0] <= pos[0] + receptive_field * res / 2) &
+    #                    (grid_points[:, 1] >= pos[1] - receptive_field * res / 2) &
+    #                    (grid_points[:, 1] <= pos[1] + receptive_field * res / 2))
 
     return indices  # 返回正样本锚点索引元组
 
@@ -181,57 +188,13 @@ def PaddedSequence(batch):
     
     return data
 
-# def get_encoder_input(normal_z, goal_state, start_state, normal_x, normal_y):
-#     # 构造编码输入[H, W, 6]
-#     goal_pos = goal_state[:2]  # 终点位置 (x, y)
-#     start_pos = start_state[:2]  # 起点位置 (x, y)
-#     goal_angle = goal_state[2]  # 终点朝向
-#     start_angle = start_state[2]  # 起点朝向
+def get_encoder_input(normal_z, goal_state, start_state, normal_x, normal_y):
+    # 构造编码输入[H, W, 6]
+    goal_pos = goal_state[:2]  # 终点位置 (x, y)
+    start_pos = start_state[:2]  # 起点位置 (x, y)
+    goal_angle = goal_state[2]  # 终点朝向
+    start_angle = start_state[2]  # 起点朝向
     
-#     goal_index = geom2pix(goal_pos, res=res, size=normal_z.shape[:2])
-#     start_index = geom2pix(start_pos, res=res, size=normal_z.shape[:2])
-
-#     # 起点区域（使用start_index）
-#     start_start_y = max(0, start_index[0] - receptive_field//2)
-#     start_start_x = max(0, start_index[1] - receptive_field//2)
-#     start_end_y = min(normal_z.shape[0], start_index[0] + receptive_field//2)
-#     start_end_x = min(normal_z.shape[1], start_index[1] + receptive_field//2)
-
-#     # 终点区域（使用goal_index）
-#     goal_start_y = max(0, goal_index[0] - receptive_field//2)
-#     goal_start_x = max(0, goal_index[1] - receptive_field//2)
-#     goal_end_y = min(normal_z.shape[0], goal_index[0] + receptive_field//2)
-#     goal_end_x = min(normal_z.shape[1], goal_index[1] + receptive_field//2)
-    
-#     # 上下文地图： 起点终点的 位置标记 + 朝向的余弦值 + 朝向的正弦值，组成3通道输入
-#     context_map = np.zeros((*normal_z.shape[:2], 3))  # [H, W, 3]
-#     context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 0] = 1.0  # 终点标记为1
-#     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 0] = -1.0  # 起点标记为-1
-#     context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 1] = np.cos(goal_angle)  # 终点朝向
-#     context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 2] = np.sin(goal_angle)  # 终点朝向
-#     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 1] = np.cos(start_angle)  # 起点朝向
-#     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 2] = np.sin(start_angle)  # 起点朝向
-
-#     # 构造θ=<nx,ny>->(cosθ, sinθ)的映射
-#     angle_map = np.zeros((normal_z.shape[0], normal_z.shape[1], 2))  # [H, W, 2]
-#     for i in range(normal_z.shape[0]):
-#         for j in range(normal_z.shape[1]):
-#             n_xy_norm = np.linalg.norm([normal_x[i, j], normal_y[i, j]])
-            
-#             if n_xy_norm == 0:
-#                 # 如果法向量为零，避免除以零
-#                 angle_map[i, j, 0] = 0.0
-#                 angle_map[i, j, 1] = 0.0
-#             else:
-#                 # 归一化法向量
-#                 angle_map[i, j, 0] = normal_x[i, j] / n_xy_norm
-#                 angle_map[i, j, 1] = normal_y[i, j] / n_xy_norm
-    
-#     # 拼接为6通道
-#     encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, :3], angle_map[:, :, :2]), axis=2)  # [H, W, 6]
-#     return encoded_input
-
-def get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y):
     goal_index = geom2pix(goal_pos, res=res, size=normal_z.shape[:2])
     start_index = geom2pix(start_pos, res=res, size=normal_z.shape[:2])
 
@@ -247,16 +210,21 @@ def get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y):
     goal_end_y = min(normal_z.shape[0], goal_index[0] + receptive_field//2)
     goal_end_x = min(normal_z.shape[1], goal_index[1] + receptive_field//2)
     
-    # 上下文地图： 起点终点的位置标记
-    context_map = np.zeros(normal_z.shape[:2])  # [H, W]
-    context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x] = 1.0  # 终点标记为1
-    context_map[start_start_y:start_end_y, start_start_x:start_end_x] = -1.0  # 起点标记为-1
+    # 上下文地图： 起点终点的 位置标记 + 朝向的余弦值 + 朝向的正弦值，组成3通道输入
+    context_map = np.zeros((*normal_z.shape[:2], 3))  # [H, W, 3]
+    context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 0] = 1.0  # 终点标记为1
+    context_map[start_start_y:start_end_y, start_start_x:start_end_x, 0] = -1.0  # 起点标记为-1
+    context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 1] = np.cos(goal_angle)  # 终点朝向
+    context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 2] = np.sin(goal_angle)  # 终点朝向
+    context_map[start_start_y:start_end_y, start_start_x:start_end_x, 1] = np.cos(start_angle)  # 起点朝向
+    context_map[start_start_y:start_end_y, start_start_x:start_end_x, 2] = np.sin(start_angle)  # 起点朝向
 
     # 构造θ=<nx,ny>->(cosθ, sinθ)的映射
     angle_map = np.zeros((normal_z.shape[0], normal_z.shape[1], 2))  # [H, W, 2]
     for i in range(normal_z.shape[0]):
         for j in range(normal_z.shape[1]):
             n_xy_norm = np.linalg.norm([normal_x[i, j], normal_y[i, j]])
+            
             if n_xy_norm == 0:
                 # 如果法向量为零，避免除以零
                 angle_map[i, j, 0] = 0.0
@@ -265,10 +233,49 @@ def get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y):
                 # 归一化法向量
                 angle_map[i, j, 0] = normal_x[i, j] / n_xy_norm
                 angle_map[i, j, 1] = normal_y[i, j] / n_xy_norm
-
-    # 拼接为4通道
-    encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, None], angle_map[:, :, :2]), axis=2)  # [H, W, 4]
+    
+    # 拼接为6通道
+    encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, :3], angle_map[:, :, :2]), axis=2)  # [H, W, 6]
     return encoded_input
+
+# def get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y):
+#     goal_index = geom2pix(goal_pos, res=res, size=normal_z.shape[:2])
+#     start_index = geom2pix(start_pos, res=res, size=normal_z.shape[:2])
+
+#     # 起点区域（使用start_index）
+#     start_start_y = max(0, start_index[0] - receptive_field//2)
+#     start_start_x = max(0, start_index[1] - receptive_field//2)
+#     start_end_y = min(normal_z.shape[0], start_index[0] + receptive_field//2)
+#     start_end_x = min(normal_z.shape[1], start_index[1] + receptive_field//2)
+
+#     # 终点区域（使用goal_index）
+#     goal_start_y = max(0, goal_index[0] - receptive_field//2)
+#     goal_start_x = max(0, goal_index[1] - receptive_field//2)
+#     goal_end_y = min(normal_z.shape[0], goal_index[0] + receptive_field//2)
+#     goal_end_x = min(normal_z.shape[1], goal_index[1] + receptive_field//2)
+    
+#     # 上下文地图： 起点终点的位置标记
+#     context_map = np.zeros(normal_z.shape[:2])  # [H, W]
+#     context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x] = 1.0  # 终点标记为1
+#     context_map[start_start_y:start_end_y, start_start_x:start_end_x] = -1.0  # 起点标记为-1
+
+#     # 构造θ=<nx,ny>->(cosθ, sinθ)的映射
+#     angle_map = np.zeros((normal_z.shape[0], normal_z.shape[1], 2))  # [H, W, 2]
+#     for i in range(normal_z.shape[0]):
+#         for j in range(normal_z.shape[1]):
+#             n_xy_norm = np.linalg.norm([normal_x[i, j], normal_y[i, j]])
+#             if n_xy_norm == 0:
+#                 # 如果法向量为零，避免除以零
+#                 angle_map[i, j, 0] = 0.0
+#                 angle_map[i, j, 1] = 0.0
+#             else:
+#                 # 归一化法向量
+#                 angle_map[i, j, 0] = normal_x[i, j] / n_xy_norm
+#                 angle_map[i, j, 1] = normal_y[i, j] / n_xy_norm
+
+#     # 拼接为4通道
+#     encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, None], angle_map[:, :, :2]), axis=2)  # [H, W, 4]
+#     return encoded_input
 
 class UnevenPathDataLoader(Dataset):
     """
@@ -404,18 +411,26 @@ class UnevenPathDataLoader(Dataset):
         # 2. 加载路径数据
         with open(path_file, 'rb') as f:
             path_data = pickle.load(f)
-        trajectory = path_data['path']  # [N, 3]
+        trajectory = path_data['path']  # [N+2, 3]
         
         # 3. 生成编码输入
-        path = trajectory[:, :3]  # [N, 3]
+        path = trajectory[:, :3]  # [N+2, 3]
         
         encoded_input = get_encoder_input(
             normal_z, 
-            goal_pos=path[-1, :2],  # 终点位置
-            start_pos=path[0, :2],  # 起点位置
+            goal_state=path[-1, :],  # 终点位姿
+            start_state=path[0, :],  # 起点位姿
             normal_x=normal_x, 
             normal_y=normal_y
         )
+        
+        # encoded_input = get_encoder_input(
+        #     normal_z, 
+        #     goal_pos=path[-1, :2],  # 终点位置
+        #     start_pos=path[0, :2],  # 起点位置
+        #     normal_x=normal_x, 
+        #     normal_y=normal_y
+        # )
         
         # goal_index = geom2pix(path[-1, :2], res=map_data['resolution'], size=elevation.shape[:2])
         # start_index = geom2pix(path[0, :2], res=map_data['resolution'], size=elevation.shape[:2])
@@ -451,7 +466,8 @@ class UnevenPathDataLoader(Dataset):
         
         # 4. 提取正/负样本锚点
         # 为每个轨迹点创建独立的正样本图层
-        path_xy = trajectory[:, :2]  # [N, 2]
+        # trajectory = trajectory[1:-1, :]  # [N, 3]
+        path_xy = trajectory[1:-1, :2]  # [N, 2] 去掉起点和终点
         num_trajectory_points = len(path_xy)
         
         # print(f"轨迹点数量: {num_trajectory_points}")

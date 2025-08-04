@@ -1107,7 +1107,7 @@ class UnevenTransformer(Transformer):
 
         # 重新定义编码器的CNN特征提取部分，以适应不平坦地面的4通道输入
         self.encoder.to_patch_embedding = nn.Sequential(
-            nn.Conv2d(4, 6, kernel_size=3),     # 第一层卷积：4输入通道->6输出通道，3x3卷积核，提取基础特征
+            nn.Conv2d(6, 6, kernel_size=3),     # 第一层卷积：4输入通道->6输出通道，3x3卷积核，提取基础特征
             nn.MaxPool2d(kernel_size=2),        # 最大池化：2x2池化核，降低空间分辨率
             nn.ReLU(),                          # ReLU激活函数：引入非线性变换
             nn.Conv2d(6, 16, kernel_size=3),    # 第二层卷积：6->16通道，3x3卷积核，进一步提取特征

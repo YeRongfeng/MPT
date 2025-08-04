@@ -36,6 +36,11 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTraj=None, outp
     
     # 如果是预测图，则绘制预测轨迹
     if is_pred and predTraj is not None:
+        # 先为预测轨迹补足起点和终点，只使用x,y坐标
+        predTraj = np.vstack((start_pos[:2], predTraj, goal_pos[:2]))
+        # print(f"Predicted trajectory shape: {predTraj.shape}")
+        output_dim = predTraj.shape[0]  # 已经包括起点和终点
+        
         for i in range(output_dim-1):
             color = plt.cm.rainbow(i / (output_dim - 2))  # 使用rainbow颜色映射
             ax.plot([predTraj[i][0], predTraj[i+1][0]], 
@@ -109,11 +114,13 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
         goal_pos = trajectory[-1, :]
         
         # 获取预测轨迹
-        patch_map, predProb, predTraj = get_patch(transformer, start_pos[:2], goal_pos[:2], normal_x, normal_y, normal_z)
+        # patch_map, predProb, predTraj = get_patch(transformer, start_pos[:2], goal_pos[:2], normal_x, normal_y, normal_z)
+        patch_map, predProb, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
         output_dim = patch_map.shape[0]
         
         # 创建左侧子图 - 预测轨迹
         ax_pred = fig.add_subplot(gs[row, col])
+        # 为预测轨迹补足起点和终点
         plot_single_trajectory(ax_pred, elevation_masked, trajectory, predTraj, output_dim, is_pred=True)
         
         # 创建右侧子图 - 真实轨迹
@@ -148,12 +155,13 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
     plt.savefig(osp.join(save_path, f'multi_trajectories_{path_ids_str}.png'), dpi=300)
 
 if __name__ == "__main__":
-    epoch = 4
-    # envType_list = ['desert', 'forest', 'hill']
-    envType_list = ['hill']
+    epoch = 19
+    envType_list = ['desert']
+    # envType_list = ['hill']
     save_path = 'predictions'
 
     modelFolder = 'data/uneven'
+    # modelFolder = 'data/uneven_old'
     modelFile = osp.join(modelFolder, f'model_params.json')
     model_param = json.load(open(modelFile))
 
@@ -168,6 +176,8 @@ if __name__ == "__main__":
     envType_random = np.random.choice(envType_list, size=1)[0]
     # 随机选择6个不同的路径
     path_indexes = np.random.choice(range(500), size=6, replace=False)
+    # path_indexes = np.array([7, 33, 86, 150, 196, 197])  # 示例路径索引
+    # path_indexes = np.array([21, 42, 63, 84, 105, 126])  # 示例路径索引
     print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path indexes: {path_indexes}")
 
