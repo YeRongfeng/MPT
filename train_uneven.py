@@ -23,10 +23,11 @@ from dataLoader_uneven import hashTable, receptive_field
 
 from torch.utils.tensorboard import SummaryWriter
 
-def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
+def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajectory):
     """
     计算模型性能指标
     predVals: [batch_size, num_tokens, output_dim] - 模型预测：144个锚点位置，每个位置10个时间步的预测
+    correctionVals: [batch_size, num_tokens, 3, output_dim] - 模型修正预测：位置偏移和角度预测
     anchorPoints: [batch_size, num_layers, max_anchors] - 锚点索引
     trueLabels: [batch_size, num_layers, max_anchors] - 真实标签
     """
@@ -44,10 +45,18 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
     trajectory = trajectory[:, 0:-1, :]  # 只保留中间的轨迹点 [batch_size, num_steps, 3]
     
     # 各损失的权重
+    # loss_weights = {
+    #     'classification': 4e-1, # 分类损失权重(L_ce)
+    #     'regression': 2e-2,     # 回归损失权重(L_mse)
+    #     'uniformity': 1e1,      # 轨迹点分布均匀性损失权重(L_uni)
+    #     'angle': 3e0,          # 角度一致性损失权重(L_angle)
+    # }
+
     loss_weights = {
-        'classification': 4e-1, # 分类损失权重(L_ce)
-        'regression': 2e-2,     # 回归损失权重(L_mse)
-        'uniformity': 1e1,      # 轨迹点分布均匀性损失权重(L_uni)
+        'classification': 1e1, # 分类损失权重(L_ce)
+        'regression': 1e0,   # 回归损失权重(L_mse)
+        'uniformity': 0,     # 轨迹点分布均匀性损失权重(L_uni)
+        'angle': 0,          # 角度一致性损失权重(L_angle)
     }
 
     # 用于统计标签分布
@@ -61,10 +70,12 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
         trueLabel = trueLabels[i]  # [num_layers, max_anchors]
         
         # 损失1：锚点分类交叉熵损失(L_ce)
-        # 对每个输出维度(时间步)分别计算损失和准确率
-        for step in range(min(output_dim, anchorPoint.shape[0])):  # 确保不超出标签维度
+        # 对每个锚点行分别计算损失和准确率，包括正样本和负样本
+        num_anchor_rows = anchorPoint.shape[0]  # 总行数 = 2 * num_trajectory_points
+        
+        for step in range(num_anchor_rows):  # 处理所有锚点行
             # 获取当前时间步的预测 [num_tokens] - 所有锚点位置在这个时间步的预测
-            step_pred = predVals[i, :, step]  # [num_tokens] - 第step个时间步的预测
+            step_pred = predVals[i, :, step % output_dim]  # 使用模运算循环使用预测维度
             
             # 获取当前时间步对应的锚点和标签
             anchor_step = anchorPoint[step]  # [max_anchors]
@@ -90,10 +101,13 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
             # 将有效锚点位置设置为对应的真实标签
             full_labels[valid_anchors] = valid_labels.float()
             
-            # 对所有位置计算BCE loss，这样背景区域会被推向低概率
-            loss = F.binary_cross_entropy_with_logits(step_pred, full_labels)
-            total_loss += loss * loss_weights['classification']  # 分类损失(L_ce)
-            loss_count += 1
+            # 将标签归一化为概率分布（与softmax输出匹配）
+            if full_labels.sum() > 0:
+                full_labels = full_labels / full_labels.sum()  # 归一化使和为1
+            
+            # 使用KL散度损失计算概率分布之间的差异
+            # step_pred已经是概率分布，full_labels现在也是概率分布
+            loss = F.kl_div(torch.log(step_pred + 1e-8), full_labels, reduction='batchmean')
             total_loss += loss * loss_weights['classification']  # 分类损失(L_ce)
             loss_count += 1
             
@@ -109,8 +123,11 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
             
             # 计算准确率 - 只在锚点位置计算准确率
             selected_preds = step_pred.index_select(0, valid_anchors)
-            selected_probs = torch.sigmoid(selected_preds)
-            classPred = (selected_probs > 0.2).long()  # 将概率转换为预测类别
+            
+            # 对于概率分布，我们认为概率>阈值的位置为正预测
+            # 这里使用动态阈值：如果是softmax分布，平均概率为1/num_tokens
+            threshold = max(0.01, 1.0 / num_tokens * 2)  # 动态阈值，至少为平均概率的2倍
+            classPred = (selected_preds > threshold).long()  # 将概率转换为预测类别
             
             # 统计正确预测数（只统计锚点位置）
             correct_predictions = classPred.eq(valid_labels.long()).sum().item()
@@ -127,15 +144,16 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
             correct_positive += ((classPred == 1) & (valid_labels == 1)).sum().item()
             correct_negative += ((classPred == 0) & (valid_labels == 0)).sum().item()
             
-        # 损失2：轨迹坐标回归损失(L_mse) - 使用张量并行计算
+        # 损失2：轨迹回归损失(L_mse) - 使用张量并行计算
+        # 不仅计算位置的回归损失，还计算角度的回归损失，但是角度需要特殊处理
         # 确定处理的时间步数
         steps_to_process = min(output_dim, anchorPoint.shape[0])
         if steps_to_process > 0:
             # 将hashTable转换为张量以便并行计算
             hash_table_tensor = torch.tensor(hashTable, device=predVals.device)  # [num_tokens, 2]
             
-            # 对所有时间步进行softmax归一化
-            pred_probs = F.softmax(predVals[i, :, :steps_to_process], dim=0)  # [num_tokens, steps_to_process]
+            # predVals已经经过softmax归一化，直接使用
+            pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
             
             # 计算所有时间步的加权坐标
             # 扩展hashTable以计算所有时间步 [num_tokens, 2, steps_to_process]
@@ -150,12 +168,49 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
             # 将像素坐标映射回实际坐标系
             weighted_coords = -5.0 + weighted_coords * 0.1
             
-            # 提取真实轨迹坐标 [steps_to_process, 2]
-            true_coords = trajectory[i, :steps_to_process, :2]
+            # 提取真实轨迹坐标和角度 [steps_to_process, 3]
+            true_trajectory = trajectory[i, :steps_to_process, :]
+            true_coords = true_trajectory[:, :2]  # 位置坐标 [steps_to_process, 2]
+            true_angles = true_trajectory[:, 2]   # 角度信息 [steps_to_process]
             
-            # 计算所有时间步的MSE损失
-            mse_loss = F.mse_loss(weighted_coords.t(), true_coords)
-            total_loss += mse_loss * loss_weights['regression'] * steps_to_process  # 回归损失(L_mse)
+            # 计算位置的MSE损失
+            coord_loss = F.mse_loss(weighted_coords.t(), true_coords)
+            
+            # 计算角度的加权平均预测
+            # 使用模型直接预测的角度信息（从correctionVal中获取）
+            # correctionVal: [batch_size, num_tokens, 3, output_dim]，其中第3个维度的第2个元素是角度预测
+            
+            # 为了处理角度的周期性，我们需要特殊处理
+            # 将角度转换为复数表示：e^(i*θ) = cos(θ) + i*sin(θ)
+            true_angles_complex = torch.complex(torch.cos(true_angles), torch.sin(true_angles))  # [steps_to_process]
+            
+            # 直接使用模型预测的角度（已经通过sigmoid映射到[0,1]，需要转换到[-π,π]）
+            pred_angles_complex_list = []
+            for step in range(steps_to_process):
+                # 获取当前时间步的角度预测：[num_tokens]
+                # correctionVals[i, :, 2, step] 是第i个样本，所有锚点，角度维度，第step个时间步
+                step_angle_preds = correctionVals[i, :, 2, step]  # [num_tokens] - sigmoid输出，范围[0,1]
+                
+                # 将sigmoid输出[0,1]转换为角度范围[-π,π]
+                step_angle_preds_rad = step_angle_preds * 2 * np.pi - np.pi  # [num_tokens]
+                
+                # 转换为复数表示
+                step_angles_complex = torch.complex(torch.cos(step_angle_preds_rad), torch.sin(step_angle_preds_rad))  # [num_tokens]
+                
+                # 使用概率加权计算平均角度
+                step_probs = pred_probs[:, step]  # [num_tokens]
+                weighted_angle_complex = torch.sum(step_probs * step_angles_complex)  # 标量复数
+                pred_angles_complex_list.append(weighted_angle_complex)
+            
+            pred_angles_complex = torch.stack(pred_angles_complex_list)  # [steps_to_process]
+            
+            # 计算角度损失：在复数域中计算差异
+            angle_diff_complex = pred_angles_complex - true_angles_complex  # [steps_to_process]
+            angle_loss = torch.mean(torch.abs(angle_diff_complex) ** 2)  # 复数的模长平方作为损失
+            
+            # 组合位置和角度损失
+            total_mse_loss = coord_loss + 0.5 * angle_loss  # 角度损失权重为0.5
+            total_loss += total_mse_loss * loss_weights['regression'] * steps_to_process  # 回归损失(L_mse)
             loss_count += steps_to_process
             
         # 损失3: 轨迹点分布均匀性损失(L_uni)
@@ -172,6 +227,56 @@ def cal_performance(predVals, anchorPoints, trueLabels, trajectory):
             uniformity_loss = F.mse_loss(distances, torch.full_like(distances, 1.0))
             total_loss += uniformity_loss * loss_weights['uniformity']  # 均匀性损失(L_uni)
             loss_count += 1
+            
+        # 损失4: 角度一致性损失(L_angle)
+        if trajectory_copy.shape[1] > 2:
+            vectors = trajectory_copy[i, 1:, :2] - trajectory_copy[i, :-1, :2]  # 计算每两个点之间的向量
+            
+            # 计算相邻向量之间的转向角
+            if vectors.shape[0] > 1:
+                # 归一化向量
+                vectors_norm = F.normalize(vectors, p=2, dim=1)
+                
+                # 计算相邻向量之间的转向角
+                # 使用向量叉积和点积计算有向角度
+                v1 = vectors_norm[:-1]  # 前一个向量
+                v2 = vectors_norm[1:]   # 后一个向量
+                
+                # 计算转向角：使用atan2计算有向角度
+                cross_product = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]  # 叉积的z分量
+                dot_product = torch.sum(v1 * v2, dim=1)  # 点积
+                turn_angles = torch.atan2(cross_product, dot_product)  # 有向转向角 [-π, π]
+                
+                # 计算预测轨迹的累积朝向
+                # 从起点朝向开始，依次累加转向角
+                initial_heading = torch.atan2(vectors[0, 1], vectors[0, 0])  # 第一段的朝向
+                predicted_headings = [initial_heading]
+                
+                current_heading = initial_heading
+                for turn_angle in turn_angles:
+                    current_heading = current_heading + turn_angle  # 累积转向角
+                    # 将角度标准化到[-π, π]范围
+                    current_heading = torch.atan2(torch.sin(current_heading), torch.cos(current_heading))
+                    predicted_headings.append(current_heading)
+                
+                predicted_headings = torch.stack(predicted_headings)  # [num_segments]
+                
+                # 获取真实朝向（从第1个点到最后一个点）
+                true_headings = trajectory_copy[i, 1:, 2]  # 真实朝向角度
+                
+                # 确保维度匹配
+                min_len = min(len(predicted_headings), len(true_headings))
+                predicted_headings = predicted_headings[:min_len]
+                true_headings = true_headings[:min_len]
+                
+                # 计算角度差异损失（考虑角度的周期性）
+                angle_diff = predicted_headings - true_headings
+                # 将角度差异限制在[-π, π]范围内
+                angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
+                
+                angle_loss = F.mse_loss(angle_diff, torch.zeros_like(angle_diff))
+                total_loss += angle_loss * loss_weights.get('angle', 1.0)  # 角度一致性损失(L_angle)
+                loss_count += 1
 
     # 确保返回张量类型的损失
     if loss_count == 0:
@@ -196,11 +301,12 @@ def train_epoch(model, trainingData, optimizer, device):
         
         optimizer.zero_grad()  # 清零梯度：避免梯度累积     
         encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
-        predVal = model(encoder_input)  # 前向传播：获取模型预测值
+        predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
 
         # 正确处理锚点和标签，保持对应关系
         loss, n_correct, n_samples, batch_stats = cal_performance(
             predVal, 
+            correctionVal,  # 添加correctionVal参数
             batch['anchor'].to(device),
             batch['labels'].to(device),
             batch['trajectory'].to(device)  # 轨迹点：[N, 3]
@@ -233,11 +339,12 @@ def eval_epoch(model, validationData, device):
         for batch in tqdm(validationData, mininterval=2):  # 遍历验证数据批次，使用tqdm显示进度
 
             encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
-            predVal = model(encoder_input)  # 前向传播：获取模型预测值
+            predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
 
             # 正确处理锚点和标签，保持对应关系
             loss, n_correct, n_samples, batch_stats = cal_performance(
                 predVal,
+                correctionVal,  # 添加correctionVal参数
                 batch['anchor'].to(device),
                 batch['labels'].to(device),
                 batch['trajectory'].to(device)  # 轨迹点：[N, 3]

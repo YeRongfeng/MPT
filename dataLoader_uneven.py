@@ -67,14 +67,14 @@ def geom2pixMatpos(pos, res=0.1, size=(100, 100)):
     distances = np.linalg.norm(grid_points - pos, axis=1)  # 形状：(100,)
     
     # 筛选距离阈值内的锚点索引
-    # indices = np.where(distances <= receptive_field * res * np.sqrt(5)/2)  # 阈值：18 * 0.1 * sqrt(5)/2 = 2.012米
-    indices = np.where(distances <= receptive_field * res * 0.4)  # 阈值：18 * 0.1 * 0.4 = 0.72米
+    # indices = np.where(distances <= receptive_field * res * 0.5)  # 阈值：18 * 0.1 * 0.5 = 0.9米
+    # indices = np.where(distances <= receptive_field * res * 0.4)  # 阈值：18 * 0.1 * 0.4 = 0.72米
 
-    # # 筛选感受野区域内包含输入位置的锚点索引（感受野区域是矩形）
-    # indices = np.where((grid_points[:, 0] >= pos[0] - receptive_field * res / 2) &
-    #                    (grid_points[:, 0] <= pos[0] + receptive_field * res / 2) &
-    #                    (grid_points[:, 1] >= pos[1] - receptive_field * res / 2) &
-    #                    (grid_points[:, 1] <= pos[1] + receptive_field * res / 2))
+    # 筛选感受野区域内包含输入位置的锚点索引（感受野区域是矩形）
+    indices = np.where((grid_points[:, 0] >= pos[0] - receptive_field * res / 2) &
+                       (grid_points[:, 0] <= pos[0] + receptive_field * res / 2) &
+                       (grid_points[:, 1] >= pos[1] - receptive_field * res / 2) &
+                       (grid_points[:, 1] <= pos[1] + receptive_field * res / 2))
 
     return indices  # 返回正样本锚点索引元组
 
@@ -276,6 +276,307 @@ def get_encoder_input(normal_z, goal_state, start_state, normal_x, normal_y):
 #     # 拼接为4通道
 #     encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, None], angle_map[:, :, :2]), axis=2)  # [H, W, 4]
 #     return encoded_input
+
+def compute_terrain_direction(nx, ny, nz, cos_theta, sin_theta):
+    """
+    根据地形法向量调整运动方向，确保方向在可达范围内
+    
+    Args:
+        nx: 法向量x分量 (标量或数组)
+        ny: 法向量y分量 (标量或数组)  
+        nz: 法向量z分量 (标量或数组)
+        cos_theta: 目标方向角度的余弦值 (标量或数组)
+        sin_theta: 目标方向角度的正弦值 (标量或数组)
+    
+    Returns:
+        np.ndarray: 调整后的[cos_theta, sin_theta]
+    """
+    # 转换为numpy数组以支持向量化操作
+    nx = np.asarray(nx)
+    ny = np.asarray(ny)
+    nz = np.asarray(nz)
+    cos_theta = np.asarray(cos_theta)
+    sin_theta = np.asarray(sin_theta)
+    
+    # 如果输入为空，直接返回
+    if nx.size == 0 or ny.size == 0 or nz.size == 0:
+        return np.array([cos_theta, sin_theta])
+    
+    # 从cos和sin计算当前角度
+    current_theta = np.arctan2(sin_theta, cos_theta)
+    
+    # 地形约束参数
+    h = 8           # 机器人高度
+    min_edge = 10   # 最小边长约束
+    max_edge = 20   # 最大边长约束
+    
+    # 计算地形倾斜角度对应的tan值
+    # 这里假设地形倾斜角度与法向量相关
+    terrain_slope = np.arctan2(np.sqrt(nx**2 + ny**2), np.abs(nz))
+    
+    # 计算约束参数b
+    b_vals = h * np.tan(terrain_slope)
+    
+    # 根据b值分类地形约束类型
+    mask_reachable = b_vals < min_edge  # 完全可达
+    mask_partial = (b_vals >= min_edge) & (b_vals < max_edge)  # 部分可达
+    mask_complex = (b_vals >= max_edge) & (b_vals < np.sqrt(max_edge**2 + min_edge**2))  # 复杂约束
+    mask_unreachable = b_vals >= np.sqrt(max_edge**2 + min_edge**2)  # 完全不可达
+    
+    # 初始化调整后的角度
+    adjusted_theta = current_theta.copy()
+    
+    # 处理完全不可达区域：设置为零方向
+    if np.any(mask_unreachable):
+        adjusted_theta[mask_unreachable] = 0.0
+    
+    # # 处理完全可达区域：应用地形约束但不限制方向
+    # if np.any(mask_reachable):
+    #     reachable_indices = np.where(mask_reachable)[0]
+    #     reachable_theta = current_theta[mask_reachable]
+    #     reachable_nx = nx[mask_reachable]
+    #     reachable_ny = ny[mask_reachable]
+    #     reachable_nz = nz[mask_reachable]
+        
+    #     # 计算地形法向量的影响：从局部坐标系转换到全局坐标系
+    #     normal_proj_angles = np.arctan2(reachable_ny, reachable_nx)
+        
+    #     # 对于完全可达区域，我们仍然要考虑地形倾斜的影响
+    #     # 使用简化的地形校正：theta_global = theta_local + terrain_correction
+    #     terrain_correction = normal_proj_angles * 0.3  # 地形影响权重可调
+        
+    #     # 应用地形校正
+    #     corrected_theta = reachable_theta + terrain_correction
+        
+    #     # 标准化角度到[-π, π]
+    #     corrected_theta = np.where(corrected_theta > np.pi, corrected_theta - 2*np.pi, corrected_theta)
+    #     corrected_theta = np.where(corrected_theta < -np.pi, corrected_theta + 2*np.pi, corrected_theta)
+        
+    #     # 更新调整后的角度
+    #     if adjusted_theta.ndim == 0:  # 标量情况
+    #         adjusted_theta = corrected_theta[0] if len(corrected_theta) > 0 else adjusted_theta
+    #     else:  # 数组情况
+    #         adjusted_theta[mask_reachable] = corrected_theta
+    
+    # 处理部分可达区域
+    if np.any(mask_partial):
+        # print(f"进入部分可达区域处理，共{np.sum(mask_partial)}个点")
+        partial_b = b_vals[mask_partial]
+        partial_theta = current_theta[mask_partial]
+        partial_nx = nx[mask_partial]
+        partial_ny = ny[mask_partial]
+        partial_nz = nz[mask_partial]
+        
+        # print(f"部分可达区域 b值范围: {partial_b.min():.2f} - {partial_b.max():.2f}")
+        # print(f"部分可达区域 角度范围: {partial_theta.min():.3f} - {partial_theta.max():.3f} rad")
+        
+        # 计算约束边界角度
+        s1_vals = np.arcsin(min_edge / partial_b)
+        e1_vals = np.pi - s1_vals
+        s2_vals = -s1_vals
+        e2_vals = -np.pi + s1_vals
+        
+        # print(f"局部约束边界 s1: {s1_vals.min():.3f}-{s1_vals.max():.3f}, e1: {e1_vals.min():.3f}-{e1_vals.max():.3f}")
+        # print(f"局部约束边界 s2: {s2_vals.min():.3f}-{s2_vals.max():.3f}, e2: {e2_vals.min():.3f}-{e2_vals.max():.3f}")
+        
+        # 考虑地形法向量的影响：从局部坐标系转换到全局坐标系
+        # theta_global = arctan2(ny,nx) + arctan(nz*tan(theta_local))
+        normal_proj_angles = np.arctan2(partial_ny, partial_nx)
+        # print(f"法向量投影角度范围: {normal_proj_angles.min():.3f} - {normal_proj_angles.max():.3f} rad")
+        
+        # 计算全局坐标系下的边界参数，注意处理arctan的角度范围
+        # 对于 arctan(nz*tan(theta_local))，需要根据原始角度的象限来调整结果
+        def safe_arctan_transform(nz_vals, theta_local_vals):
+            """安全的arctan变换，考虑角度的正确象限"""
+            tan_vals = np.tan(theta_local_vals)
+            arctan_result = np.arctan(nz_vals * tan_vals)
+            
+            # 如果原始角度在第二或第三象限（cos < 0），需要调整arctan结果
+            # 第二象限：θ ∈ (π/2, π) => cos < 0, sin > 0
+            # 第三象限：θ ∈ (-π, -π/2) => cos < 0, sin < 0
+            cos_local = np.cos(theta_local_vals)
+            sin_local = np.sin(theta_local_vals)
+            
+            # 调整第二象限的角度：arctan结果需要加π
+            second_quadrant = (cos_local < 0) & (sin_local > 0)
+            arctan_result = np.where(second_quadrant, arctan_result + np.pi, arctan_result)
+            
+            # 调整第三象限的角度：arctan结果需要减π
+            third_quadrant = (cos_local < 0) & (sin_local < 0)
+            arctan_result = np.where(third_quadrant, arctan_result - np.pi, arctan_result)
+            
+            return arctan_result
+        
+        # 计算全局坐标系下的边界参数
+        s1_transform = safe_arctan_transform(partial_nz, s1_vals)
+        e1_transform = safe_arctan_transform(partial_nz, e1_vals)
+        s2_transform = safe_arctan_transform(partial_nz, s2_vals)
+        e2_transform = safe_arctan_transform(partial_nz, e2_vals)
+        
+        s1_global = normal_proj_angles + s1_transform
+        e1_global = normal_proj_angles + e1_transform
+        s2_global = normal_proj_angles + s2_transform
+        e2_global = normal_proj_angles + e2_transform
+        
+        # 标准化角度到[-π, π]
+        s1_global = np.where(s1_global > np.pi, s1_global - 2*np.pi, s1_global)
+        s1_global = np.where(s1_global < -np.pi, s1_global + 2*np.pi, s1_global)
+        e1_global = np.where(e1_global > np.pi, e1_global - 2*np.pi, e1_global)
+        e1_global = np.where(e1_global < -np.pi, e1_global + 2*np.pi, e1_global)
+        s2_global = np.where(s2_global > np.pi, s2_global - 2*np.pi, s2_global)
+        s2_global = np.where(s2_global < -np.pi, s2_global + 2*np.pi, s2_global)
+        e2_global = np.where(e2_global > np.pi, e2_global - 2*np.pi, e2_global)
+        e2_global = np.where(e2_global < -np.pi, e2_global + 2*np.pi, e2_global)
+        
+        # print(f"全局约束边界 s1: {s1_global.min():.3f}-{s1_global.max():.3f}, e1: {e1_global.min():.3f}-{e1_global.max():.3f}")
+        # print(f"全局约束边界 s2: {s2_global.min():.3f}-{s2_global.max():.3f}, e2: {e2_global.min():.3f}-{e2_global.max():.3f}")
+        
+        # 检查是否在不可达区域（现在使用全局坐标系下的角度）
+        unreachable_mask = ((partial_theta > s1_global) & (partial_theta < e1_global)) | \
+                          ((partial_theta > e2_global) & (partial_theta < s2_global))
+        
+        # print(f"不可达角度检查: {np.sum(unreachable_mask)} 个角度被判定为不可达")
+        
+        # 对不可达角度进行调整：找到最近的可达边界
+        if np.any(unreachable_mask):
+            # print(f"开始修正不可达角度...")
+            unreachable_indices = np.where(unreachable_mask)[0]
+            partial_indices = np.where(mask_partial)[0]  # 获取部分可达区域在原数组中的索引
+            
+            for idx in unreachable_indices:
+                current_angle = partial_theta[idx]
+                # print(f"  修正角度 {idx}: 当前角度={current_angle:.3f} rad")
+                # 找到最近的边界（全局坐标系下）
+                boundaries = [s1_global[idx], e1_global[idx], s2_global[idx], e2_global[idx]]
+                # print(f"    边界值: s1={s1_global[idx]:.3f}, e1={e1_global[idx]:.3f}, s2={s2_global[idx]:.3f}, e2={e2_global[idx]:.3f}")
+                closest_boundary = min(boundaries, key=lambda x: abs(current_angle - x))
+                # print(f"    最近边界: {closest_boundary:.3f} rad")
+                # 调整角度 - 使用原数组中的正确索引
+                original_idx = partial_indices[idx]
+                if adjusted_theta.ndim == 0:  # 标量情况
+                    adjusted_theta = closest_boundary
+                else:  # 数组情况
+                    adjusted_theta[original_idx] = closest_boundary
+                # print(f"    角度已修正为: {closest_boundary:.3f} rad，原索引={original_idx}")
+        # else:
+            # print("没有不可达角度需要修正")
+    
+    # 处理复杂约束区域
+    if np.any(mask_complex):
+        complex_b = b_vals[mask_complex]
+        complex_theta = current_theta[mask_complex]
+        complex_nx = nx[mask_complex]
+        complex_ny = ny[mask_complex]
+        complex_nz = nz[mask_complex]
+        
+        # 计算复杂约束的边界参数
+        r1_vals = np.arcsin(min_edge / complex_b)
+        r2_vals = np.arccos(max_edge / complex_b)
+        
+        # 计算所有边界角度
+        s1_vals = -r2_vals
+        e1_vals = r2_vals
+        s2_vals = r1_vals
+        e2_vals = np.pi - r1_vals
+        p1_vals = np.pi - r2_vals
+        p2_vals = -np.pi + r2_vals
+        s3_vals = -np.pi + r1_vals
+        e3_vals = -r1_vals
+        
+        # 考虑地形法向量的影响：从局部坐标系转换到全局坐标系
+        # theta_global = arctan2(ny,nx) + arctan(nz*tan(theta_local))
+        normal_proj_angles = np.arctan2(complex_ny, complex_nx)
+        
+        # 计算全局坐标系下的边界参数，注意处理arctan的角度范围
+        def safe_arctan_transform(nz_vals, theta_local_vals):
+            """安全的arctan变换，考虑角度的正确象限"""
+            tan_vals = np.tan(theta_local_vals)
+            arctan_result = np.arctan(nz_vals * tan_vals)
+            
+            # 如果原始角度在第二或第三象限（cos < 0），需要调整arctan结果
+            cos_local = np.cos(theta_local_vals)
+            sin_local = np.sin(theta_local_vals)
+            
+            # 调整第二象限的角度：arctan结果需要加π
+            second_quadrant = (cos_local < 0) & (sin_local > 0)
+            arctan_result = np.where(second_quadrant, arctan_result + np.pi, arctan_result)
+            
+            # 调整第三象限的角度：arctan结果需要减π
+            third_quadrant = (cos_local < 0) & (sin_local < 0)
+            arctan_result = np.where(third_quadrant, arctan_result - np.pi, arctan_result)
+            
+            return arctan_result
+        
+        # 计算全局坐标系下的边界参数
+        s1_transform = safe_arctan_transform(complex_nz, s1_vals)
+        e1_transform = safe_arctan_transform(complex_nz, e1_vals)
+        s2_transform = safe_arctan_transform(complex_nz, s2_vals)
+        e2_transform = safe_arctan_transform(complex_nz, e2_vals)
+        p1_transform = safe_arctan_transform(complex_nz, p1_vals)
+        p2_transform = safe_arctan_transform(complex_nz, p2_vals)
+        s3_transform = safe_arctan_transform(complex_nz, s3_vals)
+        e3_transform = safe_arctan_transform(complex_nz, e3_vals)
+        
+        s1_global = normal_proj_angles + s1_transform
+        e1_global = normal_proj_angles + e1_transform
+        s2_global = normal_proj_angles + s2_transform
+        e2_global = normal_proj_angles + e2_transform
+        p1_global = normal_proj_angles + p1_transform
+        p2_global = normal_proj_angles + p2_transform
+        s3_global = normal_proj_angles + s3_transform
+        e3_global = normal_proj_angles + e3_transform
+        
+        # 标准化所有角度到[-π, π]
+        def normalize_angle(angle):
+            angle = np.where(angle > np.pi, angle - 2*np.pi, angle)
+            angle = np.where(angle < -np.pi, angle + 2*np.pi, angle)
+            return angle
+        
+        s1_global = normalize_angle(s1_global)
+        e1_global = normalize_angle(e1_global)
+        s2_global = normalize_angle(s2_global)
+        e2_global = normalize_angle(e2_global)
+        p1_global = normalize_angle(p1_global)
+        p2_global = normalize_angle(p2_global)
+        s3_global = normalize_angle(s3_global)
+        e3_global = normalize_angle(e3_global)
+        
+        # 检查是否在不可达区域（复杂约束的多个区间，使用全局坐标系）
+        unreachable_mask = (
+            ((complex_theta > s1_global) & (complex_theta < e1_global)) |
+            ((complex_theta > s2_global) & (complex_theta < e2_global)) |
+            ((complex_theta > s3_global) & (complex_theta < e3_global)) |
+            (complex_theta < p2_global) |
+            (complex_theta > p1_global)
+        )
+        
+        # 对不可达角度进行调整：找到最近的可达边界
+        if np.any(unreachable_mask):
+            unreachable_indices = np.where(unreachable_mask)[0]
+            complex_indices = np.where(mask_complex)[0]  # 获取复杂约束区域在原数组中的索引
+            
+            for idx in unreachable_indices:
+                current_angle = complex_theta[idx]
+                # 找到最近的边界（包括所有复杂约束的边界，全局坐标系下）
+                boundaries = [
+                    s1_global[idx], e1_global[idx], s2_global[idx], e2_global[idx],
+                    s3_global[idx], e3_global[idx], p1_global[idx], p2_global[idx]
+                ]
+                closest_boundary = min(boundaries, key=lambda x: abs(current_angle - x))
+                # 调整角度 - 使用原数组中的正确索引
+                original_idx = complex_indices[idx]
+                if adjusted_theta.ndim == 0:  # 标量情况
+                    adjusted_theta = closest_boundary
+                else:  # 数组情况
+                    adjusted_theta[original_idx] = closest_boundary
+    
+    # 将调整后的角度转换回cos和sin
+    adjusted_cos = np.cos(adjusted_theta)
+    adjusted_sin = np.sin(adjusted_theta)
+    
+    return np.array([adjusted_cos, adjusted_sin])
+
+    
 
 class UnevenPathDataLoader(Dataset):
     """
@@ -487,17 +788,21 @@ class UnevenPathDataLoader(Dataset):
         for anchors in positive_anchors_per_point:
             while len(anchors) < max_anchors:
                 anchors.append(-1)  # 用-1填充
-        
-        # 生成负样本：为每个轨迹点生成相同数量的负样本
+                       
+        # 生成负样本：为每个轨迹点生成对应的负样本
+        # 每个轨迹点的负样本应该是该点正样本的补集，而不是全体正样本的补集
         all_anchor_indices = set(range(len(hashTable)))
-        used_positive_anchors = set()
-        for anchors in positive_anchors_per_point:
-            used_positive_anchors.update([a for a in anchors if a != -1])
-        
-        available_negative_anchors = list(all_anchor_indices - used_positive_anchors)
-        
         negative_anchors_per_point = []
-        for _ in range(num_trajectory_points):
+        # max_anchors = max(0, len(all_anchor_indices) - max_anchors)  # 负样本锚点数量
+        
+        for i in range(num_trajectory_points):
+            # 获取当前轨迹点的正样本锚点
+            current_positive_anchors = set([a for a in positive_anchors_per_point[i] if a != -1])
+            
+            # 当前轨迹点的负样本候选：全体锚点减去当前点的正样本
+            available_negative_anchors = list(all_anchor_indices - current_positive_anchors)
+            
+            # 为当前轨迹点生成负样本
             if len(available_negative_anchors) >= max_anchors:
                 neg_anchors = np.random.choice(available_negative_anchors, size=max_anchors, replace=False).tolist()
             else:

@@ -60,7 +60,7 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     print(f"Encoder input tensor shape: {encoder_input.shape}")
     
     try:
-        predVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim)
+        predVal, correctionVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
     except Exception as e:
         print(f"Model forward error: {e}")
         print(f"Model expected input size might be different from {normal_z.shape}")
@@ -69,14 +69,14 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     # 从模型输出获取维度信息
     batch_size, num_tokens, output_dim = predVal.shape
     
-    # 对每个output_dim维度分别进行全局softmax归一化
+    # predVal已经经过softmax，直接使用
     predProb_list = []
     patch_maps = []
     map_size = normal_z.shape
     
     for dim in range(output_dim):
-        # 对第dim个输出维度进行softmax归一化
-        predProb = F.softmax(predVal[0, :, dim], dim=0)  # Shape: (num_tokens,)
+        # predVal已经是softmax后的概率，直接使用
+        predProb = predVal[0, :, dim]  # Shape: (num_tokens,)
         predProb_list.append(predProb)
         
         # 对第dim个输出维度获取预测锚点 (取概率最大的作为预测类别)
@@ -99,10 +99,11 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     predProb_list = torch.stack(predProb_list, dim=0)  # Shape: (output_dim, num_tokens)
     
     # 将n张概率图（每个坐标对应一个锚点），独立地进行对锚点坐标概率加权运算，回归到n个坐标上
+    roughTraj = []
     predTraj = []
+    
     for dim in range(output_dim):
         predProb = predProb_list[dim]
-
 
         # 对每个全部锚点位置进行加权
         weighted_x = sum(pos[0] * predProb[idx].item() for idx, pos in enumerate(hashTable))
@@ -112,7 +113,32 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         weighted_x = -5 + weighted_x * 0.1  # 列对应x坐标
         weighted_y = -5 + weighted_y * 0.1  # 行对应y坐标
         
-        # 将加权结果添加到预测轨迹中
-        predTraj.append((weighted_x, weighted_y))
+        # 将加权结果添加到粗略轨迹中
+        roughTraj.append((weighted_x, weighted_y))
+        
+        # 分离偏移量与角度 - 在每个dim循环内处理
+        # correctionVal的格式为[batch_size, seq_len, 3, output_dim]，这里batch_size=1
+        offset_x = correctionVal[0, :, 0, dim]  # [seq_len] - 直接取第0个batch
+        offset_y = correctionVal[0, :, 1, dim]  # [seq_len] - 直接取第0个batch
+        predTheta = correctionVal[0, :, 2, dim]  # [seq_len] - 直接取第0个batch
+        
+        # 对空间维度seq_len进行概率加权求和，得到最后的偏移量和角度
+        # 注意：这里的seq_len是指锚点数量
+        weighted_offset_x = (offset_x * predProb).sum()  # 标量
+        weighted_offset_y = (offset_y * predProb).sum()  # 标量
+        weighted_predTheta = (predTheta * predProb).sum()  # 标量
+        
+        # 计算加权偏移量和角度，sigmoid后得到的角度范围是[0, 1]，需要转换为[-pi, pi]
+        weighted_predTheta = weighted_predTheta * 2 * np.pi - np.pi  # 将范围从[0, 1]映射到[-pi, pi]
+        
+        # 计算最终预测位置和角度
+        final_x = weighted_x + weighted_offset_x.item()
+        final_y = weighted_y + weighted_offset_y.item()
+        
+        # 获取角度, predTheta是弧度值, 直接使用
+        theta_rad = weighted_predTheta.item()
+        
+        # 添加到预测轨迹中
+        predTraj.append((final_x, final_y, theta_rad))
 
     return patch_maps, predProb_list, predTraj

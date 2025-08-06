@@ -42,6 +42,7 @@ Models.py - Transformer架构的路径规划模型实现
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from transformer.Layers import EncoderLayer, DecoderLayer
 
@@ -1121,8 +1122,42 @@ class UnevenTransformer(Transformer):
         
         # 更新分类头的输出维度，以适应不平坦地面的预测需求
         self.classPred = nn.Sequential(
+            # 输入尺寸：(batch_size, seq_len, d_model)
             Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
             nn.Conv2d(d_model, output_dim, kernel_size=1),  # 1x1卷积：将d_model维特征映射为(output_dim=)n步的预测输出
-            Rearrange('bc d 1 1 -> bc d')   # 维度重排：将4D卷积输出重排回2D格式，移除空间维度
+            Rearrange('bc d 1 1 -> bc d'),   # 维度重排：将4D卷积输出重排回2D格式，移除空间维度
+            # 这里需要特殊处理来对seq_len维度进行Softmax归一化
+            # 输出尺寸：(batch_size * seq_len, output_dim)
         )
         
+        # 增加一个预测头，用于预测位置的修正量和角度的生成
+        # 输入为编码器输出和分类头输出的拼接结果
+        self.correctionPred = nn.Sequential(
+            # 输入尺寸：(batch_size, seq_len, d_model + output_dim)
+            nn.Linear(d_model + output_dim, 3 * output_dim),  # 线性层：将拼接后的特征映射到3倍的输出维度
+            nn.ReLU(),  # ReLU激活函数：引入非线性变换
+            nn.LayerNorm(3 * output_dim),  # 层归一化：标准化输出特征分布，提升训练稳定性
+            nn.Dropout(dropout),  # Dropout层：防止过拟合的正则化技术
+            nn.Sigmoid()  # Sigmoid激活：将输出映射到(0,1)范围，用于位置修正量和角度预测
+            # 输出尺寸：(batch_size, seq_len, 3 * output_dim)
+            # 这里的3 * output_dim可以理解为位置修正量和角度预测
+        )
+        
+    def forward(self, input_map):
+        # 模型前向传播函数，需要输出分类结果和修正结果
+        enc_output, *_ = self.encoder(input_map)  # 编码阶段：通过编码器处理输入地图，获得特征表示，*_忽略可能的注意力权重返回值
+        
+        seq_logit = self.classPred(enc_output)  # 分类预测：通过分类头将编码特征转换为每个位置的类别logits（未归一化）
+        batch_size = input_map.shape[0]  # 获取批量大小：从输入张量的第0维获取batch_size，用于后续维度重排
+        seq_logit_reshaped = rearrange(seq_logit, '(b c) d -> b c d', b=batch_size)  # 输出重排：将展平的预测结果重新组织为(batch_size, seq_len, num_classes)格式
+        
+        # 对seq_len维度进行Softmax归一化
+        seq_logit_softmax = F.softmax(seq_logit_reshaped, dim=1)  # 在seq_len维度(dim=1)上进行Softmax归一化
+        
+        # 拼接编码器输出和分类预测结果
+        combined_features = torch.cat([enc_output, seq_logit_softmax], dim=-1)  # 在最后一个维度上拼接特征：(batch, seq_len, d_model + output_dim)
+        correction = self.correctionPred(combined_features)  # 结合地图特征和概率引导特征，通过修正头获得位置修正量和角度预测
+        
+        # 重排修正预测结果：将(batch, seq_len, 3*output_dim) -> (batch, seq_len, 3, output_dim)
+        correction_reshaped = rearrange(correction, 'b c (n d) -> b c n d', n=3)
+        return seq_logit_softmax, correction_reshaped  # 返回分类预测结果和位置修正预测结果
