@@ -53,10 +53,10 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # }
 
     loss_weights = {
-        'classification': 1e1, # 分类损失权重(L_ce)
-        'regression': 1e0,   # 回归损失权重(L_mse)
-        'uniformity': 0,     # 轨迹点分布均匀性损失权重(L_uni)
-        'angle': 0,          # 角度一致性损失权重(L_angle)
+        'classification': 1e-1, # 分类损失权重(L_ce)
+        'regression': 4e-3,     # 回归损失权重(L_mse) 
+        'uniformity': 0,        # 轨迹点分布均匀性损失权重(L_uni)
+        'angle': 0,             # 角度一致性损失权重(L_angle)
     }
 
     # 用于统计标签分布
@@ -210,8 +210,10 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             
             # 组合位置和角度损失
             total_mse_loss = coord_loss + 0.5 * angle_loss  # 角度损失权重为0.5
-            total_loss += total_mse_loss * loss_weights['regression'] * steps_to_process  # 回归损失(L_mse)
-            loss_count += steps_to_process
+            # total_loss += total_mse_loss * loss_weights['regression'] * steps_to_process  # 回归损失(L_mse)
+            # loss_count += steps_to_process
+            total_loss += total_mse_loss * loss_weights['regression']  # 回归损失(L_mse)
+            loss_count += 1
             
         # 损失3: 轨迹点分布均匀性损失(L_uni)
         # trajectory_copy中包含起点和终点，对于每两个点之间的距离，归一化后计算均匀性损失
@@ -286,7 +288,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # 返回总正确数而不是平均准确率，让调用者计算最终准确率
     return total_loss, n_correct, total_samples, (total_positive, total_negative, correct_positive, correct_negative)
 
-def train_epoch(model, trainingData, optimizer, device):
+def train_epoch(model, trainingData, optimizer, device, epoch=0):
     """
     单轮训练函数
     """
@@ -297,7 +299,8 @@ def train_epoch(model, trainingData, optimizer, device):
     epoch_stats = [0, 0, 0, 0]  # [total_positive, total_negative, correct_positive, correct_negative]
     
     # Train for a single epoch.
-    for batch in tqdm(trainingData, mininterval=2):  # 遍历训练数据批次，使用tqdm显示进度
+    pbar = tqdm(trainingData, mininterval=2, desc="Training")  # 创建进度条并设置描述
+    for batch_idx, batch in enumerate(pbar):  # 遍历训练数据批次，使用tqdm显示进度
         
         optimizer.zero_grad()  # 清零梯度：避免梯度累积     
         encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
@@ -312,6 +315,27 @@ def train_epoch(model, trainingData, optimizer, device):
             batch['trajectory'].to(device)  # 轨迹点：[N, 3]
         )
         loss.backward()  # 反向传播：计算梯度
+        
+        # 计算梯度范数
+        total_norm = 0
+        param_count = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        total_norm = total_norm ** (1. / 2)
+        original_norm = total_norm  # 保存原始梯度范数
+        
+        # 梯度裁剪：防止梯度爆炸
+        max_grad_norm = 1.0
+        
+        clipped = False
+        if total_norm > max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            total_norm = max_grad_norm  # 如果裁剪了梯度，更新总范数
+            clipped = True
+        
         optimizer.step_and_update_lr()  # 参数更新：同时更新模型参数和学习率
         total_loss += loss.item()  # 累加批次损失
         total_n_correct += n_correct  # 累加批次正确预测数
@@ -320,6 +344,14 @@ def train_epoch(model, trainingData, optimizer, device):
         # 累加统计信息
         for i in range(4):
             epoch_stats[i] += batch_stats[i]
+        
+        # 更新进度条显示信息
+        grad_info = f'{original_norm:.2f}' if not clipped else f'{original_norm:.2f}→{total_norm:.2f}'
+        pbar.set_postfix({
+            'Loss': f'{loss.item():.4f}',
+            'GradNorm': grad_info,
+            'LR': f'{optimizer._optimizer.param_groups[0]["lr"]:.2e}'
+        })
     
     return total_loss, total_n_correct, total_samples, epoch_stats  # 返回整个epoch的统计结果
 
@@ -429,7 +461,7 @@ if __name__ == "__main__":
     # TODO: What does these parameters do ???
     optimizer = Optim.ScheduledOptim(  # 创建带有学习率调度的优化器
         optim.Adam(transformer.parameters(), betas=(0.9, 0.98), eps=1e-9),  # Adam优化器：动量参数(0.9, 0.98)，数值稳定性参数1e-9
-        lr_mul = 0.5,  # 学习率乘数：0.5
+        lr_mul = 0.1,  # 学习率乘数：降低到0.1
         d_model = 256,  # 模型维度：用于学习率计算
         n_warmup_steps = 3200  # 预热步数：3200步
     )
