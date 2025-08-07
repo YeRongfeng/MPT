@@ -1134,13 +1134,9 @@ class UnevenTransformer(Transformer):
         # 输入为编码器输出和分类头输出的拼接结果
         self.correctionPred = nn.Sequential(
             # 输入尺寸：(batch_size, seq_len, d_model + output_dim)
-            nn.Linear(d_model + output_dim, 3 * output_dim),  # 线性层：将拼接后的特征映射到3倍的输出维度
-            nn.ReLU(),  # ReLU激活函数：引入非线性变换
-            nn.LayerNorm(3 * output_dim),  # 层归一化：标准化输出特征分布，提升训练稳定性
-            nn.Dropout(dropout),  # Dropout层：防止过拟合的正则化技术
-            nn.Sigmoid()  # Sigmoid激活：将输出映射到(0,1)范围，用于位置修正量和角度预测
-            # 输出尺寸：(batch_size, seq_len, 3 * output_dim)
-            # 这里的3 * output_dim可以理解为位置修正量和角度预测
+            Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
+            nn.Conv2d(d_model + output_dim, 3 * output_dim, kernel_size=1),  # 1x1卷积：将拼接后的特征映射为3 * output_dim维度
+            Rearrange('bc d 1 1 -> bc d'),  # 维度重排：将4D卷积输出重排为(batch_size, seq_len, 3*output_dim)格式
         )
         
     def forward(self, input_map):
@@ -1158,6 +1154,8 @@ class UnevenTransformer(Transformer):
         combined_features = torch.cat([enc_output, seq_logit_softmax], dim=-1)  # 在最后一个维度上拼接特征：(batch, seq_len, d_model + output_dim)
         correction = self.correctionPred(combined_features)  # 结合地图特征和概率引导特征，通过修正头获得位置修正量和角度预测
         
+        correction_sigmoid = F.sigmoid(correction)  # 对修正预测结果进行Sigmoid归一化，确保输出在[0, 1]范围内
+        
         # 重排修正预测结果：将(batch, seq_len, 3*output_dim) -> (batch, seq_len, 3, output_dim)
-        correction_reshaped = rearrange(correction, 'b c (n d) -> b c n d', n=3)
+        correction_reshaped = rearrange(correction_sigmoid, '(b c) (n d) -> b c n d', b=batch_size, n=3)
         return seq_logit_softmax, correction_reshaped  # 返回分类预测结果和位置修正预测结果

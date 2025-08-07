@@ -53,8 +53,8 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # }
 
     loss_weights = {
-        'classification': 1e-1, # 分类损失权重(L_ce)
-        'regression': 4e-3,     # 回归损失权重(L_mse) 
+        'classification': 4e-1, # 分类损失权重(L_ce)1e-1
+        'regression': 4e-3,     # 回归损失权重(L_mse)4e-3 
         'uniformity': 0,        # 轨迹点分布均匀性损失权重(L_uni)
         'angle': 0,             # 角度一致性损失权重(L_angle)
     }
@@ -215,70 +215,70 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             total_loss += total_mse_loss * loss_weights['regression']  # 回归损失(L_mse)
             loss_count += 1
             
-        # 损失3: 轨迹点分布均匀性损失(L_uni)
-        # trajectory_copy中包含起点和终点，对于每两个点之间的距离，归一化后计算均匀性损失
-        if trajectory_copy.shape[1] > 2:
-            # 计算每两个点之间的距离
-            distances = torch.norm(trajectory_copy[i, 1:, :2] - trajectory_copy[i, :-1, :2], dim=1)
-            avg_distance = distances.mean()
+        # # 损失3: 轨迹点分布均匀性损失(L_uni)
+        # # trajectory_copy中包含起点和终点，对于每两个点之间的距离，归一化后计算均匀性损失
+        # if trajectory_copy.shape[1] > 2:
+        #     # 计算每两个点之间的距离
+        #     distances = torch.norm(trajectory_copy[i, 1:, :2] - trajectory_copy[i, :-1, :2], dim=1)
+        #     avg_distance = distances.mean()
             
-            # 归一化距离
-            distances = distances / avg_distance if avg_distance > 0 else distances
+        #     # 归一化距离
+        #     distances = distances / avg_distance if avg_distance > 0 else distances
             
-            # 计算均匀性损失
-            uniformity_loss = F.mse_loss(distances, torch.full_like(distances, 1.0))
-            total_loss += uniformity_loss * loss_weights['uniformity']  # 均匀性损失(L_uni)
-            loss_count += 1
+        #     # 计算均匀性损失
+        #     uniformity_loss = F.mse_loss(distances, torch.full_like(distances, 1.0))
+        #     total_loss += uniformity_loss * loss_weights['uniformity']  # 均匀性损失(L_uni)
+        #     loss_count += 1
             
-        # 损失4: 角度一致性损失(L_angle)
-        if trajectory_copy.shape[1] > 2:
-            vectors = trajectory_copy[i, 1:, :2] - trajectory_copy[i, :-1, :2]  # 计算每两个点之间的向量
+        # # 损失4: 角度一致性损失(L_angle)
+        # if trajectory_copy.shape[1] > 2:
+        #     vectors = trajectory_copy[i, 1:, :2] - trajectory_copy[i, :-1, :2]  # 计算每两个点之间的向量
             
-            # 计算相邻向量之间的转向角
-            if vectors.shape[0] > 1:
-                # 归一化向量
-                vectors_norm = F.normalize(vectors, p=2, dim=1)
+        #     # 计算相邻向量之间的转向角
+        #     if vectors.shape[0] > 1:
+        #         # 归一化向量
+        #         vectors_norm = F.normalize(vectors, p=2, dim=1)
                 
-                # 计算相邻向量之间的转向角
-                # 使用向量叉积和点积计算有向角度
-                v1 = vectors_norm[:-1]  # 前一个向量
-                v2 = vectors_norm[1:]   # 后一个向量
+        #         # 计算相邻向量之间的转向角
+        #         # 使用向量叉积和点积计算有向角度
+        #         v1 = vectors_norm[:-1]  # 前一个向量
+        #         v2 = vectors_norm[1:]   # 后一个向量
                 
-                # 计算转向角：使用atan2计算有向角度
-                cross_product = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]  # 叉积的z分量
-                dot_product = torch.sum(v1 * v2, dim=1)  # 点积
-                turn_angles = torch.atan2(cross_product, dot_product)  # 有向转向角 [-π, π]
+        #         # 计算转向角：使用atan2计算有向角度
+        #         cross_product = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]  # 叉积的z分量
+        #         dot_product = torch.sum(v1 * v2, dim=1)  # 点积
+        #         turn_angles = torch.atan2(cross_product, dot_product)  # 有向转向角 [-π, π]
                 
-                # 计算预测轨迹的累积朝向
-                # 从起点朝向开始，依次累加转向角
-                initial_heading = torch.atan2(vectors[0, 1], vectors[0, 0])  # 第一段的朝向
-                predicted_headings = [initial_heading]
+        #         # 计算预测轨迹的累积朝向
+        #         # 从起点朝向开始，依次累加转向角
+        #         initial_heading = torch.atan2(vectors[0, 1], vectors[0, 0])  # 第一段的朝向
+        #         predicted_headings = [initial_heading]
                 
-                current_heading = initial_heading
-                for turn_angle in turn_angles:
-                    current_heading = current_heading + turn_angle  # 累积转向角
-                    # 将角度标准化到[-π, π]范围
-                    current_heading = torch.atan2(torch.sin(current_heading), torch.cos(current_heading))
-                    predicted_headings.append(current_heading)
+        #         current_heading = initial_heading
+        #         for turn_angle in turn_angles:
+        #             current_heading = current_heading + turn_angle  # 累积转向角
+        #             # 将角度标准化到[-π, π]范围
+        #             current_heading = torch.atan2(torch.sin(current_heading), torch.cos(current_heading))
+        #             predicted_headings.append(current_heading)
                 
-                predicted_headings = torch.stack(predicted_headings)  # [num_segments]
+        #         predicted_headings = torch.stack(predicted_headings)  # [num_segments]
                 
-                # 获取真实朝向（从第1个点到最后一个点）
-                true_headings = trajectory_copy[i, 1:, 2]  # 真实朝向角度
+        #         # 获取真实朝向（从第1个点到最后一个点）
+        #         true_headings = trajectory_copy[i, 1:, 2]  # 真实朝向角度
                 
-                # 确保维度匹配
-                min_len = min(len(predicted_headings), len(true_headings))
-                predicted_headings = predicted_headings[:min_len]
-                true_headings = true_headings[:min_len]
+        #         # 确保维度匹配
+        #         min_len = min(len(predicted_headings), len(true_headings))
+        #         predicted_headings = predicted_headings[:min_len]
+        #         true_headings = true_headings[:min_len]
                 
-                # 计算角度差异损失（考虑角度的周期性）
-                angle_diff = predicted_headings - true_headings
-                # 将角度差异限制在[-π, π]范围内
-                angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
+        #         # 计算角度差异损失（考虑角度的周期性）
+        #         angle_diff = predicted_headings - true_headings
+        #         # 将角度差异限制在[-π, π]范围内
+        #         angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
                 
-                angle_loss = F.mse_loss(angle_diff, torch.zeros_like(angle_diff))
-                total_loss += angle_loss * loss_weights.get('angle', 1.0)  # 角度一致性损失(L_angle)
-                loss_count += 1
+        #         angle_loss = F.mse_loss(angle_diff, torch.zeros_like(angle_diff))
+        #         total_loss += angle_loss * loss_weights.get('angle', 1.0)  # 角度一致性损失(L_angle)
+        #         loss_count += 1
 
     # 确保返回张量类型的损失
     if loss_count == 0:
@@ -328,7 +328,7 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0):
         original_norm = total_norm  # 保存原始梯度范数
         
         # 梯度裁剪：防止梯度爆炸
-        max_grad_norm = 1.0
+        max_grad_norm = 2.0
         
         clipped = False
         if total_norm > max_grad_norm:
@@ -438,9 +438,9 @@ if __name__ == "__main__":
     
     model_args = dict(        # 定义模型参数字典
         n_layers=6,           # Transformer编码器层数：6层
-        n_heads=3,            # 多头注意力的头数：3个头
-        d_k=512,              # Key向量的维度：512
-        d_v=256,              # Value向量的维度：256
+        n_heads=8,            # 多头注意力的头数：3->8个头
+        d_k=192,              # Key向量的维度：512->192
+        d_v=96,               # Value向量的维度：256->96
         d_model=512,          # 模型的主要特征维度：512
         d_inner=1024,         # 前馈网络的隐藏层维度：1024
         pad_idx=None,         # 填充标记的索引：无
@@ -462,7 +462,7 @@ if __name__ == "__main__":
     optimizer = Optim.ScheduledOptim(  # 创建带有学习率调度的优化器
         optim.Adam(transformer.parameters(), betas=(0.9, 0.98), eps=1e-9),  # Adam优化器：动量参数(0.9, 0.98)，数值稳定性参数1e-9
         lr_mul = 0.1,  # 学习率乘数：降低到0.1
-        d_model = 256,  # 模型维度：用于学习率计算
+        d_model = 512,  # 模型维度：用于学习率计算
         n_warmup_steps = 3200  # 预热步数：3200步
     )
 

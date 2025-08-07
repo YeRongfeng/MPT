@@ -342,7 +342,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
     plt.close()  # 关闭图像以释放内存
 
 if __name__ == "__main__":
-    epoch = 54
+    epoch = 29
     envType_list = ['desert']
     # envType_list = ['hill']
     save_path = 'predictions'
