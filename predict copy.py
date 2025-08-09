@@ -342,8 +342,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
     plt.close()  # 关闭图像以释放内存
 
 if __name__ == "__main__":
-    stage = 2
-    epoch = 9
+    epoch = 99
     envType_list = ['desert']
     # envType_list = ['hill']
     save_path = 'predictions'
@@ -356,11 +355,7 @@ if __name__ == "__main__":
     transformer = Models.UnevenTransformer(**model_param)
     _ = transformer.to(device)
 
-    # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
-    if stage == 1:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
-    else:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
+    checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
     transformer.load_state_dict(checkpoint['state_dict'])
 
     _ = transformer.eval()
@@ -368,8 +363,7 @@ if __name__ == "__main__":
     envType_random = np.random.choice(envType_list, size=1)[0]
     # 随机选择一个路径用于概率图对比
     # path_index = np.random.choice(range(500), size=1)[0]
-    # path_index_list = list(np.random.choice(range(500), size=6, replace=False))
-    path_index_list = list([163, 119, 340, 416, 148, 260])
+    path_index_list = list(np.random.choice(range(500), size=6, replace=False))
     print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 

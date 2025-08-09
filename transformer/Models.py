@@ -1106,19 +1106,51 @@ class UnevenTransformer(Transformer):
         """
         super().__init__(n_layers, n_heads, d_k, d_v, d_model, d_inner, pad_idx, dropout, n_position, train_shape)
 
-        # 重新定义编码器的CNN特征提取部分，以适应不平坦地面的4通道输入
+        # # 重新定义编码器的CNN特征提取部分，以适应不平坦地面的4通道输入
+        # self.encoder.to_patch_embedding = nn.Sequential(
+        #     nn.Conv2d(6, 6, kernel_size=3),     # 第一层卷积：4输入通道->6输出通道，3x3卷积核，提取基础特征
+        #     nn.MaxPool2d(kernel_size=2),        # 最大池化：2x2池化核，降低空间分辨率
+        #     nn.ReLU(),                          # ReLU激活函数：引入非线性变换
+        #     nn.Conv2d(6, 16, kernel_size=3),    # 第二层卷积：6->16通道，3x3卷积核，进一步提取特征
+        #     nn.MaxPool2d(kernel_size=2),        # 第二次最大池化：继续降低分辨率
+        #     nn.ReLU(),                          # 第二个ReLU激活
+        #     nn.Conv2d(16, d_model,              # 第三层卷积：16->d_model通道，3x3卷积核，进一步提取特征并调整维度
+        #               kernel_size=3, 
+        #               stride=2, 
+        #               padding=1),               
+        # )
+        
+        # 重新定义编码器的CNN特征提取部分
         self.encoder.to_patch_embedding = nn.Sequential(
-            nn.Conv2d(6, 6, kernel_size=3),     # 第一层卷积：4输入通道->6输出通道，3x3卷积核，提取基础特征
-            nn.MaxPool2d(kernel_size=2),        # 最大池化：2x2池化核，降低空间分辨率
-            nn.ReLU(),                          # ReLU激活函数：引入非线性变换
-            nn.Conv2d(6, 16, kernel_size=3),    # 第二层卷积：6->16通道，3x3卷积核，进一步提取特征
-            nn.MaxPool2d(kernel_size=2),        # 第二次最大池化：继续降低分辨率
-            nn.ReLU(),                          # 第二个ReLU激活
-            nn.Conv2d(16, d_model,              # 第三层卷积：16->d_model通道，3x3卷积核，进一步提取特征并调整维度
-                      kernel_size=3, 
-                      stride=2, 
-                      padding=1),               
+            # Block 1
+            nn.Conv2d(6, d_model//8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//8),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 50×50
+            
+            # Block 2
+            nn.Conv2d(d_model//8, d_model//4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//4),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 25×25
+            
+            # Block 3
+            nn.Conv2d(d_model//4, d_model//2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 12×12
+            
+            # Block 4
+            nn.Conv2d(d_model//2, d_model, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model),
+            nn.ReLU(),
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model),
+            nn.ReLU(),             
         )
+        
+        # 输出层归一化
+        # self.layer_norm = nn.LayerNorm(d_model)
         
         # 更新分类头的输出维度，以适应不平坦地面的预测需求
         self.classPred = nn.Sequential(
@@ -1135,13 +1167,15 @@ class UnevenTransformer(Transformer):
         self.correctionPred = nn.Sequential(
             # 输入尺寸：(batch_size, seq_len, d_model + output_dim)
             Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
-            nn.Conv2d(d_model + output_dim, 3 * output_dim, kernel_size=1),  # 1x1卷积：将拼接后的特征映射为3 * output_dim维度
+            nn.Conv2d(d_model + output_dim, 3 * output_dim, kernel_size=3, padding=1),  # 3x3卷积：将拼接后的特征映射为3 * output_dim维度
             Rearrange('bc d 1 1 -> bc d'),  # 维度重排：将4D卷积输出重排为(batch_size, seq_len, 3*output_dim)格式
         )
         
     def forward(self, input_map):
         # 模型前向传播函数，需要输出分类结果和修正结果
         enc_output, *_ = self.encoder(input_map)  # 编码阶段：通过编码器处理输入地图，获得特征表示，*_忽略可能的注意力权重返回值
+        
+        # enc_output = self.layer_norm(enc_output)  # 输出层归一化：对编码器输出进行层归一化，稳定训练过程
         
         seq_logit = self.classPred(enc_output)  # 分类预测：通过分类头将编码特征转换为每个位置的类别logits（未归一化）
         batch_size = input_map.shape[0]  # 获取批量大小：从输入张量的第0维获取batch_size，用于后续维度重排

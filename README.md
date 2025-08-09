@@ -64,6 +64,14 @@ uv run train.py --batchSize=32 --forestDir=data/forest --fileDir=data/point_robo
 
 uv run train_uneven.py --batchSize=32 --env_list=desert --dataFolder=data/test_training --fileDir=data/uneven
 
+uv run train_uneven.py --batchSize=32 --env_list=desert --dataFolder=data/test_training --fileDir=data/uneven --load_stage1_model=data/uneven/stage1_model_epoch_39.pkl
+
+# 正常的两阶段训练
+uv run train_uneven.py --batchSize 32 --env_list uneven --dataFolder /path/to/data --fileDir /path/to/save
+
+# 加载第一阶段模型直接开始第二阶段训练
+uv run train_uneven.py --batchSize 32 --env_list uneven --dataFolder /path/to/data --fileDir /path/to/save --load_stage1_model /path/to/stage1_model.pkl
+
 ```
 
 ### Pre-trained Models

@@ -31,11 +31,11 @@ anchor_spacing = 8
 boundary_offset = 6
 
 map_size = (input_size, input_size)  # 地图尺寸：100x100像素的标准地图大小
-receptive_field = 18   # 感受野大小：每个锚点影响的像素范围 TODO
+receptive_field = 38   # 感受野大小：每个锚点影响的像素范围 TODO
 res = 0.1              # 地图分辨率：每像素代表0.05米的实际距离
 
 # 【锚点网格系统构建】
-# 将连续的地图空间离散化为24x24的锚点网格，用于Transformer的token化处理
+# 将连续的地图空间离散化为12x12的锚点网格，用于Transformer的token化处理
 
 # X轴锚点坐标：从6像素开始，每8像素一个锚点，转换为几何坐标: 
 # [6, 14, 22, ..., 94] * res - 5 = [-4.4, -3.6, -2.8, ..., 4.4] 米
