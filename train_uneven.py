@@ -253,16 +253,16 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 start_xy = start_state[i][:2]
                 goal_xy = goal_state[i][:2]
                 
-                # 重用回归损失中计算的预测坐标（如果有的话）
-                if loss_weights['regression'] > 0:
+                # 使用预测坐标构建完整轨迹（如果有回归损失计算）
+                if loss_weights['regression'] > 0 and weighted_coords is not None:
                     # 构建完整轨迹：起点 + 预测点 + 终点
                     full_coords = torch.cat([
                         start_xy.unsqueeze(0),
-                        weighted_coords,  # 来自回归损失计算
+                        weighted_coords,  # 来自回归损失计算的预测坐标
                         goal_xy.unsqueeze(0)
                     ], dim=0)  # [steps_to_process+2, 2]
                 else:
-                    # 如果没有回归损失，使用简化版本
+                    # 如果没有回归损失计算，使用真实轨迹坐标
                     full_coords = trajectory_copy[i, :, :2]
                 
                 # 计算速度向量 - 张量并行（中心差分）
