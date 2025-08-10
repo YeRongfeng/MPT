@@ -1156,7 +1156,19 @@ class UnevenTransformer(Transformer):
         self.classPred = nn.Sequential(
             # 输入尺寸：(batch_size, seq_len, d_model)
             Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
-            nn.Conv2d(d_model, output_dim, kernel_size=1),  # 1x1卷积：将d_model维特征映射为(output_dim=)n步的预测输出
+            
+            # nn.Conv2d(d_model, output_dim, kernel_size=1),  # 1x1卷积：将d_model维特征映射为(output_dim=)n步的预测输出
+            
+            nn.Conv2d(d_model, d_model // 2, kernel_size=3, padding=1),  # 第一层：特征提取和降维
+            nn.BatchNorm2d(d_model // 2),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(d_model // 2, d_model // 2, kernel_size=3, padding=1),  # 第二层：通道数保持，深层特征提取
+            nn.BatchNorm2d(d_model // 2),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv2d(d_model // 2, output_dim, kernel_size=1),  # 第三层：输出层，将特征映射到(output_dim=)n步的预测输出
+            
             Rearrange('bc d 1 1 -> bc d'),   # 维度重排：将4D卷积输出重排回2D格式，移除空间维度
             # 这里需要特殊处理来对seq_len维度进行Softmax归一化
             # 输出尺寸：(batch_size * seq_len, output_dim)
@@ -1167,7 +1179,20 @@ class UnevenTransformer(Transformer):
         self.correctionPred = nn.Sequential(
             # 输入尺寸：(batch_size, seq_len, d_model + output_dim)
             Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
-            nn.Conv2d(d_model + output_dim, 3 * output_dim, kernel_size=3, padding=1),  # 3x3卷积：将拼接后的特征映射为3 * output_dim维度
+            
+            # 第一层：特征提取和降维
+            nn.Conv2d(d_model + output_dim, (d_model + output_dim) // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d((d_model + output_dim) // 2),
+            nn.ReLU(inplace=True),
+            
+            # 第二层：通道数保持，深层特征提取
+            nn.Conv2d((d_model + output_dim) // 2, (d_model + output_dim) // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d((d_model + output_dim) // 2),
+            nn.ReLU(inplace=True),
+            
+            # 第三层：输出层
+            nn.Conv2d((d_model + output_dim) // 2, 3 * output_dim, kernel_size=1),  # 1x1卷积作为最终输出
+            
             Rearrange('bc d 1 1 -> bc d'),  # 维度重排：将4D卷积输出重排为(batch_size, seq_len, 3*output_dim)格式
         )
         

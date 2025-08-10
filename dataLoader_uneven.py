@@ -32,7 +32,19 @@ boundary_offset = 6
 
 map_size = (input_size, input_size)  # 地图尺寸：100x100像素的标准地图大小
 receptive_field = 38   # 感受野大小：每个锚点影响的像素范围 TODO
-res = 0.1              # 地图分辨率：每像素代表0.05米的实际距离
+res = 0.1              # 地图分辨率：每像素代表0.1米的实际距离
+
+# 【理论最大正样本数自动计算】
+# 感受野区域大小：receptive_field * res = 38 * 0.1 = 3.8米
+# 锚点间距：anchor_spacing * res = 8 * 0.1 = 0.8米
+# x方向最大锚点数：ceil(3.8 / 0.8) = 5个
+# y方向最大锚点数：ceil(3.8 / 0.8) = 5个
+# 理论最大正样本数：5 × 5 = 25个
+import math
+receptive_field_size = receptive_field * res  # 感受野的实际大小（米）
+anchor_spacing_size = anchor_spacing * res    # 锚点间距的实际大小（米）
+max_anchors_per_axis = math.ceil(receptive_field_size / anchor_spacing_size)  # 每个轴向最大锚点数
+MAX_POSITIVE_ANCHORS = max_anchors_per_axis * max_anchors_per_axis  # 理论最大正样本数
 
 # 【锚点网格系统构建】
 # 将连续的地图空间离散化为12x12的锚点网格，用于Transformer的token化处理
@@ -49,17 +61,24 @@ Y = np.arange(boundary_offset, output_grid*anchor_spacing+boundary_offset, ancho
 grid_2d = np.meshgrid(X, Y)  # 创建X-Y坐标网格
 
 # 网格点重排：将2D网格转换为(N, 2)的点列表，N=144个锚点
-grid_points = rearrange(grid_2d, 'c h w->(h w) c')  # 形状：(144, 2)
+# 注意：必须与hashTable的生成顺序保持一致！
+# hashTable按列优先顺序：for c in range(output_grid) for r in range(output_grid)
+# 因此grid_points也必须按相同顺序重排
+XX, YY = grid_2d[0], grid_2d[1]  # XX是x坐标矩阵，YY是y坐标矩阵
+grid_points = np.array([[XX[r, c], YY[r, c]] 
+                       for c in range(output_grid) for r in range(output_grid)])  # 形状：(144, 2)
+
+# print(grid_points)
 
 # 哈希表：锚点索引到像素坐标的映射表
 hashTable = [(anchor_spacing*r+boundary_offset, anchor_spacing*c+boundary_offset)
              for c in range(output_grid) for r in range(output_grid)]
 
 # 【网格系统说明】
-# 1. 锚点分布：10x10=100个锚点均匀分布在地图上
-# 2. 像素间距：每个锚点间隔10像素，对应1米的实际距离
-# 3. 边界偏移：起始偏移5像素，确保锚点不在地图边缘
-# 4. 坐标对应：每个锚点代表一个10x10像素的区域
+# 1. 锚点分布：12x12=144个锚点均匀分布在地图上
+# 2. 像素间距：每个锚点间隔8像素，对应0.8米的实际距离
+# 3. 边界偏移：起始偏移6像素，确保锚点不在地图边缘
+# 4. 坐标对应：每个锚点代表一个8x8像素的区域
 # 5. 索引映射：通过hashTable实现1D索引到2D像素坐标的转换
 
 def geom2pixMatpos(pos, res=0.1, size=(100, 100)):
@@ -108,83 +127,43 @@ def geom2pix(pos, res=0.1, size=(100, 100)):
 
 def PaddedSequence(batch):
     """
-    变长序列批处理整理函数（用于Transformer训练）
+    固定尺寸批处理整理函数（用于Transformer训练）
     
     【核心功能】
-    将不同长度的序列样本整理成统一的批处理格式，通过填充机制处理变长数据。
-    专门用于Transformer模型的训练，支持注意力掩码和长度信息的传递。
+    由于DataLoader已经确保所有样本的anchor和labels具有固定尺寸(MAX_POSITIVE_ANCHORS)，
+    此函数只需简单地将批处理数据堆叠即可，无需复杂的填充处理。
     
     【处理流程】
     1. 过滤无效样本：移除None值的样本
-    2. 地图数据拼接：将所有地图在batch维度上拼接
-    3. 序列数据填充：使用pad_sequence处理变长的anchor和labels
-    4. 长度信息记录：保存每个样本的实际长度用于掩码
-    5. 轨迹数据处理：将轨迹数据堆叠成批处理
+    2. 数据堆叠：直接堆叠所有数据到批处理维度
     
     Args:
         batch (list): 批处理样本列表
             每个元素包含：
-            - 'map': 地图张量，形状为(1, H, W, 4)
-            - 'anchor': 锚点序列，形状为(num_layers, max_anchors)
-            - 'labels': 标签序列，形状为(num_layers, max_anchors)
-            - 'trajectory': 轨迹序列，形状为(N, 3)
+            - 'map': 地图张量，形状为(1, C, H, W)
+            - 'anchor': 锚点序列，形状为(2*N, MAX_POSITIVE_ANCHORS) - 已固定尺寸
+            - 'labels': 标签序列，形状为(2*N, MAX_POSITIVE_ANCHORS) - 已固定尺寸
+            - 'trajectory': 轨迹序列，形状为(N+2, 3)
     
     Returns:
         dict: 整理后的批处理数据
-            - 'map': 批处理地图，形状为(B, H, W, 4)
-            - 'anchor': 填充后的锚点序列，形状为(B, num_layers, max_anchors_global)
-            - 'labels': 填充后的标签序列，形状为(B, num_layers, max_anchors_global)
-            - 'length': 每个样本的实际长度，形状为(B,)
-            - 'trajectory': 批处理轨迹序列，形状为(B, N, 3)
+            - 'map': 批处理地图，形状为(B, C, H, W)
+            - 'anchor': 批处理锚点序列，形状为(B, 2*N, MAX_POSITIVE_ANCHORS)
+            - 'labels': 批处理标签序列，形状为(B, 2*N, MAX_POSITIVE_ANCHORS)
+            - 'length': 每个样本的序列长度，形状为(B,) - 用于兼容性
+            - 'trajectory': 批处理轨迹序列，形状为(B, N+2, 3)
     """
-    data = {}
     # 过滤有效样本：移除None值，确保数据完整性
     valid_batch = [batch_i for batch_i in batch if batch_i is not None]
     
-    # 地图数据拼接：在batch维度上连接所有地图
-    data['map'] = torch.cat([batch_i['map'] for batch_i in valid_batch], dim=0)
-    
-    # 找到所有样本中的最大锚点数量
-    max_anchors_global = max(batch_i['anchor'].shape[1] for batch_i in valid_batch)
-    
-    # 填充锚点和标签到统一尺寸
-    padded_anchors = []
-    padded_labels = []
-    
-    for batch_i in valid_batch:
-        anchor = batch_i['anchor']  # [num_layers, max_anchors_i]
-        labels = batch_i['labels']  # [num_layers, max_anchors_i]
-        
-        current_max_anchors = anchor.shape[1]
-        
-        if current_max_anchors < max_anchors_global:
-            # 需要填充到最大长度
-            pad_size = max_anchors_global - current_max_anchors
-            
-            # 填充锚点（用-1填充）
-            anchor_pad = torch.full((anchor.shape[0], pad_size), -1, dtype=anchor.dtype)
-            anchor_padded = torch.cat([anchor, anchor_pad], dim=1)
-            
-            # 填充标签（用-1填充）
-            labels_pad = torch.full((labels.shape[0], pad_size), -1, dtype=labels.dtype)
-            labels_padded = torch.cat([labels, labels_pad], dim=1)
-        else:
-            anchor_padded = anchor
-            labels_padded = labels
-            
-        padded_anchors.append(anchor_padded)
-        padded_labels.append(labels_padded)
-    
-    # 现在所有张量都有相同的形状，可以安全地堆叠
-    data['anchor'] = torch.stack(padded_anchors)
-    data['labels'] = torch.stack(padded_labels)
-    
-    # 长度信息记录：每个样本的层数（实际上是固定的）
-    data['length'] = torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch])
-    
-    # 处理轨迹数据：将所有轨迹数据堆叠成批处理
-    if 'trajectory' in valid_batch[0]:
-        data['trajectory'] = torch.stack([batch_i['trajectory'] for batch_i in valid_batch])
+    # 由于所有样本已经具有固定尺寸，直接堆叠即可
+    data = {
+        'map': torch.stack([batch_i['map'] for batch_i in valid_batch]),  # [B, C, H, W]
+        'anchor': torch.stack([batch_i['anchor'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
+        'labels': torch.stack([batch_i['labels'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
+        'length': torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch]),  # [B,] - 序列长度
+        'trajectory': torch.stack([batch_i['trajectory'] for batch_i in valid_batch])  # [B, N+2, 3]
+    }
     
     return data
 
@@ -219,23 +198,24 @@ def get_encoder_input(normal_z, goal_state, start_state, normal_x, normal_y):
     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 1] = np.cos(start_angle)  # 起点朝向
     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 2] = np.sin(start_angle)  # 起点朝向
 
-    # 构造θ=<nx,ny>->(cosθ, sinθ)的映射
-    angle_map = np.zeros((normal_z.shape[0], normal_z.shape[1], 2))  # [H, W, 2]
-    for i in range(normal_z.shape[0]):
-        for j in range(normal_z.shape[1]):
-            n_xy_norm = np.linalg.norm([normal_x[i, j], normal_y[i, j]])
+    # # 构造θ=<nx,ny>->(cosθ, sinθ)的映射
+    # angle_map = np.zeros((normal_z.shape[0], normal_z.shape[1], 2))  # [H, W, 2]
+    # for i in range(normal_z.shape[0]):
+    #     for j in range(normal_z.shape[1]):
+    #         n_xy_norm = np.linalg.norm([normal_x[i, j], normal_y[i, j]])
             
-            if n_xy_norm == 0:
-                # 如果法向量为零，避免除以零
-                angle_map[i, j, 0] = 0.0
-                angle_map[i, j, 1] = 0.0
-            else:
-                # 归一化法向量
-                angle_map[i, j, 0] = normal_x[i, j] / n_xy_norm
-                angle_map[i, j, 1] = normal_y[i, j] / n_xy_norm
+    #         if n_xy_norm == 0:
+    #             # 如果法向量为零，避免除以零
+    #             angle_map[i, j, 0] = 0.0
+    #             angle_map[i, j, 1] = 0.0
+    #         else:
+    #             # 归一化法向量
+    #             angle_map[i, j, 0] = normal_x[i, j] / n_xy_norm
+    #             angle_map[i, j, 1] = normal_y[i, j] / n_xy_norm
     
-    # 拼接为6通道
-    encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, :3], angle_map[:, :, :2]), axis=2)  # [H, W, 6]
+    # # 拼接为6通道
+    # encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, :3], angle_map[:, :, :2]), axis=2)  # [H, W, 6]
+    encoded_input = np.concatenate((normal_x[:, :, None], normal_y[:, :, None], normal_z[:, :, None], context_map[:, :, :3]), axis=2)
     return encoded_input
 
 # def get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y):
@@ -774,20 +754,24 @@ class UnevenPathDataLoader(Dataset):
         # print(f"轨迹点数量: {num_trajectory_points}")
         # print(f"轨迹形状: {trajectory.shape}")
         
-        # 为每个轨迹点找到对应的锚点
+        # 为每个轨迹点找到对应的锚点（固定尺寸处理）
         positive_anchors_per_point = []  # 每个轨迹点对应的锚点列表
         for pos in path_xy:
             indices, = geom2pixMatpos(pos, res=res, size=map_tensor.shape[:2])
-            # print(f"位置 {pos} 对应的锚点索引: {indices}")
-            positive_anchors_per_point.append(list(set(indices)))
-
-        # 找到最大锚点数量，用于填充
-        max_anchors = max(len(anchors) for anchors in positive_anchors_per_point) if positive_anchors_per_point else 0
+            current_anchors = list(set(indices))
+            
+            # 固定尺寸处理：确保每个轨迹点的正样本数量都是MAX_POSITIVE_ANCHORS
+            if len(current_anchors) > MAX_POSITIVE_ANCHORS:
+                # 如果超过最大值，随机采样到固定数量
+                current_anchors = np.random.choice(current_anchors, size=MAX_POSITIVE_ANCHORS, replace=False).tolist()
+            else:
+                # 如果不足最大值，用-1填充到固定数量
+                current_anchors.extend([-1] * (MAX_POSITIVE_ANCHORS - len(current_anchors)))
+            
+            positive_anchors_per_point.append(current_anchors)
         
-        # 填充正样本锚点到统一长度
-        for anchors in positive_anchors_per_point:
-            while len(anchors) < max_anchors:
-                anchors.append(-1)  # 用-1填充
+        # 现在所有轨迹点的正样本数量都是MAX_POSITIVE_ANCHORS
+        max_anchors = MAX_POSITIVE_ANCHORS
                        
         # 生成负样本：为每个轨迹点生成对应的负样本
         # 每个轨迹点的负样本应该是该点正样本的补集，而不是全体正样本的补集
@@ -825,7 +809,7 @@ class UnevenPathDataLoader(Dataset):
         
         # 转换为PyTorch张量
         return {
-            'map': torch.as_tensor(encoded_input, dtype=torch.float).permute(2, 0, 1)[None, :],  # 地图：(1, 4, H, W) - 转换为channels-first格式
+            'map': torch.as_tensor(encoded_input, dtype=torch.float).permute(2, 0, 1),  # 地图：(C, H, W) - 转换为channels-first格式
             'anchor': anchor,  # 锚点索引：(N, M)
             'labels': labels,  # 锚点标签：(N, M)
             'trajectory': torch.as_tensor(trajectory, dtype=torch.float),  # 轨迹点：[N, 3]

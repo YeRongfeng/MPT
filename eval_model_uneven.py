@@ -39,6 +39,9 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
     hashTable = getHashTable(normal_z.shape)
     
+    # print(f"Hash table size: {len(hashTable)}")
+    # print(f"Hash table example: {hashTable[:5]}")  # 打印前5个锚点坐标
+    
     print(f"Input map shape: {normal_z.shape}")
     print(f"Encoder input shape: {encoder_input.shape}")
     
@@ -106,8 +109,23 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         predProb = predProb_list[dim]
 
         # 对每个全部锚点位置进行加权
-        weighted_x = sum(pos[0] * predProb[idx].item() for idx, pos in enumerate(hashTable))
-        weighted_y = sum(pos[1] * predProb[idx].item() for idx, pos in enumerate(hashTable))
+        threshold = max(0.01, 1.0 / num_tokens * 2)  # 动态阈值，至少为平均概率的2倍
+        
+        # 只对概率大于阈值的锚点进行加权计算
+        valid_indices = [idx for idx, prob in enumerate(predProb) if prob.item() > threshold]
+        
+        if valid_indices:
+            # 计算有效锚点的概率和坐标加权
+            valid_probs = [predProb[idx].item() for idx in valid_indices]
+            total_prob = sum(valid_probs)
+            
+            # 归一化概率并计算加权坐标
+            weighted_y = sum(hashTable[idx][0] * (predProb[idx].item() / total_prob) for idx in valid_indices)
+            weighted_x = sum(hashTable[idx][1] * (predProb[idx].item() / total_prob) for idx in valid_indices)
+        else:
+            # 如果没有锚点超过阈值，使用所有锚点的加权平均
+            weighted_y = sum(pos[0] * predProb[idx].item() for idx, pos in enumerate(hashTable))
+            weighted_x = sum(pos[1] * predProb[idx].item() for idx, pos in enumerate(hashTable))
 
         # 映射回到实际坐标系
         weighted_x = -5 + weighted_x * 0.1  # 列对应x坐标
@@ -140,5 +158,8 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         
         # 添加到预测轨迹中
         predTraj.append((final_x, final_y, theta_rad))
+        
+    # print(f"Final_x range: {min(t[0] for t in predTraj)} to {max(t[0] for t in predTraj)}")
+    # print(f"Final_y range: {min(t[1] for t in predTraj)} to {max(t[1] for t in predTraj)}")
 
     return patch_maps, predProb_list, predTraj

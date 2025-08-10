@@ -33,20 +33,10 @@ def generate_ground_truth_labels(trajectory, hashTable, output_dim):
     Returns:
         gt_labels: [output_dim, num_tokens] ground truth标签分布
     """
-    from dataLoader_uneven import receptive_field
+    from dataLoader_uneven import receptive_field, geom2pixMatpos
     
-    def geom2pixMatpos(pos, res=0.1, size=(100, 100)):
-        """与dataLoader_uneven中相同的函数"""
-        # 将hashTable转换为网格点坐标
-        grid_points = np.array([(pos[1] * res - 5.0, pos[0] * res - 5.0) for pos in hashTable])  # (row, col) -> (x, y)
-        
-        # 筛选感受野区域内包含输入位置的锚点索引（感受野区域是矩形）
-        indices = np.where((grid_points[:, 0] >= pos[0] - receptive_field * res / 2) &
-                           (grid_points[:, 0] <= pos[0] + receptive_field * res / 2) &
-                           (grid_points[:, 1] >= pos[1] - receptive_field * res / 2) &
-                           (grid_points[:, 1] <= pos[1] + receptive_field * res / 2))
-        
-        return indices  # 返回正样本锚点索引元组
+    # 直接使用dataLoader_uneven中已修复的geom2pixMatpos函数
+    # 不再在这里重新实现，确保与训练时使用的完全一致
     
     num_tokens = len(hashTable)
     gt_labels = []
@@ -192,10 +182,18 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
         start_pos = trajectory[0, :]
         goal_pos = trajectory[-1, :]
         
+        # print(f"True_x range: {min(trajectory[:, 0])} to {max(trajectory[:, 0])}")
+        # print(f"True_y range: {min(trajectory[:, 1])} to {max(trajectory[:, 1])}")
+        
+        print(f"True Traj: {trajectory}")
+        
         # 获取预测轨迹
         # patch_map, predProb, predTraj = get_patch(transformer, start_pos[:2], goal_pos[:2], normal_x, normal_y, normal_z)
         patch_map, predProb, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
         output_dim = patch_map.shape[0]
+        # print(f"normal_z shape: {normal_z.shape}")
+        
+        print(f"Predicted Traj: {predTraj}")
         
         # 创建左侧子图 - 预测轨迹
         ax_pred = fig.add_subplot(gs[row, col])
@@ -296,7 +294,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
         # 将锚点的概率值和标签值映射到对应的像素位置
         for token_idx, (anchor_row, anchor_col) in enumerate(hashTable):
             if 0 <= anchor_row < map_height and 0 <= anchor_col < map_width:
-                pred_prob_map[anchor_col, anchor_row] = pred_prob_step[token_idx]
+                pred_prob_map[anchor_row, anchor_col] = pred_prob_step[token_idx]
                 gt_labels_map[anchor_row, anchor_col] = gt_labels_step[token_idx]
         
         # 左侧子图 - 预测概率分布
@@ -307,8 +305,8 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
         ax_pred.axis('off')
         
         # 在预测图上叠加轨迹点
-        if step < len(trajectory) - 2:  # 确保索引有效
-            traj_point = trajectory[step + 1]  # +1因为去掉了起点
+        if step < len(trajectory):  # 确保索引有效
+            traj_point = trajectory[step+1]  # +1因为去掉了起点
             ax_pred.scatter(traj_point[0], traj_point[1], color='red', s=50, marker='x', linewidth=3)
         
         # 右侧子图 - Ground Truth标签分布
@@ -319,8 +317,8 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
         ax_gt.axis('off')
         
         # 在GT图上叠加轨迹点
-        if step < len(trajectory) - 2:  # 确保索引有效
-            traj_point = trajectory[step + 1]  # +1因为去掉了起点
+        if step < len(trajectory):  # 确保索引有效
+            traj_point = trajectory[step+1]  # +1因为去掉了起点
             ax_gt.scatter(traj_point[0], traj_point[1], color='blue', s=50, marker='x', linewidth=3)
         
         # 添加颜色条
@@ -342,7 +340,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
     plt.close()  # 关闭图像以释放内存
 
 if __name__ == "__main__":
-    epoch = 99
+    epoch = 19
     envType_list = ['desert']
     # envType_list = ['hill']
     save_path = 'predictions'
@@ -355,7 +353,7 @@ if __name__ == "__main__":
     transformer = Models.UnevenTransformer(**model_param)
     _ = transformer.to(device)
 
-    checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
+    checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))        
     transformer.load_state_dict(checkpoint['state_dict'])
 
     _ = transformer.eval()
@@ -363,13 +361,14 @@ if __name__ == "__main__":
     envType_random = np.random.choice(envType_list, size=1)[0]
     # 随机选择一个路径用于概率图对比
     # path_index = np.random.choice(range(500), size=1)[0]
-    path_index_list = list(np.random.choice(range(500), size=6, replace=False))
+    # path_index_list = list(np.random.choice(range(500), size=6, replace=False))
+    path_index_list = list([163, 119, 340, 416, 148, 260])
     print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 
     # 绘制多条轨迹的预测概率图和GT标签图对比
-    for path_index in path_index_list:
-        plot_predProb_map(path_index, envType_random, save_path)
+    # for path_index in path_index_list:
+    #     plot_predProb_map(path_index, envType_random, save_path)
         
     # 绘制多组轨迹对比图
     plot_elevation_map(path_index_list, envType_random, save_path)

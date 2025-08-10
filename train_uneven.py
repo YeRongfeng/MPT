@@ -56,7 +56,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     if stage == 1:
         # 第一阶段：只计算分类损失
         loss_weights = {
-            'classification': 4e-2, # 分类损失权重(L_ce) - 主要损失
+            'classification': 2e-1, # 分类损失权重(L_ce) - 主要损失
             'regression': 0.0,      # 回归损失权重(L_mse) - 关闭
             'uniformity': 0,        # 轨迹点分布均匀性损失权重(L_uni)
             'angle': 0,             # 角度一致性损失权重(L_angle)
@@ -64,10 +64,10 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     else:
         # 第二阶段：计算回归损失 - 平衡稳定性和学习效率
         loss_weights = {
-            'classification': 8e-3,  # 适度降低分类损失权重，保持学习能力
-            'regression': 6e-3,      # 适度降低回归损失权重，保持学习能力
-            'uniformity': 15e-3,     # 适度降低均匀性损失权重，保持学习能力
-            'angle': 2e-3,           # 适度降低角度损失权重，保持学习能力
+            'classification': 0e-3,  # 适度降低分类损失权重，保持学习能力
+            'regression': 5e-3,      # 适度降低回归损失权重，保持学习能力
+            'uniformity': 0e-2,      # 适度降低均匀性损失权重，保持学习能力
+            'angle': 0e-2,           # 适度降低角度损失权重，保持学习能力
         }
 
     # 用于统计标签分布
@@ -80,99 +80,126 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         anchorPoint = anchorPoints[i]  # [num_layers, max_anchors]
         trueLabel = trueLabels[i]  # [num_layers, max_anchors]
         
-        # 损失1：锚点分类交叉熵损失(L_ce)
-        # 对每个锚点行分别计算损失和准确率，包括正样本和负样本
+        # 损失1：锚点分类交叉熵损失(L_ce) - 使用张量并行计算
+        # 由于DataLoader已经保证了固定尺寸，可以直接进行批量处理
         if loss_weights['classification'] > 0:
             num_anchor_rows = anchorPoint.shape[0]  # 总行数 = 2 * num_trajectory_points
-        
-            for step in range(num_anchor_rows):  # 处理所有锚点行
-                # 获取当前时间步的预测 [num_tokens] - 所有锚点位置在这个时间步的预测
-                step_pred = predVals[i, :, step % output_dim]  # 使用模运算循环使用预测维度
+            
+            # 检查锚点索引是否在有效范围内
+            valid_anchor_mask = (anchorPoint >= 0) & (anchorPoint < num_tokens) & (trueLabel != -1)
+            if not valid_anchor_mask.any():
+                # 如果没有有效的锚点，跳过这个样本
+                continue
+            
+            # 批量处理所有时间步的损失计算
+            step_indices = torch.arange(num_anchor_rows, device=predVals.device) % output_dim
+            
+            # 获取所有时间步的预测 [num_anchor_rows, num_tokens]
+            all_step_preds = predVals[i, :, step_indices].t()  # [num_anchor_rows, num_tokens]
+            
+            # 为每个时间步创建全图标签张量 [num_anchor_rows, num_tokens] - 完全并行化
+            full_labels_batch = torch.zeros(num_anchor_rows, num_tokens, device=predVals.device)
+            
+            # 创建有效掩码 [num_anchor_rows, MAX_POSITIVE_ANCHORS]
+            valid_mask = (anchorPoint != -1) & (trueLabel != -1) & (anchorPoint < num_tokens)
+            
+            # 使用高级索引批量设置所有标签
+            if valid_mask.any():
+                # 获取所有有效位置的索引
+                step_indices, anchor_indices = torch.where(valid_mask)  # 有效位置的(step, anchor)索引对
                 
-                # 获取当前时间步对应的锚点和标签
-                anchor_step = anchorPoint[step]  # [max_anchors]
-                label_step = trueLabel[step]     # [max_anchors]
-                
-                # 过滤掉填充值(-1)
-                valid_mask = (anchor_step != -1) & (label_step != -1)
-                valid_anchors = anchor_step[valid_mask]
-                valid_labels = label_step[valid_mask]
-                
-                if len(valid_anchors) == 0:  # 如果没有有效的锚点，跳过
-                    continue
-                
-                # 检查锚点索引是否在有效范围内
-                max_anchor_idx = valid_anchors.max().item()
-                if max_anchor_idx >= num_tokens:
-                    print(f"Warning: anchor index {max_anchor_idx} >= num_tokens {num_tokens}, skipping")
-                    continue
-                
-                # 创建全图标签：默认所有位置都是负样本(0)
-                full_labels = torch.zeros(num_tokens, device=predVals.device)
-                
-                # 将有效锚点位置设置为对应的真实标签
-                full_labels[valid_anchors] = valid_labels.float()
-                
-                # 将标签归一化为概率分布（与softmax输出匹配）
-                if full_labels.sum() > 0:
-                    full_labels = full_labels / full_labels.sum()  # 归一化使和为1
-                
-                # 使用更稳定的KL散度计算 - 进一步增强数值稳定性
-                # 确保step_pred不会过于接近0或1
-                step_pred_stable = torch.clamp(step_pred, min=1e-8, max=1.0-1e-8)
-                
-                # 对标签也进行稳定性处理
-                full_labels_stable = torch.clamp(full_labels, min=1e-8, max=1.0-1e-8)
-                
-                # 重新归一化以确保概率分布有效
-                if full_labels_stable.sum() > 0:
-                    full_labels_stable = full_labels_stable / full_labels_stable.sum()
-                
-                # 使用更稳定的KL散度损失计算
-                loss = F.kl_div(torch.log(step_pred_stable), full_labels_stable, reduction='batchmean')
-                
-                # 额外的数值稳定性检查
-                if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 50:  # 降低异常阈值
-                    print(f"Warning: Abnormal classification loss: {loss.item()}")
-                    print(f"step_pred range: [{step_pred.min().item():.6f}, {step_pred.max().item():.6f}]")
-                    print(f"full_labels range: [{full_labels.min().item():.6f}, {full_labels.max().item():.6f}]")
-                    continue  # 跳过这个异常的批次
+                if len(step_indices) > 0:
+                    # 批量获取有效的锚点索引和标签值
+                    valid_anchor_positions = anchorPoint[step_indices, anchor_indices]  # 锚点在tokens中的位置
+                    valid_label_values = trueLabel[step_indices, anchor_indices].float()  # 对应的标签值
                     
-                total_loss += loss * loss_weights['classification']  # 分类损失(L_ce)
+                    # 批量设置标签值
+                    full_labels_batch[step_indices, valid_anchor_positions] = valid_label_values
+                    
+                    # 按行归一化为概率分布
+                    row_sums = full_labels_batch.sum(dim=1, keepdim=True)  # [num_anchor_rows, 1]
+                    nonzero_mask = (row_sums > 0).squeeze(1)  # [num_anchor_rows]
+                    if nonzero_mask.any():
+                        full_labels_batch[nonzero_mask] = full_labels_batch[nonzero_mask] / row_sums[nonzero_mask]
+            
+            # 数值稳定性处理
+            all_step_preds_stable = torch.clamp(all_step_preds, min=1e-8, max=1.0-1e-8)
+            full_labels_stable = torch.clamp(full_labels_batch, min=1e-8, max=1.0-1e-8)
+            
+            # 重新归一化以确保概率分布有效
+            label_sums = full_labels_stable.sum(dim=1, keepdim=True)
+            label_sums = torch.clamp(label_sums, min=1e-8)
+            full_labels_stable = full_labels_stable / label_sums
+            
+            # 批量计算KL散度损失 [num_anchor_rows]
+            kl_losses = F.kl_div(
+                torch.log(all_step_preds_stable), 
+                full_labels_stable, 
+                reduction='none'
+            ).sum(dim=1)  # 对每个时间步求和
+            
+            # 过滤掉异常值并求平均
+            valid_loss_mask = ~(torch.isnan(kl_losses) | torch.isinf(kl_losses) | (kl_losses > 50))
+            if valid_loss_mask.any():
+                classification_loss = kl_losses[valid_loss_mask].mean()
+                total_loss += classification_loss * loss_weights['classification']
                 loss_count += 1
+            else:
+                print(f"Warning: All classification losses are abnormal, skipping")
+            
+            # 批量计算准确率 - 完全并行化处理
+            threshold = max(0.01, 1.0 / num_tokens * 2)
+            
+            # 创建有效锚点和标签的掩码 [num_anchor_rows, MAX_POSITIVE_ANCHORS]
+            valid_anchor_mask = (anchorPoint != -1) & (trueLabel != -1) & (anchorPoint < num_tokens)
+            
+            if valid_anchor_mask.any():
+                # 批量收集所有有效的预测值和标签
+                all_valid_preds = []
+                all_valid_labels = []
+                all_valid_positive_labels = []
+                all_valid_negative_labels = []
                 
-                # # 改动：对背景位置计算BCE loss，保证概率集中于正样本锚点区域
-                # background_mask = (full_labels == 0)  # 背景位置的掩码
-                # if background_mask.any():  # 如果有背景位置
-                #     background_preds = step_pred[background_mask]
-                #     background_labels = full_labels[background_mask]
-                #     if len(background_preds) > 0:  # 确保有背景位置
-                #         loss = F.binary_cross_entropy_with_logits(background_preds, background_labels)
-                #         total_loss += loss * loss_weights['classification']  # 分类损失(L_ce)
-                #         loss_count += 1
+                # 使用高级索引批量提取有效的预测和标签
+                for step in range(num_anchor_rows):
+                    step_mask = valid_anchor_mask[step]  # [MAX_POSITIVE_ANCHORS]
+                    if step_mask.any():
+                        valid_anchors = anchorPoint[step][step_mask]  # 有效锚点索引
+                        valid_labels = trueLabel[step][step_mask]     # 有效标签
+                        step_pred = all_step_preds[step]             # [num_tokens]
+                        
+                        # 提取对应锚点的预测值
+                        selected_preds = step_pred[valid_anchors]    # 有效锚点的预测值
+                        
+                        all_valid_preds.append(selected_preds)
+                        all_valid_labels.append(valid_labels)
+                        all_valid_positive_labels.append(valid_labels == 1)
+                        all_valid_negative_labels.append(valid_labels == 0)
                 
-                # 计算准确率 - 只在锚点位置计算准确率
-                selected_preds = step_pred.index_select(0, valid_anchors)
-                
-                # 对于概率分布，我们认为概率>阈值的位置为正预测
-                # 这里使用动态阈值：如果是softmax分布，平均概率为1/num_tokens
-                threshold = max(0.01, 1.0 / num_tokens * 2)  # 动态阈值，至少为平均概率的2倍
-                classPred = (selected_preds > threshold).long()  # 将概率转换为预测类别
-                
-                # 统计正确预测数（只统计锚点位置）
-                correct_predictions = classPred.eq(valid_labels.long()).sum().item()
-                n_correct += correct_predictions
-                total_samples += len(valid_labels)
-                
-                # 统计标签分布（只统计锚点位置）
-                positive_labels = (valid_labels == 1).sum().item()
-                negative_labels = (valid_labels == 0).sum().item()
-                total_positive += positive_labels
-                total_negative += negative_labels
-                
-                # 统计各类别的正确预测（只统计锚点位置）
-                correct_positive += ((classPred == 1) & (valid_labels == 1)).sum().item()
-                correct_negative += ((classPred == 0) & (valid_labels == 0)).sum().item()
+                if all_valid_preds:
+                    # 将所有有效数据拼接成单个张量进行批量处理
+                    batch_valid_preds = torch.cat(all_valid_preds)      # [total_valid_samples]
+                    batch_valid_labels = torch.cat(all_valid_labels)    # [total_valid_samples]
+                    batch_positive_mask = torch.cat(all_valid_positive_labels)  # [total_valid_samples]
+                    batch_negative_mask = torch.cat(all_valid_negative_labels)  # [total_valid_samples]
+                    
+                    # 批量计算预测类别
+                    batch_class_preds = (batch_valid_preds > threshold).long()  # [total_valid_samples]
+                    
+                    # 批量统计正确预测数
+                    batch_correct = batch_class_preds.eq(batch_valid_labels.long())  # [total_valid_samples]
+                    n_correct += batch_correct.sum().item()
+                    total_samples += len(batch_valid_labels)
+                    
+                    # 批量统计标签分布
+                    total_positive += batch_positive_mask.sum().item()
+                    total_negative += batch_negative_mask.sum().item()
+                    
+                    # 批量统计各类别的正确预测
+                    correct_positive_mask = (batch_class_preds == 1) & batch_positive_mask
+                    correct_negative_mask = (batch_class_preds == 0) & batch_negative_mask
+                    correct_positive += correct_positive_mask.sum().item()
+                    correct_negative += correct_negative_mask.sum().item()
             
         # 损失2：轨迹回归损失(L_mse) - 使用张量并行计算
         # 不仅计算位置的回归损失，还计算角度的回归损失，但是角度需要特殊处理
@@ -186,31 +213,75 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # predVals已经经过softmax归一化，直接使用
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
                 
-                # 计算所有时间步的加权坐标
-                # 扩展hashTable以计算所有时间步 [num_tokens, 2, steps_to_process]
-                expanded_hash = hash_table_tensor.unsqueeze(-1).expand(-1, -1, steps_to_process)
+                # 对每个时间步分别计算加权坐标，只对概率大于阈值的锚点进行加权计算
+                weighted_coords_list = []
+                num_tokens = pred_probs.shape[0]
                 
-                # 扩展概率以匹配哈希表维度 [num_tokens, steps_to_process] -> [num_tokens, 1, steps_to_process]
-                expanded_probs = pred_probs.unsqueeze(1)
+                for step in range(steps_to_process):
+                    step_prob = pred_probs[:, step]  # [num_tokens]
+                    
+                    # 动态阈值，至少为平均概率的2倍
+                    threshold = max(0.01, 1.0 / num_tokens * 2)
+                    
+                    # 只对概率大于阈值的锚点进行加权计算
+                    valid_mask = step_prob > threshold
+                    valid_indices = torch.where(valid_mask)[0]
+                    
+                    if len(valid_indices) > 0:
+                        # 计算有效锚点的概率和坐标加权
+                        valid_probs = step_prob[valid_indices]
+                        total_prob = valid_probs.sum()
+                        
+                        # 归一化概率并计算加权坐标
+                        if total_prob > 0:
+                            normalized_probs = valid_probs / total_prob
+                            weighted_x = torch.sum(hash_table_tensor[valid_indices, 0] * normalized_probs)
+                            weighted_y = torch.sum(hash_table_tensor[valid_indices, 1] * normalized_probs)
+                        else:
+                            # 如果总概率为0，使用所有锚点的加权平均
+                            weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
+                            weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    else:
+                        # 如果没有锚点超过阈值，使用所有锚点的加权平均
+                        weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
+                        weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    
+                    weighted_coords_list.append(torch.stack([weighted_x, weighted_y]))
                 
-                # 乘法和求和得到加权坐标 [2, steps_to_process]
-                weighted_coords = torch.sum(expanded_hash * expanded_probs, dim=0)
+                # 将列表转换为张量 [2, steps_to_process]
+                weighted_coords = torch.stack(weighted_coords_list, dim=1)
+
+                # 依据概率进行修正量的计算 - 使用并行张量计算
+                # 提取修正值 [num_tokens, 2, steps_to_process]
+                offset_coords = correctionVals[i, :, :2, :steps_to_process]  # x, y 偏移量
+                
+                # 扩展概率分布以匹配偏移量维度 [num_tokens, steps_to_process] -> [num_tokens, 1, steps_to_process]
+                expanded_probs_correction = pred_probs.unsqueeze(1)  # [num_tokens, 1, steps_to_process]
+                
+                # 并行计算所有时间步的加权偏移量 [2, steps_to_process]
+                weighted_offsets = torch.sum(expanded_probs_correction * offset_coords, dim=0)
+                
+                # 计算修正后的坐标：基础坐标 + 加权偏移量 [2, steps_to_process]
+                corrected_coords_raw = weighted_coords + weighted_offsets
+                
+                # 转置以匹配预期格式 [steps_to_process, 2]
+                corrected_coords = corrected_coords_raw.t()
                 
                 # 将像素坐标映射回实际坐标系
-                weighted_coords = -5.0 + weighted_coords * 0.1
+                corrected_coords = -5.0 + corrected_coords * 0.1
                 
                 # 提取真实轨迹坐标和角度 [steps_to_process, 3]
-                true_trajectory = trajectory[i, :steps_to_process, :]
+                true_trajectory = trajectory[i, 1:steps_to_process+1, :]
                 true_coords = true_trajectory[:, :2]  # 位置坐标 [steps_to_process, 2]
                 true_angles = true_trajectory[:, 2]   # 角度信息 [steps_to_process]
                 
-                # 计算位置的MSE损失
-                coord_loss = F.mse_loss(weighted_coords.t(), true_coords)
+                # 计算修正后位置的MSE损失
+                coord_loss = F.mse_loss(corrected_coords, true_coords)
                 
                 # 检查坐标损失是否异常
                 if torch.isnan(coord_loss) or torch.isinf(coord_loss) or coord_loss.item() > 1000:
                     print(f"Warning: Abnormal coord loss: {coord_loss.item()}")
-                    print(f"weighted_coords range: [{weighted_coords.min().item():.3f}, {weighted_coords.max().item():.3f}]")
+                    print(f"corrected_coords range: [{corrected_coords.min().item():.3f}, {corrected_coords.max().item():.3f}]")
                     print(f"true_coords range: [{true_coords.min().item():.3f}, {true_coords.max().item():.3f}]")
                     coord_loss = torch.tensor(0.0, requires_grad=True, device=predVals.device)
                 
@@ -222,28 +293,53 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # 将角度转换为复数表示：e^(i*θ) = cos(θ) + i*sin(θ)
                 true_angles_complex = torch.complex(torch.cos(true_angles), torch.sin(true_angles))  # [steps_to_process]
                 
-                # 使用更稳定的角度预测计算
-                pred_angles_complex_list = []
-                for step in range(steps_to_process):
-                    # 获取当前时间步的角度预测：[num_tokens]
-                    # correctionVals[i, :, 2, step] 是第i个样本，所有锚点，角度维度，第step个时间步
-                    step_angle_preds = correctionVals[i, :, 2, step]  # [num_tokens] - sigmoid输出，范围[0,1]
-                    
-                    # 确保角度预测在合理范围内
-                    step_angle_preds = torch.clamp(step_angle_preds, min=1e-7, max=1.0-1e-7)
-                    
-                    # 将sigmoid输出[0,1]转换为角度范围[-π,π]
-                    step_angle_preds_rad = step_angle_preds * 2 * np.pi - np.pi  # [num_tokens]
-                    
-                    # 转换为复数表示
-                    step_angles_complex = torch.complex(torch.cos(step_angle_preds_rad), torch.sin(step_angle_preds_rad))  # [num_tokens]
-                    
-                    # 使用概率加权计算平均角度
-                    step_probs = pred_probs[:, step]  # [num_tokens]
-                    weighted_angle_complex = torch.sum(step_probs * step_angles_complex)  # 标量复数
-                    pred_angles_complex_list.append(weighted_angle_complex)
+                # 提取所有时间步的角度预测 [num_tokens, steps_to_process]
+                step_angle_preds = correctionVals[i, :, 2, :steps_to_process]  # sigmoid输出，范围[0,1]
                 
-                pred_angles_complex = torch.stack(pred_angles_complex_list)  # [steps_to_process]
+                # 确保角度预测在合理范围内
+                step_angle_preds = torch.clamp(step_angle_preds, min=1e-7, max=1.0-1e-7)
+                
+                # 将sigmoid输出[0,1]转换为角度范围[-π,π] [num_tokens, steps_to_process]
+                step_angle_preds_rad = step_angle_preds * 2 * np.pi - np.pi
+                
+                # 转换为复数表示 [num_tokens, steps_to_process]
+                step_angles_complex = torch.complex(torch.cos(step_angle_preds_rad), torch.sin(step_angle_preds_rad))
+                
+                # 对每个时间步分别计算加权角度，只对概率大于阈值的锚点进行加权
+                pred_angles_complex_list = []
+                num_tokens = pred_probs.shape[0]
+                
+                for step in range(steps_to_process):
+                    step_prob = pred_probs[:, step]  # [num_tokens]
+                    step_complex = step_angles_complex[:, step]  # [num_tokens]
+                    
+                    # 动态阈值，至少为平均概率的2倍
+                    threshold = max(0.01, 1.0 / num_tokens * 2)
+                    
+                    # 只对概率大于阈值的锚点进行加权计算
+                    valid_mask = step_prob > threshold
+                    valid_indices = torch.where(valid_mask)[0]
+                    
+                    if len(valid_indices) > 0:
+                        # 计算有效锚点的概率和角度加权
+                        valid_probs = step_prob[valid_indices]
+                        total_prob = valid_probs.sum()
+                        
+                        # 归一化概率并计算加权角度
+                        if total_prob > 0:
+                            normalized_probs = valid_probs / total_prob
+                            pred_angle_complex = torch.sum(step_complex[valid_indices] * normalized_probs)
+                        else:
+                            # 如果总概率为0，使用所有锚点的加权平均
+                            pred_angle_complex = torch.sum(step_complex * step_prob)
+                    else:
+                        # 如果没有锚点超过阈值，使用所有锚点的加权平均
+                        pred_angle_complex = torch.sum(step_complex * step_prob)
+                    
+                    pred_angles_complex_list.append(pred_angle_complex)
+                
+                # 将列表转换为张量 [steps_to_process]
+                pred_angles_complex = torch.stack(pred_angles_complex_list)
                 
                 # 计算角度损失：在复数域中计算差异
                 angle_diff_complex = pred_angles_complex - true_angles_complex  # [steps_to_process]
@@ -306,27 +402,88 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 hash_table_tensor = torch.tensor(hashTable, device=predVals.device)  # [num_tokens, 2]
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
                 
-                # 计算加权坐标
-                expanded_hash = hash_table_tensor.unsqueeze(-1).expand(-1, -1, steps_to_process)
-                expanded_probs = pred_probs.unsqueeze(1)
-                weighted_coords = torch.sum(expanded_hash * expanded_probs, dim=0)  # [2, steps_to_process]
+                # 对每个时间步分别计算加权坐标，只对概率大于阈值的锚点进行加权计算
+                weighted_coords_list = []
+                num_tokens = pred_probs.shape[0]
+                
+                for step in range(steps_to_process):
+                    step_prob = pred_probs[:, step]  # [num_tokens]
+                    
+                    # 动态阈值，至少为平均概率的2倍
+                    threshold = max(0.01, 1.0 / num_tokens * 2)
+                    
+                    # 只对概率大于阈值的锚点进行加权计算
+                    valid_mask = step_prob > threshold
+                    valid_indices = torch.where(valid_mask)[0]
+                    
+                    if len(valid_indices) > 0:
+                        # 计算有效锚点的概率和坐标加权
+                        valid_probs = step_prob[valid_indices]
+                        total_prob = valid_probs.sum()
+                        
+                        # 归一化概率并计算加权坐标
+                        if total_prob > 0:
+                            normalized_probs = valid_probs / total_prob
+                            weighted_x = torch.sum(hash_table_tensor[valid_indices, 0] * normalized_probs)
+                            weighted_y = torch.sum(hash_table_tensor[valid_indices, 1] * normalized_probs)
+                        else:
+                            # 如果总概率为0，使用所有锚点的加权平均
+                            weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
+                            weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    else:
+                        # 如果没有锚点超过阈值，使用所有锚点的加权平均
+                        weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
+                        weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    
+                    weighted_coords_list.append(torch.stack([weighted_x, weighted_y]))
+                
+                # 将列表转换为张量 [2, steps_to_process]
+                weighted_coords = torch.stack(weighted_coords_list, dim=1)
                 weighted_coords = -5.0 + weighted_coords * 0.1  # 映射到实际坐标系
                 
-                # 获取预测角度
+                # 获取预测角度 - 对每个时间步分别计算，只对概率大于阈值的锚点进行加权
+                # 提取所有时间步的角度预测 [num_tokens, steps_to_process]
+                step_angle_preds_all = correctionVals[i, :, 2, :steps_to_process]  # sigmoid输出[0,1]
+                
+                # 确保角度预测在合理范围内
+                step_angle_preds_all = torch.clamp(step_angle_preds_all, min=1e-6, max=1.0-1e-6)
+                
+                # 转换到[-π,π] [num_tokens, steps_to_process]
+                step_angle_preds_rad_all = step_angle_preds_all * 2 * np.pi - np.pi
+                
+                # 对每个时间步分别计算加权角度，只对概率大于阈值的锚点进行加权
                 pred_angles_list = []
                 for step in range(steps_to_process):
-                    step_angle_preds = correctionVals[i, :, 2, step]  # [num_tokens] - sigmoid输出[0,1]
+                    step_prob = pred_probs[:, step]  # [num_tokens]
+                    step_angle_preds_rad = step_angle_preds_rad_all[:, step]  # [num_tokens]
                     
-                    # 确保角度预测在合理范围内
-                    step_angle_preds = torch.clamp(step_angle_preds, min=1e-6, max=1.0-1e-6)
+                    # 动态阈值，至少为平均概率的2倍
+                    threshold = max(0.01, 1.0 / num_tokens * 2)
                     
-                    step_angle_preds_rad = step_angle_preds * 2 * np.pi - np.pi  # 转换到[-π,π]
-                    # 使用概率加权计算平均角度
-                    step_probs = pred_probs[:, step]  # [num_tokens]
-                    weighted_angle = torch.sum(step_probs * step_angle_preds_rad)  # 标量
-                    pred_angles_list.append(weighted_angle)
+                    # 只对概率大于阈值的锚点进行加权计算
+                    valid_mask = step_prob > threshold
+                    valid_indices = torch.where(valid_mask)[0]
+                    
+                    if len(valid_indices) > 0:
+                        # 计算有效锚点的概率和角度加权
+                        valid_probs = step_prob[valid_indices]
+                        total_prob = valid_probs.sum()
+                        
+                        # 归一化概率并计算加权角度
+                        if total_prob > 0:
+                            normalized_probs = valid_probs / total_prob
+                            pred_angle = torch.sum(step_angle_preds_rad[valid_indices] * normalized_probs)
+                        else:
+                            # 如果总概率为0，使用所有锚点的加权平均
+                            pred_angle = torch.sum(step_angle_preds_rad * step_prob)
+                    else:
+                        # 如果没有锚点超过阈值，使用所有锚点的加权平均
+                        pred_angle = torch.sum(step_angle_preds_rad * step_prob)
+                    
+                    pred_angles_list.append(pred_angle)
                 
-                pred_angles = torch.stack(pred_angles_list)  # [steps_to_process]
+                # 将列表转换为张量 [steps_to_process]
+                pred_angles = torch.stack(pred_angles_list)
                 
                 # 2. 为预测轨迹补足起点和终点，从N个变成N+2个
                 # 起点和终点坐标
@@ -441,77 +598,16 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
             print(f"Warning: NaN or Inf loss detected, skipping batch")
             continue
         
-        # 对于过大的损失值，进行缩放以保持梯度稳定性
-        if loss.item() > 0.8:  # 适当提高阈值，避免过度抑制学习
-            print(f"Warning: Large loss detected ({loss.item():.4f}), applying scaling")
-            loss = loss * 0.5  # 温和缩放，保持学习能力
-        
         loss.backward()  # 反向传播：计算梯度
         
-        # 在梯度裁剪前检查各个损失组件
-        if loss.item() > 10.0:  # 如果损失异常大，输出调试信息
-            print(f"Warning: Large loss detected: {loss.item():.4f}")
-        
         # 梯度裁剪：防止梯度爆炸 - 平衡稳定性和学习效率
-        max_grad_norm = 2.0  # 适度控制，平衡稳定性和学习速度
+        max_grad_norm = 5.0  # 适度控制，平衡稳定性和学习速度
         
         # 进行梯度裁剪，返回的是裁剪前的原始梯度范数
         original_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, norm_type=2)
         
-        # 对patch embedding层进行更精细的梯度检查和处理
-        patch_embedding_grad_norms = []
-        sensitive_layers = {4, 8, 12, 15}  # 已知的敏感层索引
-        
-        for name, param in model.named_parameters():
-            if 'to_patch_embedding' in name and param.grad is not None:
-                param_grad_norm = param.grad.data.norm(2).item()
-                patch_embedding_grad_norms.append((name, param_grad_norm))
-                
-                # 从参数名中提取层索引（如果包含数字）
-                layer_idx = None
-                if '.' in name:
-                    parts = name.split('.')
-                    for part in parts:
-                        if part.isdigit():
-                            layer_idx = int(part)
-                            break
-                
-                # 对敏感层使用更强的梯度控制
-                if layer_idx in sensitive_layers:
-                    if param_grad_norm > 0.8:  # 敏感层更严格的阈值
-                        param.grad.data *= 0.3  # 更强的缩放
-                elif param_grad_norm > 1.0:  # 其他层的标准处理
-                    param.grad.data *= 0.5
-        
         # 判断是否进行了裁剪
         was_clipped = original_grad_norm > max_grad_norm
-        
-        # 如果梯度范数异常大，输出详细调试信息
-        if original_grad_norm > 1.8:  # 进一步降低阈值，更早发现问题
-            print(f"Warning: Large gradient norm detected: {original_grad_norm:.2f}")
-            print(f"  Batch loss: {loss.item():.6f}")
-            print(f"  Stage: {stage}")
-            
-            # 检查各个参数的梯度
-            max_grad = 0.0
-            max_param_name = ""
-            gradient_info = []
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    param_grad_norm = param.grad.data.norm(2).item()
-                    if param_grad_norm > 0.5:  # 收集所有较大的梯度
-                        gradient_info.append((name, param_grad_norm))
-                    if param_grad_norm > max_grad:
-                        max_grad = param_grad_norm
-                        max_param_name = name
-            
-            print(f"  Largest gradient: {max_grad:.4f} in {max_param_name}")
-            # 显示前5个最大的梯度
-            gradient_info.sort(key=lambda x: x[1], reverse=True)
-            print(f"  Top gradients:")
-            for name, grad_norm in gradient_info[:5]:
-                print(f"    {grad_norm:.4f} - {name}")
-            print()
 
         optimizer.step_and_update_lr()  # 参数更新：同时更新模型参数和学习率
         total_loss += loss.item()  # 累加批次损失
@@ -528,17 +624,11 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         else:
             grad_info = f'{original_grad_norm:.2f}'
         
-        # 计算patch embedding层的平均梯度
-        avg_patch_grad = 0.0
-        if patch_embedding_grad_norms:
-            avg_patch_grad = sum([grad for _, grad in patch_embedding_grad_norms]) / len(patch_embedding_grad_norms)
-        
         stage_info = "S1" if stage == 1 else "S2"  # 显示训练阶段
         pbar.set_postfix({
             'Stage': stage_info,
             'Loss': f'{loss.item():.4f}',
             'GradNorm': grad_info,
-            'PatchGrad': f'{avg_patch_grad:.2f}',  # 显示patch embedding层平均梯度
             'LR': f'{optimizer._optimizer.param_groups[0]["lr"]:.2e}'
         })
     
@@ -843,11 +933,11 @@ if __name__ == "__main__":
     
     # 第二阶段：冻结其他参数，只训练correctionPred
     print("=== Stage 2: Training only correctionPred parameters ===")
-    # for param in transformer.parameters():
-    #     param.requires_grad = False
-    # for param in transformer.correctionPred.parameters():
-    #     param.requires_grad = True
-    transformer.train()  # 设置模型为训练模式
+    for param in transformer.parameters():
+        param.requires_grad = False
+    for param in transformer.correctionPred.parameters():
+        param.requires_grad = True
+    # transformer.train()  # 设置模型为训练模式
     
     # 打印参数状态
     print_model_parameters(transformer, "Stage 2")
