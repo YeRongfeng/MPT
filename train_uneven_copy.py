@@ -53,10 +53,10 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # }
 
     loss_weights = {
-        'classification': 1e-2, # 分类损失权重(L_ce) - 提高权重避免梯度消失
-        'regression': 1e-3,     # 回归损失权重(L_mse) - 提高权重
-        'uniformity': 1e-3,     # 轨迹点分布均匀性损失权重(L_uni) - 提高权重
-        'angle': 1e-8,          # 角度一致性损失权重(L_angle) - 使用更小的权重进一步测试
+        'classification': 1e-2, # 分类损失权重(L_ce)
+        'regression': 1e-3,     # 回归损失权重(L_mse)
+        'uniformity': 1e-3,     # 轨迹点分布均匀性损失权重(L_uni)
+        'angle': 1e-3,          # 角度一致性损失权重(L_angle)
     }
 
     # 用于统计标签分布

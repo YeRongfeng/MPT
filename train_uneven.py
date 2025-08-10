@@ -208,10 +208,18 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             steps_to_process = min(output_dim, anchorPoint.shape[0])
             if steps_to_process > 0:
                 # 将hashTable转换为张量以便并行计算
-                hash_table_tensor = torch.tensor(hashTable, device=predVals.device)  # [num_tokens, 2]
+                hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
                 
-                # predVals已经经过softmax归一化，直接使用
+                # predVals已经经过softmax归一化，检查是否包含异常值
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
+                
+                # 数值稳定性检查
+                if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
+                    print(f"Warning: NaN or Inf in pred_probs, skipping regression loss")
+                    continue
+                
+                # 确保概率值在合理范围内，但不重新归一化（保持模型的输出分布）
+                pred_probs = torch.clamp(pred_probs, min=1e-8, max=1.0-1e-8)
                 
                 # 对每个时间步分别计算加权坐标，只对概率大于阈值的锚点进行加权计算
                 weighted_coords_list = []
@@ -219,6 +227,11 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 
                 for step in range(steps_to_process):
                     step_prob = pred_probs[:, step]  # [num_tokens]
+                    
+                    # 检查当前时间步的概率是否有异常值
+                    if torch.any(torch.isnan(step_prob)) or torch.any(torch.isinf(step_prob)):
+                        print(f"Warning: NaN or Inf in step_prob at step {step}, using uniform distribution")
+                        step_prob = torch.ones_like(step_prob) / num_tokens
                     
                     # 动态阈值，至少为平均概率的2倍
                     threshold = max(0.01, 1.0 / num_tokens * 2)
@@ -233,18 +246,24 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         total_prob = valid_probs.sum()
                         
                         # 归一化概率并计算加权坐标
-                        if total_prob > 0:
+                        if total_prob > 1e-8:
                             normalized_probs = valid_probs / total_prob
                             weighted_x = torch.sum(hash_table_tensor[valid_indices, 0] * normalized_probs)
                             weighted_y = torch.sum(hash_table_tensor[valid_indices, 1] * normalized_probs)
                         else:
-                            # 如果总概率为0，使用所有锚点的加权平均
-                            weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
-                            weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                            # 如果总概率太小，使用所有锚点的均匀权重
+                            weighted_x = hash_table_tensor[:, 0].mean()
+                            weighted_y = hash_table_tensor[:, 1].mean()
                     else:
                         # 如果没有锚点超过阈值，使用所有锚点的加权平均
                         weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
                         weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    
+                    # 检查加权坐标是否异常
+                    if torch.isnan(weighted_x) or torch.isnan(weighted_y) or torch.isinf(weighted_x) or torch.isinf(weighted_y):
+                        print(f"Warning: NaN or Inf in weighted coords at step {step}, using center coordinates")
+                        weighted_x = hash_table_tensor[:, 0].mean()
+                        weighted_y = hash_table_tensor[:, 1].mean()
                     
                     weighted_coords_list.append(torch.stack([weighted_x, weighted_y]))
                 
@@ -255,14 +274,29 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # 提取修正值 [num_tokens, 2, steps_to_process]
                 offset_coords = correctionVals[i, :, :2, :steps_to_process]  # x, y 偏移量
                 
+                # 检查修正值是否有异常
+                if torch.any(torch.isnan(offset_coords)) or torch.any(torch.isinf(offset_coords)):
+                    print(f"Warning: NaN or Inf in offset_coords, setting to zero")
+                    offset_coords = torch.zeros_like(offset_coords)
+                
                 # 扩展概率分布以匹配偏移量维度 [num_tokens, steps_to_process] -> [num_tokens, 1, steps_to_process]
                 expanded_probs_correction = pred_probs.unsqueeze(1)  # [num_tokens, 1, steps_to_process]
                 
                 # 并行计算所有时间步的加权偏移量 [2, steps_to_process]
                 weighted_offsets = torch.sum(expanded_probs_correction * offset_coords, dim=0)
                 
+                # 检查加权偏移量是否异常
+                if torch.any(torch.isnan(weighted_offsets)) or torch.any(torch.isinf(weighted_offsets)):
+                    print(f"Warning: NaN or Inf in weighted_offsets, setting to zero")
+                    weighted_offsets = torch.zeros_like(weighted_offsets)
+                
                 # 计算修正后的坐标：基础坐标 + 加权偏移量 [2, steps_to_process]
                 corrected_coords_raw = weighted_coords + weighted_offsets
+                
+                # 检查修正后的坐标是否异常
+                if torch.any(torch.isnan(corrected_coords_raw)) or torch.any(torch.isinf(corrected_coords_raw)):
+                    print(f"Warning: NaN or Inf in corrected_coords_raw, using only weighted_coords")
+                    corrected_coords_raw = weighted_coords
                 
                 # 转置以匹配预期格式 [steps_to_process, 2]
                 corrected_coords = corrected_coords_raw.t()
@@ -398,9 +432,21 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         if loss_weights['angle'] > 0:
             steps_to_process = min(output_dim, anchorPoint.shape[0])
             if steps_to_process > 0:
+                # print(f"Debug: Starting angle loss computation for sample {i}, steps_to_process={steps_to_process}")
+                
                 # 1. 先获取预测轨迹坐标（从哈希表和概率分布计算）
-                hash_table_tensor = torch.tensor(hashTable, device=predVals.device)  # [num_tokens, 2]
+                hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
+                
+                # print(f"Debug: pred_probs shape: {pred_probs.shape}, range: [{pred_probs.min().item():.6f}, {pred_probs.max().item():.6f}]")
+                
+                # 数值稳定性检查
+                if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
+                    print(f"Warning: NaN or Inf in pred_probs for angle loss, skipping")
+                    continue
+                
+                # 确保概率值在合理范围内，但不重新归一化（保持模型的输出分布）
+                pred_probs = torch.clamp(pred_probs, min=1e-8, max=1.0-1e-8)
                 
                 # 对每个时间步分别计算加权坐标，只对概率大于阈值的锚点进行加权计算
                 weighted_coords_list = []
@@ -408,6 +454,11 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 
                 for step in range(steps_to_process):
                     step_prob = pred_probs[:, step]  # [num_tokens]
+                    
+                    # 检查当前时间步的概率是否有异常值
+                    if torch.any(torch.isnan(step_prob)) or torch.any(torch.isinf(step_prob)):
+                        print(f"Warning: NaN or Inf in step_prob for angle loss at step {step}")
+                        step_prob = torch.ones_like(step_prob) / num_tokens
                     
                     # 动态阈值，至少为平均概率的2倍
                     threshold = max(0.01, 1.0 / num_tokens * 2)
@@ -422,18 +473,24 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         total_prob = valid_probs.sum()
                         
                         # 归一化概率并计算加权坐标
-                        if total_prob > 0:
+                        if total_prob > 1e-8:
                             normalized_probs = valid_probs / total_prob
                             weighted_x = torch.sum(hash_table_tensor[valid_indices, 0] * normalized_probs)
                             weighted_y = torch.sum(hash_table_tensor[valid_indices, 1] * normalized_probs)
                         else:
-                            # 如果总概率为0，使用所有锚点的加权平均
-                            weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
-                            weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                            # 如果总概率太小，使用所有锚点的均匀权重
+                            weighted_x = hash_table_tensor[:, 0].mean()
+                            weighted_y = hash_table_tensor[:, 1].mean()
                     else:
                         # 如果没有锚点超过阈值，使用所有锚点的加权平均
                         weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
                         weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    
+                    # 检查加权坐标是否异常
+                    if torch.isnan(weighted_x) or torch.isnan(weighted_y) or torch.isinf(weighted_x) or torch.isinf(weighted_y):
+                        print(f"Warning: NaN or Inf in weighted coords for angle loss at step {step}")
+                        weighted_x = hash_table_tensor[:, 0].mean()
+                        weighted_y = hash_table_tensor[:, 1].mean()
                     
                     weighted_coords_list.append(torch.stack([weighted_x, weighted_y]))
                 
@@ -444,6 +501,11 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # 获取预测角度 - 对每个时间步分别计算，只对概率大于阈值的锚点进行加权
                 # 提取所有时间步的角度预测 [num_tokens, steps_to_process]
                 step_angle_preds_all = correctionVals[i, :, 2, :steps_to_process]  # sigmoid输出[0,1]
+                
+                # 检查角度预测是否有异常
+                if torch.any(torch.isnan(step_angle_preds_all)) or torch.any(torch.isinf(step_angle_preds_all)):
+                    print(f"Warning: NaN or Inf in angle predictions, setting to default")
+                    step_angle_preds_all = torch.full_like(step_angle_preds_all, 0.5)  # 默认角度0
                 
                 # 确保角度预测在合理范围内
                 step_angle_preds_all = torch.clamp(step_angle_preds_all, min=1e-6, max=1.0-1e-6)
@@ -492,12 +554,17 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 start_theta = start_state[i, 2]  # 标量
                 goal_theta = goal_state[i, 2]   # 标量
                 
+                # print(f"Debug: start_xy: {start_xy}, goal_xy: {goal_xy}")
+                # print(f"Debug: weighted_coords shape: {weighted_coords.shape}, range: [{weighted_coords.min().item():.6f}, {weighted_coords.max().item():.6f}]")
+                
                 # 拼接完整轨迹：[起点, 中间点, 终点] -> [N+2, 2]
                 full_coords = torch.cat([
                     start_xy.unsqueeze(0),        # [1, 2]
                     weighted_coords.t(),          # [N, 2]
                     goal_xy.unsqueeze(0)          # [1, 2]
                 ], dim=0)  # [N+2, 2]
+                
+                # print(f"Debug: full_coords shape: {full_coords.shape}, range: [{full_coords.min().item():.6f}, {full_coords.max().item():.6f}]")
 
                 # 3. 隔点计算速度向量：x_dot_i = (x_i+1 - x_i-1) / 2dt, y_dot_i = (y_i+1 - y_i-1) / 2dt, dt = 1
                 # 对于中间的N个点，计算每个点的速度向量
@@ -509,42 +576,102 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     x_dot = (x_coords[2:] - x_coords[:-2]) / 2.0  # [N]
                     y_dot = (y_coords[2:] - y_coords[:-2]) / 2.0  # [N]
                     
-                    # 4. 归一化速度向量
-                    velocity_norms = torch.sqrt(x_dot**2 + y_dot**2)  # [N]
+                    # print(f"Debug: x_dot shape: {x_dot.shape}, range: [{x_dot.min().item():.6f}, {x_dot.max().item():.6f}]")
+                    # print(f"Debug: y_dot shape: {y_dot.shape}, range: [{y_dot.min().item():.6f}, {y_dot.max().item():.6f}]")
                     
-                    # 检查速度向量是否合理
+                    # 4. 改进的角度一致性约束：避免归一化极小除数的问题
+                    # 不直接归一化速度向量，而是使用向量内积的性质来计算角度一致性
+                    
+                    # 计算预测角度对应的单位向量
+                    cos_theta = torch.cos(pred_angles)  # [N]
+                    sin_theta = torch.sin(pred_angles)  # [N]
+                    pred_unit_vectors = torch.stack([cos_theta, sin_theta], dim=1)  # [N, 2]
+                    
+                    # print(f"Debug: pred_angles shape: {pred_angles.shape}, range: [{pred_angles.min().item():.6f}, {pred_angles.max().item():.6f}]")
+                    # print(f"Debug: pred_unit_vectors shape: {pred_unit_vectors.shape}, range: [{pred_unit_vectors.min().item():.6f}, {pred_unit_vectors.max().item():.6f}]")
+                    
+                    # 计算速度向量 [N, 2]
+                    velocity_vectors = torch.stack([x_dot, y_dot], dim=1)  # [N, 2]
+                    
+                    # print(f"Debug: velocity_vectors shape: {velocity_vectors.shape}, range: [{velocity_vectors.min().item():.6f}, {velocity_vectors.max().item():.6f}]")
+                    
+                    # 方法1：使用余弦相似度损失，避免直接归一化
+                    # cos(angle_between_vectors) = (a · b) / (|a| * |b|)
+                    # 我们希望 cos(angle) 接近 1，即向量方向一致
+                    
+                    # 计算向量内积 [N]
+                    dot_products = torch.sum(pred_unit_vectors * velocity_vectors, dim=1)  # [N]
+                    
+                    # print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
+                    
+                    # 计算速度向量的模长 [N] - 使用数值稳定的方法
+                    velocity_norms = torch.norm(velocity_vectors, dim=1, p=2)  # 使用torch.norm更稳定
+                    
+                    # print(f"Debug: velocity_norms shape: {velocity_norms.shape}, range: [{velocity_norms.min().item():.6f}, {velocity_norms.max().item():.6f}]")
+                    
+                    # 检查速度向量模长是否合理
                     if torch.any(torch.isnan(velocity_norms)) or torch.any(torch.isinf(velocity_norms)):
                         print(f"Warning: NaN or Inf in velocity norms")
                         continue
                     
-                    # 防止除零，并限制极小值
-                    velocity_norms = torch.clamp(velocity_norms, min=1e-6)
-                    x_dot_normalized = x_dot / velocity_norms  # [N]
-                    y_dot_normalized = y_dot / velocity_norms  # [N]
+                    # 使用更保守的数值稳定方法
+                    min_norm_threshold = 1e-2  # 提高阈值到1e-2，更保守
                     
-                    # 检查归一化后的速度向量
-                    if torch.any(torch.isnan(x_dot_normalized)) or torch.any(torch.isnan(y_dot_normalized)):
-                        print(f"Warning: NaN in normalized velocity vectors")
+                    # 对于速度太小的点，直接跳过，不参与损失计算
+                    valid_velocity_mask = velocity_norms >= min_norm_threshold
+                    
+                    if not valid_velocity_mask.any():
+                        print(f"Warning: All velocity norms too small, skipping angle loss")
                         continue
                     
-                    # 5. 计算角度对应的单位向量
-                    cos_theta = torch.cos(pred_angles)  # [N]
-                    sin_theta = torch.sin(pred_angles)  # [N]
+                    # 只对有效的速度点计算损失
+                    valid_pred_unit_vectors = pred_unit_vectors[valid_velocity_mask]  # [valid_N, 2]
+                    valid_velocity_vectors = velocity_vectors[valid_velocity_mask]    # [valid_N, 2]
+                    valid_velocity_norms = velocity_norms[valid_velocity_mask]        # [valid_N]
                     
-                    # 6. 计算损失：L_angle = mse((cos(theta), sin(theta)), (x_dot_normalized, y_dot_normalized))
-                    angle_vector = torch.stack([cos_theta, sin_theta], dim=1)  # [N, 2]
-                    velocity_vector = torch.stack([x_dot_normalized, y_dot_normalized], dim=1)  # [N, 2]
+                    # print(f"Debug: valid points: {valid_velocity_mask.sum().item()}/{len(valid_velocity_mask)}")
                     
-                    angle_loss = F.mse_loss(angle_vector, velocity_vector)
+                    # 计算向量内积 [valid_N]
+                    dot_products = torch.sum(valid_pred_unit_vectors * valid_velocity_vectors, dim=1)
+                    
+                    # print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
+                    
+                    # 计算余弦相似度 - 使用更稳定的除法
+                    cosine_similarities = dot_products / valid_velocity_norms  # 不需要clamp，因为已经过滤了小值
+                    
+                    # 限制余弦相似度范围，防止数值误差
+                    cosine_similarities = torch.clamp(cosine_similarities, min=-1.0, max=1.0)
+                    
+                    # print(f"Debug: cosine_similarities shape: {cosine_similarities.shape}, range: [{cosine_similarities.min().item():.6f}, {cosine_similarities.max().item():.6f}]")
+                    
+                    # 检查余弦相似度是否合理
+                    if torch.any(torch.isnan(cosine_similarities)) or torch.any(torch.isinf(cosine_similarities)):
+                        print(f"Warning: NaN or Inf in cosine similarities")
+                        continue
+                    
+                    # 角度一致性损失：希望余弦相似度接近1（角度差接近0）
+                    # 使用 1 - cosine_similarity 作为损失
+                    cosine_losses = 1.0 - cosine_similarities  # [valid_N]
+                    
+                    # print(f"Debug: cosine_losses shape: {cosine_losses.shape}, range: [{cosine_losses.min().item():.6f}, {cosine_losses.max().item():.6f}]")
+                    
+                    # 计算最终的角度损失 - 简单平均，不使用复杂的权重
+                    angle_loss = cosine_losses.mean()
+                    
+                    # print(f"Debug: angle_loss: {angle_loss.item():.6f}")
                     
                     # 检查角度一致性损失是否异常
                     if torch.isnan(angle_loss) or torch.isinf(angle_loss) or angle_loss.item() > 100:
                         print(f"Warning: Abnormal angle consistency loss: {angle_loss.item()}")
                         print(f"velocity_norms range: [{velocity_norms.min().item():.6f}, {velocity_norms.max().item():.6f}]")
-                        print(f"pred_angles range: [{pred_angles.min().item():.3f}, {pred_angles.max().item():.3f}]")
+                        print(f"cosine_similarities range: [{cosine_similarities.min().item():.6f}, {cosine_similarities.max().item():.6f}]")
                         continue
                     
-                    total_loss += angle_loss * loss_weights['angle']  # 角度一致性损失(L_angle)
+                    # 检查角度损失的梯度是否会导致问题
+                    angle_loss_contribution = angle_loss * loss_weights['angle']
+                    # print(f"Debug: angle_loss_contribution: {angle_loss_contribution.item():.6f}")
+                    
+                    total_loss += angle_loss_contribution  # 角度一致性损失(L_angle)
                     loss_count += 1
 
     # 确保返回张量类型的损失
