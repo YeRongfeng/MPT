@@ -47,66 +47,141 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # 根据训练阶段设置损失权重
     if stage == 1:
         loss_weights = {
-            'classification': 1e-2,
+            'classification': 1e-1,  # 第一阶段专注分类损失，需要大权重因为KL散度值很小
             'regression': 0.0,
             'uniformity': 0.0,
             'angle': 0.0,
         }
     else:
         loss_weights = {
-            'classification': 0e-3,
-            'regression': 1e-3,
-            'uniformity': 0e-2,
-            'angle': 0e-2,
+            'classification': 1e-3,  # 第二阶段保留少量分类损失
+            'regression': 1e-2,
+            'uniformity': 1e-2,
+            'angle': 1e-2,
         }
     
     # 初始化损失和统计
     total_loss = torch.tensor(0.0, requires_grad=True, device=device)
     loss_count = 0
     
-    # 统计变量（简化版本）
+    # 统计变量（根据实际标签计算）
     n_correct = 0
-    total_samples = batch_size * output_dim
-    total_positive = total_samples // 2
-    total_negative = total_samples - total_positive
+    total_samples = 0  # 根据实际有效标签数量计算
+    total_positive = 0
+    total_negative = 0
     correct_positive = 0
     correct_negative = 0
-    
-    # =================== 损失1: 分类损失(L_ce) ===================
-    if loss_weights['classification'] > 0:
-        # 将概率分布应用softmax归一化 - 批次并行
-        pred_probs = F.softmax(predVals, dim=1)  # [batch_size, num_tokens, output_dim]
-        
-        # 数值稳定性检查
-        valid_batch_mask = ~(torch.any(torch.isnan(pred_probs), dim=(1,2)) | torch.any(torch.isinf(pred_probs), dim=(1,2)))
-        
-        if valid_batch_mask.any():
-            valid_pred_probs = pred_probs[valid_batch_mask]  # [valid_batch_size, num_tokens, output_dim]
-            valid_batch_size = valid_pred_probs.shape[0]
-            
-            # 使用uniform目标分布计算KL散度 - 张量并行
-            target_uniform = torch.ones_like(valid_pred_probs) / num_tokens
-            
-            # 重塑为适合KL散度计算的形状
-            valid_pred_flat = valid_pred_probs.view(-1, num_tokens)  # [valid_batch_size * output_dim, num_tokens]
-            target_uniform_flat = target_uniform.view(-1, num_tokens)
-            
-            # 计算KL散度损失 - 向量化
-            kl_loss = F.kl_div(torch.log(valid_pred_flat + 1e-8), target_uniform_flat, reduction='mean')
-            
-            # 数值稳定性检查
-            if not (torch.isnan(kl_loss) or torch.isinf(kl_loss) or kl_loss.item() > 1000):
-                total_loss = total_loss + kl_loss * loss_weights['classification']
-                loss_count += 1
-                
-                # 简化的准确率计算
-                pred_classes = torch.argmax(valid_pred_flat, dim=1)
-                n_correct += valid_batch_size * output_dim // 2  # 简化估计
-                total_samples += valid_batch_size * output_dim
 
     for i in range(batch_size):
-        anchorPoint = anchorPoints[i]  # 锚点信息字典
+        anchorPoint = anchorPoints[i]  # [num_layers, max_anchors]
         trueLabel = trueLabels[i]  # [num_layers, max_anchors]
+        
+        # =================== 损失1：锚点分类交叉熵损失(L_ce) ===================
+        # 使用原来的基于真实标签的分类损失，而不是uniform分布的KL散度
+        if loss_weights['classification'] > 0:
+            num_anchor_rows = anchorPoint.shape[0]  # 总行数 = 2 * num_trajectory_points
+            
+            # 检查锚点索引是否在有效范围内
+            valid_anchor_mask = (anchorPoint >= 0) & (anchorPoint < num_tokens) & (trueLabel != -1)
+            if not valid_anchor_mask.any():
+                # 如果没有有效的锚点，跳过这个样本
+                continue
+            
+            # 批量处理所有时间步的损失计算
+            step_indices = torch.arange(num_anchor_rows, device=predVals.device) % output_dim
+            
+            # 获取所有时间步的预测 [num_anchor_rows, num_tokens]
+            all_step_preds = predVals[i, :, step_indices].t()  # [num_anchor_rows, num_tokens]
+            
+            # 为每个时间步创建全图标签张量 [num_anchor_rows, num_tokens] - 完全并行化
+            full_labels_batch = torch.zeros(num_anchor_rows, num_tokens, device=predVals.device)
+            
+            # 创建有效掩码 [num_anchor_rows, MAX_POSITIVE_ANCHORS]
+            valid_mask = (anchorPoint != -1) & (trueLabel != -1) & (anchorPoint < num_tokens)
+            
+            # 使用高级索引批量设置所有标签
+            if valid_mask.any():
+                # 获取所有有效位置的索引
+                step_indices_idx, anchor_indices = torch.where(valid_mask)  # 有效位置的(step, anchor)索引对
+                
+                if len(step_indices_idx) > 0:
+                    # 批量获取有效的锚点索引和标签值
+                    valid_anchor_positions = anchorPoint[step_indices_idx, anchor_indices]  # 锚点在tokens中的位置
+                    valid_label_values = trueLabel[step_indices_idx, anchor_indices].float()  # 对应的标签值
+                    
+                    # 批量设置标签值
+                    full_labels_batch[step_indices_idx, valid_anchor_positions] = valid_label_values
+                    
+                    # 按行归一化为概率分布
+                    row_sums = full_labels_batch.sum(dim=1, keepdim=True)  # [num_anchor_rows, 1]
+                    nonzero_mask = (row_sums > 0).squeeze(1)  # [num_anchor_rows]
+                    if nonzero_mask.any():
+                        full_labels_batch[nonzero_mask] = full_labels_batch[nonzero_mask] / row_sums[nonzero_mask]
+            
+            # 数值稳定性处理
+            all_step_preds_stable = torch.clamp(all_step_preds, min=1e-8, max=1.0-1e-8)
+            full_labels_stable = torch.clamp(full_labels_batch, min=1e-8, max=1.0-1e-8)
+            
+            # 重新归一化以确保概率分布有效
+            label_sums = full_labels_stable.sum(dim=1, keepdim=True)
+            label_sums = torch.clamp(label_sums, min=1e-8)
+            full_labels_stable = full_labels_stable / label_sums
+            
+            # 批量计算KL散度损失 [num_anchor_rows]
+            kl_losses = F.kl_div(
+                torch.log(all_step_preds_stable), 
+                full_labels_stable, 
+                reduction='none'
+            ).sum(dim=1)  # 对每个时间步求和
+            
+            # 过滤掉异常值并求平均
+            valid_loss_mask = ~(torch.isnan(kl_losses) | torch.isinf(kl_losses) | (kl_losses > 50))
+            if valid_loss_mask.any():
+                classification_loss = kl_losses[valid_loss_mask].mean()
+                total_loss = total_loss + classification_loss * loss_weights['classification']
+                loss_count += 1
+            else:
+                print(f"Warning: All classification losses are abnormal, skipping")
+            
+            # 批量计算准确率 - 完全张量并行化处理，无for循环
+            threshold = max(0.01, 1.0 / num_tokens * 2)
+            
+            # 创建有效锚点和标签的掩码 [num_anchor_rows, MAX_POSITIVE_ANCHORS]
+            valid_anchor_mask_acc = (anchorPoint != -1) & (trueLabel != -1) & (anchorPoint < num_tokens)
+            
+            if valid_anchor_mask_acc.any():
+                # 使用高级索引一次性提取所有有效的预测和标签 - 完全张量并行
+                step_indices_acc, anchor_indices_acc = torch.where(valid_anchor_mask_acc)
+                
+                if len(step_indices_acc) > 0:
+                    # 批量获取有效锚点位置和标签值
+                    valid_anchor_positions = anchorPoint[step_indices_acc, anchor_indices_acc]  # [total_valid]
+                    valid_label_values = trueLabel[step_indices_acc, anchor_indices_acc]        # [total_valid]
+                    
+                    # 批量获取对应的预测值 - 张量并行
+                    valid_step_preds = all_step_preds[step_indices_acc]                         # [total_valid, num_tokens]
+                    selected_preds = valid_step_preds[torch.arange(len(step_indices_acc), device=predVals.device), valid_anchor_positions]  # [total_valid]
+                    
+                    # 批量计算预测类别和统计 - 完全张量并行
+                    batch_class_preds = (selected_preds > threshold).long()                     # [total_valid]
+                    batch_correct = batch_class_preds.eq(valid_label_values.long())             # [total_valid]
+                    
+                    # 批量统计各种指标
+                    n_correct += batch_correct.sum().item()
+                    total_samples += len(valid_label_values)
+                    
+                    # 批量计算正负样本统计
+                    positive_mask = (valid_label_values == 1)
+                    negative_mask = (valid_label_values == 0)
+                    
+                    total_positive += positive_mask.sum().item()
+                    total_negative += negative_mask.sum().item()
+                    
+                    # 批量统计各类别的正确预测
+                    correct_positive_mask = (batch_class_preds == 1) & positive_mask
+                    correct_negative_mask = (batch_class_preds == 0) & negative_mask
+                    correct_positive += correct_positive_mask.sum().item()
+                    correct_negative += correct_negative_mask.sum().item()
         
         # =================== 损失2：轨迹回归损失(L_mse) ===================
         if loss_weights['regression'] > 0:
