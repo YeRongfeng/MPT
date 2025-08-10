@@ -56,7 +56,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         'classification': 1e-2, # 分类损失权重(L_ce) - 提高权重避免梯度消失
         'regression': 1e-3,     # 回归损失权重(L_mse) - 提高权重
         'uniformity': 1e-3,     # 轨迹点分布均匀性损失权重(L_uni) - 提高权重
-        'angle': 1e-6,          # 角度一致性损失权重(L_angle) - 用极小权重调试
+        'angle': 1e-8,          # 角度一致性损失权重(L_angle) - 使用更小的权重进一步测试
     }
 
     # 用于统计标签分布
@@ -593,8 +593,8 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     
                     print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
                     
-                    # 计算速度向量的模长 [N]
-                    velocity_norms = torch.sqrt(x_dot**2 + y_dot**2)  # [N]
+                    # 计算速度向量的模长 [N] - 使用数值稳定的方法
+                    velocity_norms = torch.norm(velocity_vectors, dim=1, p=2)  # 使用torch.norm更稳定
                     
                     print(f"Debug: velocity_norms shape: {velocity_norms.shape}, range: [{velocity_norms.min().item():.6f}, {velocity_norms.max().item():.6f}]")
                     
@@ -603,20 +603,33 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         print(f"Warning: NaN or Inf in velocity norms")
                         continue
                     
-                    # 使用数值稳定的方式处理小模长：
-                    # 不是直接跳过，而是使用加权损失，对小模长的贡献降权
-                    min_norm_threshold = 1e-3  # 最小模长阈值
+                    # 使用更保守的数值稳定方法
+                    min_norm_threshold = 1e-2  # 提高阈值到1e-2，更保守
                     
-                    # 计算权重：模长越大，权重越大，但不为零
-                    # weight = min(1.0, norm / min_threshold)^2
-                    normalized_norms = velocity_norms / min_norm_threshold
-                    weights = torch.clamp(normalized_norms, min=0.01, max=1.0) ** 2  # [N]
+                    # 对于速度太小的点，直接跳过，不参与损失计算
+                    valid_velocity_mask = velocity_norms >= min_norm_threshold
                     
-                    print(f"Debug: weights shape: {weights.shape}, range: [{weights.min().item():.6f}, {weights.max().item():.6f}]")
+                    if not valid_velocity_mask.any():
+                        print(f"Warning: All velocity norms too small, skipping angle loss")
+                        continue
                     
-                    # 计算余弦相似度 = dot_product / (|pred| * |velocity|)
-                    # 由于pred_unit_vectors已经是单位向量，|pred| = 1
-                    cosine_similarities = dot_products / torch.clamp(velocity_norms, min=1e-8)  # [N]
+                    # 只对有效的速度点计算损失
+                    valid_pred_unit_vectors = pred_unit_vectors[valid_velocity_mask]  # [valid_N, 2]
+                    valid_velocity_vectors = velocity_vectors[valid_velocity_mask]    # [valid_N, 2]
+                    valid_velocity_norms = velocity_norms[valid_velocity_mask]        # [valid_N]
+                    
+                    print(f"Debug: valid points: {valid_velocity_mask.sum().item()}/{len(valid_velocity_mask)}")
+                    
+                    # 计算向量内积 [valid_N]
+                    dot_products = torch.sum(valid_pred_unit_vectors * valid_velocity_vectors, dim=1)
+                    
+                    print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
+                    
+                    # 计算余弦相似度 - 使用更稳定的除法
+                    cosine_similarities = dot_products / valid_velocity_norms  # 不需要clamp，因为已经过滤了小值
+                    
+                    # 限制余弦相似度范围，防止数值误差
+                    cosine_similarities = torch.clamp(cosine_similarities, min=-1.0, max=1.0)
                     
                     print(f"Debug: cosine_similarities shape: {cosine_similarities.shape}, range: [{cosine_similarities.min().item():.6f}, {cosine_similarities.max().item():.6f}]")
                     
@@ -627,17 +640,12 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     
                     # 角度一致性损失：希望余弦相似度接近1（角度差接近0）
                     # 使用 1 - cosine_similarity 作为损失
-                    cosine_losses = 1.0 - cosine_similarities  # [N]
+                    cosine_losses = 1.0 - cosine_similarities  # [valid_N]
                     
                     print(f"Debug: cosine_losses shape: {cosine_losses.shape}, range: [{cosine_losses.min().item():.6f}, {cosine_losses.max().item():.6f}]")
                     
-                    # 应用权重：小模长的损失贡献较小
-                    weighted_cosine_losses = cosine_losses * weights  # [N]
-                    
-                    print(f"Debug: weighted_cosine_losses shape: {weighted_cosine_losses.shape}, range: [{weighted_cosine_losses.min().item():.6f}, {weighted_cosine_losses.max().item():.6f}]")
-                    
-                    # 计算最终的角度损失
-                    angle_loss = weighted_cosine_losses.mean()
+                    # 计算最终的角度损失 - 简单平均，不使用复杂的权重
+                    angle_loss = cosine_losses.mean()
                     
                     print(f"Debug: angle_loss: {angle_loss.item():.6f}")
                     
