@@ -696,7 +696,7 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0):
         has_inf_grad = False
         max_grad = 0.0
         
-        for name, param in model.parameters():
+        for name, param in model.named_parameters():
             if param.grad is not None:
                 grad_norm = param.grad.data.norm()
                 max_grad = max(max_grad, grad_norm.item())
