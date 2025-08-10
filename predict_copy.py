@@ -185,7 +185,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
         # print(f"True_x range: {min(trajectory[:, 0])} to {max(trajectory[:, 0])}")
         # print(f"True_y range: {min(trajectory[:, 1])} to {max(trajectory[:, 1])}")
         
-        print(f"True Traj: {trajectory}")
+        # print(f"True Traj: {trajectory}")
         
         # 获取预测轨迹
         # patch_map, predProb, predTraj = get_patch(transformer, start_pos[:2], goal_pos[:2], normal_x, normal_y, normal_z)
@@ -193,7 +193,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
         output_dim = patch_map.shape[0]
         # print(f"normal_z shape: {normal_z.shape}")
         
-        print(f"Predicted Traj: {predTraj}")
+        # print(f"Predicted Traj: {predTraj}")
         
         # 创建左侧子图 - 预测轨迹
         ax_pred = fig.add_subplot(gs[row, col])
