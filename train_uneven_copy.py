@@ -56,7 +56,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         'classification': 1e-1, # 分类损失权重(L_ce) - 提高权重避免梯度消失
         'regression': 1e-2,     # 回归损失权重(L_mse) - 提高权重
         'uniformity': 1e-2,     # 轨迹点分布均匀性损失权重(L_uni) - 提高权重
-        'angle': 1e-2,          # 角度一致性损失权重(L_angle) - 提高权重
+        'angle': 0,             # 角度一致性损失权重(L_angle) - 暂时关闭调试
     }
 
     # 用于统计标签分布
@@ -197,7 +197,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             steps_to_process = min(output_dim, anchorPoint.shape[0])
             if steps_to_process > 0:
                 # 将hashTable转换为张量以便并行计算
-                hash_table_tensor = torch.tensor(hashTable, device=predVals.device)  # [num_tokens, 2]
+                hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
                 
                 # predVals已经经过softmax归一化，直接使用
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
@@ -388,7 +388,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             steps_to_process = min(output_dim, anchorPoint.shape[0])
             if steps_to_process > 0:
                 # 1. 先获取预测轨迹坐标（从哈希表和概率分布计算）
-                hash_table_tensor = torch.tensor(hashTable, device=predVals.device)  # [num_tokens, 2]
+                hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
                 
                 # 对每个时间步分别计算加权坐标，只对概率大于阈值的锚点进行加权计算
@@ -508,6 +508,12 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     
                     # 防止除零，并限制极小值
                     velocity_norms = torch.clamp(velocity_norms, min=1e-6)
+                    
+                    # 检查是否存在零速度
+                    if torch.any(velocity_norms < 1e-5):
+                        print(f"Warning: Very small velocity norms detected, skipping angle loss")
+                        continue
+                        
                     x_dot_normalized = x_dot / velocity_norms  # [N]
                     y_dot_normalized = y_dot / velocity_norms  # [N]
                     
