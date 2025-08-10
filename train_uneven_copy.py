@@ -648,7 +648,11 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         print(f"cosine_similarities range: [{cosine_similarities.min().item():.6f}, {cosine_similarities.max().item():.6f}]")
                         continue
                     
-                    total_loss += angle_loss * loss_weights['angle']  # 角度一致性损失(L_angle)
+                    # 检查角度损失的梯度是否会导致问题
+                    angle_loss_contribution = angle_loss * loss_weights['angle']
+                    print(f"Debug: angle_loss_contribution: {angle_loss_contribution.item():.6f}")
+                    
+                    total_loss += angle_loss_contribution  # 角度一致性损失(L_angle)
                     loss_count += 1
 
     # 确保返回张量类型的损失
@@ -686,6 +690,28 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0):
             batch['trajectory'].to(device)  # 轨迹点：[N, 3]
         )
         loss.backward()  # 反向传播：计算梯度
+
+        # 检查梯度是否包含NaN或Inf
+        has_nan_grad = False
+        has_inf_grad = False
+        max_grad = 0.0
+        
+        for name, param in model.parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.data.norm()
+                max_grad = max(max_grad, grad_norm.item())
+                
+                if torch.isnan(param.grad).any():
+                    print(f"NaN gradient detected in {name}")
+                    has_nan_grad = True
+                if torch.isinf(param.grad).any():
+                    print(f"Inf gradient detected in {name}")
+                    has_inf_grad = True
+        
+        if has_nan_grad or has_inf_grad:
+            print(f"Gradient anomaly detected at batch {batch_idx}, skipping optimization step")
+            print(f"Loss: {loss.item():.6f}, Max gradient: {max_grad:.6f}")
+            continue
 
         # 在梯度裁剪前检查各个损失组件
         if torch.isnan(loss) or torch.isinf(loss):
