@@ -421,13 +421,13 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         if loss_weights['angle'] > 0:
             steps_to_process = min(output_dim, anchorPoint.shape[0])
             if steps_to_process > 0:
-                print(f"Debug: Starting angle loss computation for sample {i}, steps_to_process={steps_to_process}")
+                # print(f"Debug: Starting angle loss computation for sample {i}, steps_to_process={steps_to_process}")
                 
                 # 1. 先获取预测轨迹坐标（从哈希表和概率分布计算）
                 hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
                 
-                print(f"Debug: pred_probs shape: {pred_probs.shape}, range: [{pred_probs.min().item():.6f}, {pred_probs.max().item():.6f}]")
+                # print(f"Debug: pred_probs shape: {pred_probs.shape}, range: [{pred_probs.min().item():.6f}, {pred_probs.max().item():.6f}]")
                 
                 # 数值稳定性检查
                 if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
@@ -543,8 +543,8 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 start_theta = start_state[i, 2]  # 标量
                 goal_theta = goal_state[i, 2]   # 标量
                 
-                print(f"Debug: start_xy: {start_xy}, goal_xy: {goal_xy}")
-                print(f"Debug: weighted_coords shape: {weighted_coords.shape}, range: [{weighted_coords.min().item():.6f}, {weighted_coords.max().item():.6f}]")
+                # print(f"Debug: start_xy: {start_xy}, goal_xy: {goal_xy}")
+                # print(f"Debug: weighted_coords shape: {weighted_coords.shape}, range: [{weighted_coords.min().item():.6f}, {weighted_coords.max().item():.6f}]")
                 
                 # 拼接完整轨迹：[起点, 中间点, 终点] -> [N+2, 2]
                 full_coords = torch.cat([
@@ -553,7 +553,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     goal_xy.unsqueeze(0)          # [1, 2]
                 ], dim=0)  # [N+2, 2]
                 
-                print(f"Debug: full_coords shape: {full_coords.shape}, range: [{full_coords.min().item():.6f}, {full_coords.max().item():.6f}]")
+                # print(f"Debug: full_coords shape: {full_coords.shape}, range: [{full_coords.min().item():.6f}, {full_coords.max().item():.6f}]")
 
                 # 3. 隔点计算速度向量：x_dot_i = (x_i+1 - x_i-1) / 2dt, y_dot_i = (y_i+1 - y_i-1) / 2dt, dt = 1
                 # 对于中间的N个点，计算每个点的速度向量
@@ -565,8 +565,8 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     x_dot = (x_coords[2:] - x_coords[:-2]) / 2.0  # [N]
                     y_dot = (y_coords[2:] - y_coords[:-2]) / 2.0  # [N]
                     
-                    print(f"Debug: x_dot shape: {x_dot.shape}, range: [{x_dot.min().item():.6f}, {x_dot.max().item():.6f}]")
-                    print(f"Debug: y_dot shape: {y_dot.shape}, range: [{y_dot.min().item():.6f}, {y_dot.max().item():.6f}]")
+                    # print(f"Debug: x_dot shape: {x_dot.shape}, range: [{x_dot.min().item():.6f}, {x_dot.max().item():.6f}]")
+                    # print(f"Debug: y_dot shape: {y_dot.shape}, range: [{y_dot.min().item():.6f}, {y_dot.max().item():.6f}]")
                     
                     # 4. 改进的角度一致性约束：避免归一化极小除数的问题
                     # 不直接归一化速度向量，而是使用向量内积的性质来计算角度一致性
@@ -576,13 +576,13 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     sin_theta = torch.sin(pred_angles)  # [N]
                     pred_unit_vectors = torch.stack([cos_theta, sin_theta], dim=1)  # [N, 2]
                     
-                    print(f"Debug: pred_angles shape: {pred_angles.shape}, range: [{pred_angles.min().item():.6f}, {pred_angles.max().item():.6f}]")
-                    print(f"Debug: pred_unit_vectors shape: {pred_unit_vectors.shape}, range: [{pred_unit_vectors.min().item():.6f}, {pred_unit_vectors.max().item():.6f}]")
+                    # print(f"Debug: pred_angles shape: {pred_angles.shape}, range: [{pred_angles.min().item():.6f}, {pred_angles.max().item():.6f}]")
+                    # print(f"Debug: pred_unit_vectors shape: {pred_unit_vectors.shape}, range: [{pred_unit_vectors.min().item():.6f}, {pred_unit_vectors.max().item():.6f}]")
                     
                     # 计算速度向量 [N, 2]
                     velocity_vectors = torch.stack([x_dot, y_dot], dim=1)  # [N, 2]
                     
-                    print(f"Debug: velocity_vectors shape: {velocity_vectors.shape}, range: [{velocity_vectors.min().item():.6f}, {velocity_vectors.max().item():.6f}]")
+                    # print(f"Debug: velocity_vectors shape: {velocity_vectors.shape}, range: [{velocity_vectors.min().item():.6f}, {velocity_vectors.max().item():.6f}]")
                     
                     # 方法1：使用余弦相似度损失，避免直接归一化
                     # cos(angle_between_vectors) = (a · b) / (|a| * |b|)
@@ -591,12 +591,12 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     # 计算向量内积 [N]
                     dot_products = torch.sum(pred_unit_vectors * velocity_vectors, dim=1)  # [N]
                     
-                    print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
+                    # print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
                     
                     # 计算速度向量的模长 [N] - 使用数值稳定的方法
                     velocity_norms = torch.norm(velocity_vectors, dim=1, p=2)  # 使用torch.norm更稳定
                     
-                    print(f"Debug: velocity_norms shape: {velocity_norms.shape}, range: [{velocity_norms.min().item():.6f}, {velocity_norms.max().item():.6f}]")
+                    # print(f"Debug: velocity_norms shape: {velocity_norms.shape}, range: [{velocity_norms.min().item():.6f}, {velocity_norms.max().item():.6f}]")
                     
                     # 检查速度向量模长是否合理
                     if torch.any(torch.isnan(velocity_norms)) or torch.any(torch.isinf(velocity_norms)):
@@ -618,12 +618,12 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     valid_velocity_vectors = velocity_vectors[valid_velocity_mask]    # [valid_N, 2]
                     valid_velocity_norms = velocity_norms[valid_velocity_mask]        # [valid_N]
                     
-                    print(f"Debug: valid points: {valid_velocity_mask.sum().item()}/{len(valid_velocity_mask)}")
+                    # print(f"Debug: valid points: {valid_velocity_mask.sum().item()}/{len(valid_velocity_mask)}")
                     
                     # 计算向量内积 [valid_N]
                     dot_products = torch.sum(valid_pred_unit_vectors * valid_velocity_vectors, dim=1)
                     
-                    print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
+                    # print(f"Debug: dot_products shape: {dot_products.shape}, range: [{dot_products.min().item():.6f}, {dot_products.max().item():.6f}]")
                     
                     # 计算余弦相似度 - 使用更稳定的除法
                     cosine_similarities = dot_products / valid_velocity_norms  # 不需要clamp，因为已经过滤了小值
@@ -631,7 +631,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     # 限制余弦相似度范围，防止数值误差
                     cosine_similarities = torch.clamp(cosine_similarities, min=-1.0, max=1.0)
                     
-                    print(f"Debug: cosine_similarities shape: {cosine_similarities.shape}, range: [{cosine_similarities.min().item():.6f}, {cosine_similarities.max().item():.6f}]")
+                    # print(f"Debug: cosine_similarities shape: {cosine_similarities.shape}, range: [{cosine_similarities.min().item():.6f}, {cosine_similarities.max().item():.6f}]")
                     
                     # 检查余弦相似度是否合理
                     if torch.any(torch.isnan(cosine_similarities)) or torch.any(torch.isinf(cosine_similarities)):
@@ -642,12 +642,12 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     # 使用 1 - cosine_similarity 作为损失
                     cosine_losses = 1.0 - cosine_similarities  # [valid_N]
                     
-                    print(f"Debug: cosine_losses shape: {cosine_losses.shape}, range: [{cosine_losses.min().item():.6f}, {cosine_losses.max().item():.6f}]")
+                    # print(f"Debug: cosine_losses shape: {cosine_losses.shape}, range: [{cosine_losses.min().item():.6f}, {cosine_losses.max().item():.6f}]")
                     
                     # 计算最终的角度损失 - 简单平均，不使用复杂的权重
                     angle_loss = cosine_losses.mean()
                     
-                    print(f"Debug: angle_loss: {angle_loss.item():.6f}")
+                    # print(f"Debug: angle_loss: {angle_loss.item():.6f}")
                     
                     # 检查角度一致性损失是否异常
                     if torch.isnan(angle_loss) or torch.isinf(angle_loss) or angle_loss.item() > 100:
@@ -658,7 +658,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     
                     # 检查角度损失的梯度是否会导致问题
                     angle_loss_contribution = angle_loss * loss_weights['angle']
-                    print(f"Debug: angle_loss_contribution: {angle_loss_contribution.item():.6f}")
+                    # print(f"Debug: angle_loss_contribution: {angle_loss_contribution.item():.6f}")
                     
                     total_loss += angle_loss_contribution  # 角度一致性损失(L_angle)
                     loss_count += 1
