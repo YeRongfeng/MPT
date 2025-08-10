@@ -53,10 +53,10 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # }
 
     loss_weights = {
-        'classification': 2e-2, # 分类损失权重(L_ce)1e-1
-        'regression': 1e-3,     # 回归损失权重(L_mse)4e-3 
-        'uniformity': 1e-3,        # 轨迹点分布均匀性损失权重(L_uni)
-        'angle': 1e-3,             # 角度一致性损失权重(L_angle)
+        'classification': 1e-1, # 分类损失权重(L_ce) - 提高权重避免梯度消失
+        'regression': 1e-2,     # 回归损失权重(L_mse) - 提高权重
+        'uniformity': 1e-2,     # 轨迹点分布均匀性损失权重(L_uni) - 提高权重
+        'angle': 1e-2,          # 角度一致性损失权重(L_angle) - 提高权重
     }
 
     # 用于统计标签分布
@@ -573,19 +573,12 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0):
         loss.backward()  # 反向传播：计算梯度
 
         # 在梯度裁剪前检查各个损失组件
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN or Inf loss detected, skipping batch")
+            continue
+        
         if loss.item() > 10.0:  # 如果损失异常大，输出调试信息
             print(f"Warning: Large loss detected: {loss.item():.4f}")
-        
-        # 计算梯度范数
-        total_norm = 0
-        param_count = 0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-                param_count += 1
-        total_norm = total_norm ** (1. / 2)
-        original_norm = total_norm  # 保存原始梯度范数
         
         # 梯度裁剪：防止梯度爆炸
         max_grad_norm = 5.0
@@ -606,7 +599,11 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0):
             epoch_stats[i] += batch_stats[i]
         
         # 更新进度条显示信息
-        grad_info = f'{original_norm:.2f}' if not was_clipped else f'{original_norm:.2f}→{total_norm:.2f}'
+        if was_clipped:
+            grad_info = f'{original_grad_norm:.2f}→{max_grad_norm:.1f}'
+        else:
+            grad_info = f'{original_grad_norm:.2f}'
+        
         pbar.set_postfix({
             'Loss': f'{loss.item():.4f}',
             'GradNorm': grad_info,
