@@ -31,6 +31,15 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     anchorPoints: [batch_size, num_layers, max_anchors] - 锚点索引
     trueLabels: [batch_size, num_layers, max_anchors] - 真实标签
     """
+    # 首先检查输入数据的数值稳定性
+    if torch.any(torch.isnan(predVals)) or torch.any(torch.isinf(predVals)):
+        print(f"Warning: NaN or Inf detected in predVals, returning zero loss")
+        return torch.tensor(0.0, requires_grad=True, device=predVals.device), 0, 0, (0, 0, 0, 0)
+    
+    if torch.any(torch.isnan(correctionVals)) or torch.any(torch.isinf(correctionVals)):
+        print(f"Warning: NaN or Inf detected in correctionVals, setting to zero")
+        correctionVals = torch.zeros_like(correctionVals)
+    
     n_correct = 0  # 初始化正确预测计数器
     total_loss = 0.0  # 初始化总损失为浮点数
     total_samples = 0  # 初始化总样本数
@@ -199,8 +208,16 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # 将hashTable转换为张量以便并行计算
                 hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
                 
-                # predVals已经经过softmax归一化，直接使用
+                # predVals已经经过softmax归一化，检查是否包含异常值
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
+                
+                # 数值稳定性检查
+                if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
+                    print(f"Warning: NaN or Inf in pred_probs, skipping regression loss")
+                    continue
+                
+                # 确保概率值在合理范围内，但不重新归一化（保持模型的输出分布）
+                pred_probs = torch.clamp(pred_probs, min=1e-8, max=1.0-1e-8)
                 
                 # 对每个时间步分别计算加权坐标，只对概率大于阈值的锚点进行加权计算
                 weighted_coords_list = []
@@ -208,6 +225,11 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 
                 for step in range(steps_to_process):
                     step_prob = pred_probs[:, step]  # [num_tokens]
+                    
+                    # 检查当前时间步的概率是否有异常值
+                    if torch.any(torch.isnan(step_prob)) or torch.any(torch.isinf(step_prob)):
+                        print(f"Warning: NaN or Inf in step_prob at step {step}, using uniform distribution")
+                        step_prob = torch.ones_like(step_prob) / num_tokens
                     
                     # 动态阈值，至少为平均概率的2倍
                     threshold = max(0.01, 1.0 / num_tokens * 2)
@@ -222,18 +244,24 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         total_prob = valid_probs.sum()
                         
                         # 归一化概率并计算加权坐标
-                        if total_prob > 0:
+                        if total_prob > 1e-8:
                             normalized_probs = valid_probs / total_prob
                             weighted_x = torch.sum(hash_table_tensor[valid_indices, 0] * normalized_probs)
                             weighted_y = torch.sum(hash_table_tensor[valid_indices, 1] * normalized_probs)
                         else:
-                            # 如果总概率为0，使用所有锚点的加权平均
-                            weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
-                            weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                            # 如果总概率太小，使用所有锚点的均匀权重
+                            weighted_x = hash_table_tensor[:, 0].mean()
+                            weighted_y = hash_table_tensor[:, 1].mean()
                     else:
                         # 如果没有锚点超过阈值，使用所有锚点的加权平均
                         weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
                         weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    
+                    # 检查加权坐标是否异常
+                    if torch.isnan(weighted_x) or torch.isnan(weighted_y) or torch.isinf(weighted_x) or torch.isinf(weighted_y):
+                        print(f"Warning: NaN or Inf in weighted coords at step {step}, using center coordinates")
+                        weighted_x = hash_table_tensor[:, 0].mean()
+                        weighted_y = hash_table_tensor[:, 1].mean()
                     
                     weighted_coords_list.append(torch.stack([weighted_x, weighted_y]))
                 
@@ -244,14 +272,29 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # 提取修正值 [num_tokens, 2, steps_to_process]
                 offset_coords = correctionVals[i, :, :2, :steps_to_process]  # x, y 偏移量
                 
+                # 检查修正值是否有异常
+                if torch.any(torch.isnan(offset_coords)) or torch.any(torch.isinf(offset_coords)):
+                    print(f"Warning: NaN or Inf in offset_coords, setting to zero")
+                    offset_coords = torch.zeros_like(offset_coords)
+                
                 # 扩展概率分布以匹配偏移量维度 [num_tokens, steps_to_process] -> [num_tokens, 1, steps_to_process]
                 expanded_probs_correction = pred_probs.unsqueeze(1)  # [num_tokens, 1, steps_to_process]
                 
                 # 并行计算所有时间步的加权偏移量 [2, steps_to_process]
                 weighted_offsets = torch.sum(expanded_probs_correction * offset_coords, dim=0)
                 
+                # 检查加权偏移量是否异常
+                if torch.any(torch.isnan(weighted_offsets)) or torch.any(torch.isinf(weighted_offsets)):
+                    print(f"Warning: NaN or Inf in weighted_offsets, setting to zero")
+                    weighted_offsets = torch.zeros_like(weighted_offsets)
+                
                 # 计算修正后的坐标：基础坐标 + 加权偏移量 [2, steps_to_process]
                 corrected_coords_raw = weighted_coords + weighted_offsets
+                
+                # 检查修正后的坐标是否异常
+                if torch.any(torch.isnan(corrected_coords_raw)) or torch.any(torch.isinf(corrected_coords_raw)):
+                    print(f"Warning: NaN or Inf in corrected_coords_raw, using only weighted_coords")
+                    corrected_coords_raw = weighted_coords
                 
                 # 转置以匹配预期格式 [steps_to_process, 2]
                 corrected_coords = corrected_coords_raw.t()
@@ -391,12 +434,25 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
                 pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps_to_process]
                 
+                # 数值稳定性检查
+                if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
+                    print(f"Warning: NaN or Inf in pred_probs for angle loss, skipping")
+                    continue
+                
+                # 确保概率值在合理范围内，但不重新归一化（保持模型的输出分布）
+                pred_probs = torch.clamp(pred_probs, min=1e-8, max=1.0-1e-8)
+                
                 # 对每个时间步分别计算加权坐标，只对概率大于阈值的锚点进行加权计算
                 weighted_coords_list = []
                 num_tokens = pred_probs.shape[0]
                 
                 for step in range(steps_to_process):
                     step_prob = pred_probs[:, step]  # [num_tokens]
+                    
+                    # 检查当前时间步的概率是否有异常值
+                    if torch.any(torch.isnan(step_prob)) or torch.any(torch.isinf(step_prob)):
+                        print(f"Warning: NaN or Inf in step_prob for angle loss at step {step}")
+                        step_prob = torch.ones_like(step_prob) / num_tokens
                     
                     # 动态阈值，至少为平均概率的2倍
                     threshold = max(0.01, 1.0 / num_tokens * 2)
@@ -411,18 +467,24 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         total_prob = valid_probs.sum()
                         
                         # 归一化概率并计算加权坐标
-                        if total_prob > 0:
+                        if total_prob > 1e-8:
                             normalized_probs = valid_probs / total_prob
                             weighted_x = torch.sum(hash_table_tensor[valid_indices, 0] * normalized_probs)
                             weighted_y = torch.sum(hash_table_tensor[valid_indices, 1] * normalized_probs)
                         else:
-                            # 如果总概率为0，使用所有锚点的加权平均
-                            weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
-                            weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                            # 如果总概率太小，使用所有锚点的均匀权重
+                            weighted_x = hash_table_tensor[:, 0].mean()
+                            weighted_y = hash_table_tensor[:, 1].mean()
                     else:
                         # 如果没有锚点超过阈值，使用所有锚点的加权平均
                         weighted_x = torch.sum(hash_table_tensor[:, 0] * step_prob)
                         weighted_y = torch.sum(hash_table_tensor[:, 1] * step_prob)
+                    
+                    # 检查加权坐标是否异常
+                    if torch.isnan(weighted_x) or torch.isnan(weighted_y) or torch.isinf(weighted_x) or torch.isinf(weighted_y):
+                        print(f"Warning: NaN or Inf in weighted coords for angle loss at step {step}")
+                        weighted_x = hash_table_tensor[:, 0].mean()
+                        weighted_y = hash_table_tensor[:, 1].mean()
                     
                     weighted_coords_list.append(torch.stack([weighted_x, weighted_y]))
                 
@@ -433,6 +495,11 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # 获取预测角度 - 对每个时间步分别计算，只对概率大于阈值的锚点进行加权
                 # 提取所有时间步的角度预测 [num_tokens, steps_to_process]
                 step_angle_preds_all = correctionVals[i, :, 2, :steps_to_process]  # sigmoid输出[0,1]
+                
+                # 检查角度预测是否有异常
+                if torch.any(torch.isnan(step_angle_preds_all)) or torch.any(torch.isinf(step_angle_preds_all)):
+                    print(f"Warning: NaN or Inf in angle predictions, setting to default")
+                    step_angle_preds_all = torch.full_like(step_angle_preds_all, 0.5)  # 默认角度0
                 
                 # 确保角度预测在合理范围内
                 step_angle_preds_all = torch.clamp(step_angle_preds_all, min=1e-6, max=1.0-1e-6)
@@ -586,7 +653,27 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0):
         
         optimizer.zero_grad()  # 清零梯度：避免梯度累积     
         encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
+        
+        # 检查输入数据是否正常
+        if torch.any(torch.isnan(encoder_input)) or torch.any(torch.isinf(encoder_input)):
+            print(f"Warning: NaN or Inf in encoder_input at batch {batch_idx}, skipping")
+            continue
+            
         predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+        
+        # 检查模型输出是否正常
+        if torch.any(torch.isnan(predVal)) or torch.any(torch.isinf(predVal)):
+            print(f"Warning: NaN or Inf in predVal at batch {batch_idx}, skipping")
+            continue
+        
+        if torch.any(torch.isnan(correctionVal)) or torch.any(torch.isinf(correctionVal)):
+            print(f"Warning: NaN or Inf in correctionVal at batch {batch_idx}, skipping")
+            continue
+        
+        # 调试输出：检查预测值的范围
+        if batch_idx == 0:  # 只在第一个batch输出，避免过多日志
+            print(f"predVal range: [{predVal.min().item():.6f}, {predVal.max().item():.6f}]")
+            print(f"correctionVal range: [{correctionVal.min().item():.6f}, {correctionVal.max().item():.6f}]")
 
         # 正确处理锚点和标签，保持对应关系
         loss, n_correct, n_samples, batch_stats = cal_performance(
