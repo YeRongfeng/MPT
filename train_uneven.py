@@ -56,7 +56,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     if stage == 1:
         # 第一阶段：只计算分类损失
         loss_weights = {
-            'classification': 5e-2, # 分类损失权重(L_ce) - 主要损失
+            'classification': 3e-2, # 分类损失权重(L_ce) - 主要损失
             'regression': 0.0,      # 回归损失权重(L_mse) - 关闭
             'uniformity': 0,        # 轨迹点分布均匀性损失权重(L_uni)
             'angle': 0,             # 角度一致性损失权重(L_angle)

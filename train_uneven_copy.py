@@ -56,7 +56,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         'classification': 1e-1, # 分类损失权重(L_ce) - 提高权重避免梯度消失
         'regression': 1e-2,     # 回归损失权重(L_mse) - 提高权重
         'uniformity': 1e-2,     # 轨迹点分布均匀性损失权重(L_uni) - 提高权重
-        'angle': 0,             # 角度一致性损失权重(L_angle) - 暂时关闭调试
+        'angle': 1e-3,          # 角度一致性损失权重(L_angle) - 使用改进的数值稳定方法
     }
 
     # 用于统计标签分布
@@ -498,45 +498,65 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     x_dot = (x_coords[2:] - x_coords[:-2]) / 2.0  # [N]
                     y_dot = (y_coords[2:] - y_coords[:-2]) / 2.0  # [N]
                     
-                    # 4. 归一化速度向量
+                    # 4. 改进的角度一致性约束：避免归一化极小除数的问题
+                    # 不直接归一化速度向量，而是使用向量内积的性质来计算角度一致性
+                    
+                    # 计算预测角度对应的单位向量
+                    cos_theta = torch.cos(pred_angles)  # [N]
+                    sin_theta = torch.sin(pred_angles)  # [N]
+                    pred_unit_vectors = torch.stack([cos_theta, sin_theta], dim=1)  # [N, 2]
+                    
+                    # 计算速度向量 [N, 2]
+                    velocity_vectors = torch.stack([x_dot, y_dot], dim=1)  # [N, 2]
+                    
+                    # 方法1：使用余弦相似度损失，避免直接归一化
+                    # cos(angle_between_vectors) = (a · b) / (|a| * |b|)
+                    # 我们希望 cos(angle) 接近 1，即向量方向一致
+                    
+                    # 计算向量内积 [N]
+                    dot_products = torch.sum(pred_unit_vectors * velocity_vectors, dim=1)  # [N]
+                    
+                    # 计算速度向量的模长 [N]
                     velocity_norms = torch.sqrt(x_dot**2 + y_dot**2)  # [N]
                     
-                    # 检查速度向量是否合理
+                    # 检查速度向量模长是否合理
                     if torch.any(torch.isnan(velocity_norms)) or torch.any(torch.isinf(velocity_norms)):
                         print(f"Warning: NaN or Inf in velocity norms")
                         continue
                     
-                    # 防止除零，并限制极小值
-                    velocity_norms = torch.clamp(velocity_norms, min=1e-6)
+                    # 使用数值稳定的方式处理小模长：
+                    # 不是直接跳过，而是使用加权损失，对小模长的贡献降权
+                    min_norm_threshold = 1e-3  # 最小模长阈值
                     
-                    # 检查是否存在零速度
-                    if torch.any(velocity_norms < 1e-5):
-                        print(f"Warning: Very small velocity norms detected, skipping angle loss")
+                    # 计算权重：模长越大，权重越大，但不为零
+                    # weight = min(1.0, norm / min_threshold)^2
+                    normalized_norms = velocity_norms / min_norm_threshold
+                    weights = torch.clamp(normalized_norms, min=0.01, max=1.0) ** 2  # [N]
+                    
+                    # 计算余弦相似度 = dot_product / (|pred| * |velocity|)
+                    # 由于pred_unit_vectors已经是单位向量，|pred| = 1
+                    cosine_similarities = dot_products / torch.clamp(velocity_norms, min=1e-8)  # [N]
+                    
+                    # 检查余弦相似度是否合理
+                    if torch.any(torch.isnan(cosine_similarities)) or torch.any(torch.isinf(cosine_similarities)):
+                        print(f"Warning: NaN or Inf in cosine similarities")
                         continue
-                        
-                    x_dot_normalized = x_dot / velocity_norms  # [N]
-                    y_dot_normalized = y_dot / velocity_norms  # [N]
                     
-                    # 检查归一化后的速度向量
-                    if torch.any(torch.isnan(x_dot_normalized)) or torch.any(torch.isnan(y_dot_normalized)):
-                        print(f"Warning: NaN in normalized velocity vectors")
-                        continue
+                    # 角度一致性损失：希望余弦相似度接近1（角度差接近0）
+                    # 使用 1 - cosine_similarity 作为损失
+                    cosine_losses = 1.0 - cosine_similarities  # [N]
                     
-                    # 5. 计算角度对应的单位向量
-                    cos_theta = torch.cos(pred_angles)  # [N]
-                    sin_theta = torch.sin(pred_angles)  # [N]
+                    # 应用权重：小模长的损失贡献较小
+                    weighted_cosine_losses = cosine_losses * weights  # [N]
                     
-                    # 6. 计算损失：L_angle = mse((cos(theta), sin(theta)), (x_dot_normalized, y_dot_normalized))
-                    angle_vector = torch.stack([cos_theta, sin_theta], dim=1)  # [N, 2]
-                    velocity_vector = torch.stack([x_dot_normalized, y_dot_normalized], dim=1)  # [N, 2]
-                    
-                    angle_loss = F.mse_loss(angle_vector, velocity_vector)
+                    # 计算最终的角度损失
+                    angle_loss = weighted_cosine_losses.mean()
                     
                     # 检查角度一致性损失是否异常
                     if torch.isnan(angle_loss) or torch.isinf(angle_loss) or angle_loss.item() > 100:
                         print(f"Warning: Abnormal angle consistency loss: {angle_loss.item()}")
                         print(f"velocity_norms range: [{velocity_norms.min().item():.6f}, {velocity_norms.max().item():.6f}]")
-                        print(f"pred_angles range: [{pred_angles.min().item():.3f}, {pred_angles.max().item():.3f}]")
+                        print(f"cosine_similarities range: [{cosine_similarities.min().item():.6f}, {cosine_similarities.max().item():.6f}]")
                         continue
                     
                     total_loss += angle_loss * loss_weights['angle']  # 角度一致性损失(L_angle)
