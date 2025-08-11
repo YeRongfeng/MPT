@@ -51,9 +51,9 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
 
     loss_weights = {
         'classification': 1e-2, # 分类损失权重(L_ce)
-        'regression': 1e-3,     # 回归损失权重(L_mse)
-        'uniformity': 1e-3,     # 轨迹点分布均匀性损失权重(L_uni)
-        'angle': 1e-3,          # 角度一致性损失权重(L_angle)
+        'regression': 1e-1,     # 回归损失权重(L_mse)
+        'uniformity': 0e-3,     # 轨迹点分布均匀性损失权重(L_uni)
+        'angle': 0e-3,          # 角度一致性损失权重(L_angle)
     }
 
     # 初始化损失和统计
@@ -180,7 +180,6 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     correct_negative += correct_negative_mask.sum().item()
         
         # =================== 损失2：轨迹回归损失(L_mse) ===================
-        weighted_coords = None  # 初始化预测坐标变量，供角度损失使用
         if loss_weights['regression'] > 0:
             steps_to_process = min(output_dim, trajectory.shape[1])
             if steps_to_process > 0:
@@ -194,30 +193,55 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 pred_probs = F.softmax(predVals[i, :, :steps_to_process], dim=0)  # [num_tokens, steps_to_process]
                 
                 # 数值稳定性检查
-                if not (torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs))):
-                    # 使用einsum进行高效的加权坐标计算 - 张量并行
-                    # pred_probs: [num_tokens, steps_to_process], hash_table_tensor: [num_tokens, 2]
-                    # 输出: [steps_to_process, 2]
-                    weighted_coords = torch.einsum('nt,nc->tc', pred_probs, hash_table_tensor)
+                if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
+                    continue
+                
+                # 使用einsum进行高效的加权坐标计算 - 张量并行
+                # pred_probs: [num_tokens, steps_to_process], hash_table_tensor: [num_tokens, 2]
+                # 输出: [steps_to_process, 2]
+                weighted_coords = torch.einsum('nt,nc->tc', pred_probs, hash_table_tensor)
+                
+                # 坐标映射到实际坐标系
+                weighted_coords = -5.0 + weighted_coords * 0.1
+                
+                # 应用修正偏移（如果有的话） # TODO： 修正量需要基于高概率点计算，不能全概率计算
+                if correctionVals is not None:
+                    offset_coords = correctionVals[i, :, :2, :steps_to_process]  # [num_tokens, 2, steps_to_process]
+                    # 使用einsum计算加权偏移
+                    weighted_offsets = torch.einsum('nt,nct->tc', pred_probs, offset_coords)
+                    weighted_coords = weighted_coords + weighted_offsets
+                
+                # 计算与真实轨迹的坐标MSE损失
+                true_coords = trajectory[i, 1:steps_to_process+1, :2]  # 跳过起点
+                coord_loss = F.mse_loss(weighted_coords, true_coords)
+                
+                # 添加角度回归监督
+                angle_loss = torch.tensor(0.0, device=predVals.device)
+                if correctionVals is not None and trajectory_copy.shape[2] >= 3:
+                    # 获取预测角度
+                    pred_angles_sigmoid = correctionVals[i, :, 2, :steps_to_process]  # [num_tokens, steps_to_process]
+                    # 使用预测概率加权角度预测 - 张量并行
+                    weighted_angles_sigmoid = torch.sum(pred_probs * pred_angles_sigmoid, dim=0)  # [steps_to_process]
+                    # 将sigmoid输出[0,1]转换为角度范围[-π, π]
+                    weighted_pred_angles = weighted_angles_sigmoid * 2 * np.pi - np.pi  # [steps_to_process]
                     
-                    # 坐标映射到实际坐标系
-                    weighted_coords = -5.0 + weighted_coords * 0.1
+                    # 获取真实轨迹角度（跳过起点）
+                    true_angles = trajectory_copy[i, 1:steps_to_process+1, 2]  # [steps_to_process]
                     
-                    # 应用修正偏移（如果有的话）
-                    if correctionVals is not None:
-                        offset_coords = correctionVals[i, :, :2, :steps_to_process]  # [num_tokens, 2, steps_to_process]
-                        # 使用einsum计算加权偏移
-                        weighted_offsets = torch.einsum('nt,nct->tc', pred_probs, offset_coords)
-                        weighted_coords = weighted_coords + weighted_offsets
-                    
-                    # 计算与真实轨迹的MSE损失
-                    true_coords = trajectory[i, 1:steps_to_process+1, :2]  # 跳过起点
-                    coord_loss = F.mse_loss(weighted_coords, true_coords)
-                    
-                    # 数值稳定性检查
-                    if not (torch.isnan(coord_loss) or torch.isinf(coord_loss) or coord_loss.item() > 1000):
-                        total_loss = total_loss + coord_loss * loss_weights['regression']
-                        loss_count += 1
+                    # 计算角度差异，处理角度的周期性
+                    angle_diff = weighted_pred_angles - true_angles
+                    # 将角度差异规范化到[-π, π]范围内
+                    angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
+                    # 计算角度回归损失（使用平方损失）
+                    angle_loss = torch.mean(angle_diff ** 2)
+                
+                # 合并坐标损失和角度损失
+                total_regression_loss = coord_loss + 0.5 * angle_loss  # 角度损失权重可调整
+                
+                # 数值稳定性检查
+                if not (torch.isnan(total_regression_loss) or torch.isinf(total_regression_loss) or total_regression_loss.item() > 1000):
+                    total_loss = total_loss + total_regression_loss * loss_weights['regression']
+                    loss_count += 1
         
         # =================== 损失3: 轨迹点分布均匀性损失(L_uni) ===================
         if loss_weights['uniformity'] > 0:

@@ -108,24 +108,27 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     for dim in range(output_dim):
         predProb = predProb_list[dim]
 
-        # 对每个全部锚点位置进行加权
-        threshold = max(0.01, 1.0 / num_tokens * 2)  # 动态阈值，至少为平均概率的2倍
+        # 先对概率分布进行处理：滤除低概率的锚点并重新归一化
+        threshold = max(0.01, 1.0 / num_tokens * 2)  # 动态阈值
         
-        # 只对概率大于阈值的锚点进行加权计算
-        valid_indices = [idx for idx, prob in enumerate(predProb) if prob.item() > threshold]
+        # 创建掩码，只保留高概率的锚点
+        valid_mask = predProb > threshold
         
-        if valid_indices:
-            # 计算有效锚点的概率和坐标加权
-            valid_probs = [predProb[idx].item() for idx in valid_indices]
-            total_prob = sum(valid_probs)
+        if valid_mask.any():
+            # 提取有效锚点的概率并重新归一化
+            valid_probs = predProb[valid_mask]
+            normalized_probs = valid_probs / valid_probs.sum()
             
-            # 归一化概率并计算加权坐标
-            weighted_y = sum(hashTable[idx][0] * (predProb[idx].item() / total_prob) for idx in valid_indices)
-            weighted_x = sum(hashTable[idx][1] * (predProb[idx].item() / total_prob) for idx in valid_indices)
+            # 创建完整的归一化概率分布（无效位置为0）
+            filtered_predProb = torch.zeros_like(predProb)
+            filtered_predProb[valid_mask] = normalized_probs
         else:
-            # 如果没有锚点超过阈值，使用所有锚点的加权平均
-            weighted_y = sum(pos[0] * predProb[idx].item() for idx, pos in enumerate(hashTable))
-            weighted_x = sum(pos[1] * predProb[idx].item() for idx, pos in enumerate(hashTable))
+            # 如果没有锚点超过阈值，使用原始概率分布
+            filtered_predProb = predProb / predProb.sum()  # 重新归一化确保概率和为1
+
+        # 使用过滤后的概率计算加权坐标
+        weighted_y = sum(pos[0] * filtered_predProb[idx].item() for idx, pos in enumerate(hashTable))
+        weighted_x = sum(pos[1] * filtered_predProb[idx].item() for idx, pos in enumerate(hashTable))
 
         # 映射回到实际坐标系
         weighted_x = -5 + weighted_x * 0.1  # 列对应x坐标
@@ -140,18 +143,18 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         offset_y = correctionVal[0, :, 1, dim]  # [seq_len] - 直接取第0个batch
         predTheta = correctionVal[0, :, 2, dim]  # [seq_len] - 直接取第0个batch
         
-        # 对空间维度seq_len进行概率加权求和，得到最后的偏移量和角度
+        # 使用过滤后的概率进行加权求和，得到最后的偏移量和角度
         # 注意：这里的seq_len是指锚点数量
-        weighted_offset_x = (offset_x * predProb).sum()  # 标量
-        weighted_offset_y = (offset_y * predProb).sum()  # 标量
-        weighted_predTheta = (predTheta * predProb).sum()  # 标量
+        weighted_offset_x = (offset_x * filtered_predProb).sum()  # 标量
+        weighted_offset_y = (offset_y * filtered_predProb).sum()  # 标量
+        weighted_predTheta = (predTheta * filtered_predProb).sum()  # 标量
         
         # 计算加权偏移量和角度，sigmoid后得到的角度范围是[0, 1]，需要转换为[-pi, pi]
         weighted_predTheta = weighted_predTheta * 2 * np.pi - np.pi  # 将范围从[0, 1]映射到[-pi, pi]
         
         # 计算最终预测位置和角度
-        final_x = weighted_x + weighted_offset_x.item()*0
-        final_y = weighted_y + weighted_offset_y.item()*0
+        final_x = weighted_x + weighted_offset_x.item()
+        final_y = weighted_y + weighted_offset_y.item()
         
         # 获取角度, predTheta是弧度值, 直接使用
         theta_rad = weighted_predTheta.item()

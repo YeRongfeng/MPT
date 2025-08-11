@@ -367,8 +367,8 @@ if __name__ == "__main__":
     print(f"Evaluating path index: {path_index_list}")
 
     # 绘制多条轨迹的预测概率图和GT标签图对比
-    # for path_index in path_index_list:
-    #     plot_predProb_map(path_index, envType_random, save_path)
+    for path_index in path_index_list:
+        plot_predProb_map(path_index, envType_random, save_path)
         
     # 绘制多组轨迹对比图
     plot_elevation_map(path_index_list, envType_random, save_path)
