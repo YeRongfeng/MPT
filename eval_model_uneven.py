@@ -63,7 +63,8 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     print(f"Encoder input tensor shape: {encoder_input.shape}")
     
     try:
-        predVal, correctionVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
+        # predVal, correctionVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
+        predVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
     except Exception as e:
         print(f"Model forward error: {e}")
         print(f"Model expected input size might be different from {normal_z.shape}")
@@ -108,27 +109,31 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     for dim in range(output_dim):
         predProb = predProb_list[dim]
 
-        # 先对概率分布进行处理：滤除低概率的锚点并重新归一化
-        threshold = max(0.01, 1.0 / num_tokens * 2)  # 动态阈值
+        # # 先对概率分布进行处理：滤除低概率的锚点并重新归一化
+        # threshold = max(0.01, 1.0 / num_tokens * 2)  # 动态阈值
         
-        # 创建掩码，只保留高概率的锚点
-        valid_mask = predProb > threshold
+        # # 创建掩码，只保留高概率的锚点
+        # valid_mask = predProb > threshold
         
-        if valid_mask.any():
-            # 提取有效锚点的概率并重新归一化
-            valid_probs = predProb[valid_mask]
-            normalized_probs = valid_probs / valid_probs.sum()
+        # if valid_mask.any():
+        #     # 提取有效锚点的概率并重新归一化
+        #     valid_probs = predProb[valid_mask]
+        #     normalized_probs = valid_probs / valid_probs.sum()
             
-            # 创建完整的归一化概率分布（无效位置为0）
-            filtered_predProb = torch.zeros_like(predProb)
-            filtered_predProb[valid_mask] = normalized_probs
-        else:
-            # 如果没有锚点超过阈值，使用原始概率分布
-            filtered_predProb = predProb / predProb.sum()  # 重新归一化确保概率和为1
+        #     # 创建完整的归一化概率分布（无效位置为0）
+        #     filtered_predProb = torch.zeros_like(predProb)
+        #     filtered_predProb[valid_mask] = normalized_probs
+        # else:
+        #     # 如果没有锚点超过阈值，使用原始概率分布
+        #     filtered_predProb = predProb / predProb.sum()  # 重新归一化确保概率和为1
 
-        # 使用过滤后的概率计算加权坐标
-        weighted_y = sum(pos[0] * filtered_predProb[idx].item() for idx, pos in enumerate(hashTable))
-        weighted_x = sum(pos[1] * filtered_predProb[idx].item() for idx, pos in enumerate(hashTable))
+        # # 使用过滤后的概率计算加权坐标
+        # weighted_y = sum(pos[0] * filtered_predProb[idx].item() for idx, pos in enumerate(hashTable))
+        # weighted_x = sum(pos[1] * filtered_predProb[idx].item() for idx, pos in enumerate(hashTable))
+
+        # 使用概率计算加权坐标
+        weighted_y = sum(pos[0] * predProb[idx].item() for idx, pos in enumerate(hashTable))
+        weighted_x = sum(pos[1] * predProb[idx].item() for idx, pos in enumerate(hashTable))
 
         # 映射回到实际坐标系
         weighted_x = -5 + weighted_x * 0.1  # 列对应x坐标
@@ -137,30 +142,41 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         # 将加权结果添加到粗略轨迹中
         roughTraj.append((weighted_x, weighted_y))
         
-        # 分离偏移量与角度 - 在每个dim循环内处理
-        # correctionVal的格式为[batch_size, seq_len, 3, output_dim]，这里batch_size=1
-        offset_x = correctionVal[0, :, 0, dim]  # [seq_len] - 直接取第0个batch
-        offset_y = correctionVal[0, :, 1, dim]  # [seq_len] - 直接取第0个batch
-        predTheta = correctionVal[0, :, 2, dim]  # [seq_len] - 直接取第0个batch
+        # # 分离偏移量与角度 - 在每个dim循环内处理
+        # # correctionVal的格式为[batch_size, seq_len, 3, output_dim]，这里batch_size=1
+        # offset_x = correctionVal[0, :, 0, dim]  # [seq_len] - 直接取第0个batch
+        # offset_y = correctionVal[0, :, 1, dim]  # [seq_len] - 直接取第0个batch
+        # predTheta = correctionVal[0, :, 2, dim]  # [seq_len] - 直接取第0个batch
         
-        # 使用过滤后的概率进行加权求和，得到最后的偏移量和角度
-        # 注意：这里的seq_len是指锚点数量
-        weighted_offset_x = (offset_x * filtered_predProb).sum()  # 标量
-        weighted_offset_y = (offset_y * filtered_predProb).sum()  # 标量
-        weighted_predTheta = (predTheta * filtered_predProb).sum()  # 标量
+        # # 使用过滤后的概率进行加权求和，得到最后的偏移量和角度
+        # # 注意：这里的seq_len是指锚点数量
+        # weighted_offset_x = (offset_x * filtered_predProb).sum()  # 标量
+        # weighted_offset_y = (offset_y * filtered_predProb).sum()  # 标量
+        # weighted_predTheta = (predTheta * filtered_predProb).sum()  # 标量
         
-        # 计算加权偏移量和角度，sigmoid后得到的角度范围是[0, 1]，需要转换为[-pi, pi]
-        weighted_predTheta = weighted_predTheta * 2 * np.pi - np.pi  # 将范围从[0, 1]映射到[-pi, pi]
+        # # 使用概率进行加权求和，得到最后的偏移量和角度
+        # # 注意：这里的seq_len是指锚点数量
+        # weighted_offset_x = (offset_x * predProb).sum()  # 标量
+        # weighted_offset_y = (offset_y * predProb).sum()  # 标量
+        # weighted_predTheta = (predTheta * predProb).sum()  # 标量
+
+        # # 计算加权偏移量和角度，sigmoid后得到的角度范围是[0, 1]，需要转换为[-pi, pi]
+        # weighted_predTheta = weighted_predTheta * 2 * np.pi - np.pi  # 将范围从[0, 1]映射到[-pi, pi]
+        
+        # # 计算最终预测位置和角度
+        # final_x = weighted_x + weighted_offset_x.item()*0
+        # final_y = weighted_y + weighted_offset_y.item()*0
         
         # 计算最终预测位置和角度
-        final_x = weighted_x + weighted_offset_x.item()
-        final_y = weighted_y + weighted_offset_y.item()
+        final_x = weighted_x
+        final_y = weighted_y
         
-        # 获取角度, predTheta是弧度值, 直接使用
-        theta_rad = weighted_predTheta.item()
+        # # 获取角度, predTheta是弧度值, 直接使用
+        # theta_rad = weighted_predTheta.item()
         
         # 添加到预测轨迹中
-        predTraj.append((final_x, final_y, theta_rad))
+        # predTraj.append((final_x, final_y, theta_rad))
+        predTraj.append((final_x, final_y, 0.0))
         
     # print(f"Final_x range: {min(t[0] for t in predTraj)} to {max(t[0] for t in predTraj)}")
     # print(f"Final_y range: {min(t[1] for t in predTraj)} to {max(t[1] for t in predTraj)}")

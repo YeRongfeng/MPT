@@ -1157,17 +1157,17 @@ class UnevenTransformer(Transformer):
             # 输入尺寸：(batch_size, seq_len, d_model)
             Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
             
-            # nn.Conv2d(d_model, output_dim, kernel_size=1),  # 1x1卷积：将d_model维特征映射为(output_dim=)n步的预测输出
+            nn.Conv2d(d_model, output_dim, kernel_size=1),  # 1x1卷积：将d_model维特征映射为(output_dim=)n步的预测输出
             
-            nn.Conv2d(d_model, d_model // 2, kernel_size=3, padding=1),  # 第一层：特征提取和降维
-            nn.BatchNorm2d(d_model // 2),
-            nn.ReLU(inplace=True),
+            # nn.Conv2d(d_model, d_model // 2, kernel_size=3, padding=1),  # 第一层：特征提取和降维
+            # nn.BatchNorm2d(d_model // 2),
+            # nn.ReLU(inplace=True),
             
-            nn.Conv2d(d_model // 2, d_model // 2, kernel_size=3, padding=1),  # 第二层：通道数保持，深层特征提取
-            nn.BatchNorm2d(d_model // 2),
-            nn.ReLU(inplace=True),
+            # nn.Conv2d(d_model // 2, d_model // 2, kernel_size=3, padding=1),  # 第二层：通道数保持，深层特征提取
+            # nn.BatchNorm2d(d_model // 2),
+            # nn.ReLU(inplace=True),
             
-            nn.Conv2d(d_model // 2, output_dim, kernel_size=1),  # 第三层：输出层，将特征映射到(output_dim=)n步的预测输出
+            # nn.Conv2d(d_model // 2, output_dim, kernel_size=1),  # 第三层：输出层，将特征映射到(output_dim=)n步的预测输出
             
             Rearrange('bc d 1 1 -> bc d'),   # 维度重排：将4D卷积输出重排回2D格式，移除空间维度
             # 这里需要特殊处理来对seq_len维度进行Softmax归一化
@@ -1176,25 +1176,27 @@ class UnevenTransformer(Transformer):
         
         # 增加一个预测头，用于预测位置的修正量和角度的生成
         # 输入为编码器输出和分类头输出的拼接结果
-        self.correctionPred = nn.Sequential(
-            # 输入尺寸：(batch_size, seq_len, d_model + output_dim)
-            Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
+        # self.correctionPred = nn.Sequential(
+        #     # 输入尺寸：(batch_size, seq_len, d_model + output_dim)
+        #     Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
             
-            # 第一层：特征提取和降维
-            nn.Conv2d(d_model + output_dim, (d_model + output_dim) // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d((d_model + output_dim) // 2),
-            nn.ReLU(inplace=True),
+        #     nn.Conv2d(d_model + output_dim, 3*output_dim, kernel_size=1),  # 1x1卷积：将(d_model+output_dim)维特征映射为3*(output_dim=)n步的预测输出
             
-            # 第二层：通道数保持，深层特征提取
-            nn.Conv2d((d_model + output_dim) // 2, (d_model + output_dim) // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d((d_model + output_dim) // 2),
-            nn.ReLU(inplace=True),
+        #     # # 第一层：特征提取和降维
+        #     # nn.Conv2d(d_model + output_dim, (d_model + output_dim) // 2, kernel_size=3, padding=1),
+        #     # nn.BatchNorm2d((d_model + output_dim) // 2),
+        #     # nn.ReLU(inplace=True),
             
-            # 第三层：输出层
-            nn.Conv2d((d_model + output_dim) // 2, 3 * output_dim, kernel_size=1),  # 1x1卷积作为最终输出
+        #     # # 第二层：通道数保持，深层特征提取
+        #     # nn.Conv2d((d_model + output_dim) // 2, (d_model + output_dim) // 2, kernel_size=3, padding=1),
+        #     # nn.BatchNorm2d((d_model + output_dim) // 2),
+        #     # nn.ReLU(inplace=True),
             
-            Rearrange('bc d 1 1 -> bc d'),  # 维度重排：将4D卷积输出重排为(batch_size, seq_len, 3*output_dim)格式
-        )
+        #     # # 第三层：输出层
+        #     # nn.Conv2d((d_model + output_dim) // 2, 3 * output_dim, kernel_size=1),  # 1x1卷积作为最终输出
+            
+        #     Rearrange('bc d 1 1 -> bc d'),  # 维度重排：将4D卷积输出重排为(batch_size, seq_len, 3*output_dim)格式
+        # )
         
     def forward(self, input_map):
         # 模型前向传播函数，需要输出分类结果和修正结果
@@ -1208,6 +1210,7 @@ class UnevenTransformer(Transformer):
         
         # 对seq_len维度进行Softmax归一化
         seq_logit_softmax = F.softmax(seq_logit_reshaped, dim=1)  # 在seq_len维度(dim=1)上进行Softmax归一化
+        return seq_logit_softmax  # 返回分类预测结果
         
         # 拼接编码器输出和分类预测结果
         combined_features = torch.cat([enc_output, seq_logit_softmax], dim=-1)  # 在最后一个维度上拼接特征：(batch, seq_len, d_model + output_dim)
