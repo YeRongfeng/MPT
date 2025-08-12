@@ -47,11 +47,10 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # 根据训练阶段设置损失权重
     if stage == 1:
         loss_weights = {
-            'classification': 3e-2,  # 第一阶段专注分类损失
-            # 'regression': 0.0,
-            'regression': 2e-3,
-            'uniformity': 0.0,
-            'angle': 0.0,
+            'classification': 1e-3,  # 第一阶段专注分类损失
+            'regression': 3e-4,
+            'uniformity': 0e-3,
+            'angle': 3e-4,
         }
     else:
         loss_weights = {
@@ -221,8 +220,8 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 # 应用修正偏移（基于高概率点计算，过滤低概率锚点）
                 if correctionVals is not None:
                     # 计算动态阈值，过滤低概率锚点
-                    num_tokens = pred_probs.shape[0]
-                    threshold = torch.clamp(torch.tensor(max(0.01, 1.0 / num_tokens * 2), device=pred_probs.device), min=0.001)
+                    # num_tokens = pred_probs.shape[0]
+                    # threshold = torch.clamp(torch.tensor(max(0.01, 1.0 / num_tokens * 2), device=pred_probs.device), min=0.001)
                     
                     # # 为每个时间步创建高概率掩码 - 张量并行
                     # high_prob_mask = pred_probs > threshold  # [num_tokens, steps_to_process]
@@ -265,13 +264,10 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     # weighted_offsets = torch.einsum('nt,nct->tc', filtered_probs, offset_coords)
                     # weighted_coords = weighted_coords + weighted_offsets
                 
-                    # # 使用概率计算加权偏移 - 张量并行
-                    # offset_coords = correctionVals[i, :, :2, :steps_to_process]  # [num_tokens, 2, steps_to_process]
-                    # weighted_offsets = torch.einsum('nt,nct->tc', pred_probs, offset_coords)
-                    # weighted_coords = weighted_coords + weighted_offsets
-                
-                # 这里x和y反了，要作交换
-                weighted_coords = weighted_coords.flip(dims=[1])
+                    # 使用概率计算加权偏移 - 张量并行
+                    offset_coords = correctionVals[i, :, :2, :steps_to_process]  # [num_tokens, 2, steps_to_process]
+                    weighted_offsets = torch.einsum('nt,nct->tc', pred_probs, offset_coords)
+                    weighted_coords = weighted_coords + weighted_offsets
                 
                 # 计算与真实轨迹的坐标MSE损失
                 # trajectory[i, 0] 是起点，trajectory[i, 1:steps_to_process+1] 是要预测的中间点
@@ -285,7 +281,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     pred_angles_sigmoid = correctionVals[i, :, 2, :steps_to_process]  # [num_tokens, steps_to_process]
                     # # 使用过滤后的高概率分布加权角度预测 - 张量并行
                     # weighted_angles_sigmoid = torch.sum(filtered_probs * pred_angles_sigmoid, dim=0)  # [steps_to_process]
-                    # 使用过滤后的高概率分布加权角度预测 - 张量并行
+                    # 使用概率分布加权角度预测 - 张量并行
                     weighted_angles_sigmoid = torch.sum(pred_probs * pred_angles_sigmoid, dim=0)  # [steps_to_process]
                     # 将sigmoid输出[0,1]转换为角度范围[-π, π]
                     weighted_pred_angles = weighted_angles_sigmoid * 2 * np.pi - np.pi  # [steps_to_process]
@@ -310,9 +306,9 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         
         # =================== 损失3: 轨迹点分布均匀性损失(L_uni) ===================
         if loss_weights['uniformity'] > 0:
-            if trajectory_copy.shape[1] > 2:
+            if weighted_coords is not None and weighted_coords.shape[1] > 0:
                 # 计算相邻点间距离 - 张量并行
-                coords = trajectory_copy[i, :, :2]  # [num_steps, 2]
+                coords = weighted_coords[:, :2]  # [num_steps, 2]
                 diff_coords = coords[1:] - coords[:-1]  # [num_steps-1, 2]
                 distances = torch.norm(diff_coords, dim=1)  # [num_steps-1]
                 
@@ -364,14 +360,14 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         pred_angles_sigmoid = correctionVals[i, :, 2, :steps_to_process]  # [num_tokens, steps_to_process]
                         pred_angles_rad = pred_angles_sigmoid * 2 * np.pi - np.pi
                         
-                        # 使用预测概率加权角度 - 张量并行
-                        pred_probs = F.softmax(predVals[i, :, :steps_to_process], dim=0)
+                        # 使用预测概率加权角度
+                        pred_probs = predVals[i, :, :steps_to_process]
                         
                         # 转换为复数表示并计算加权平均
                         cos_angles = torch.cos(pred_angles_rad)
                         sin_angles = torch.sin(pred_angles_rad)
                         
-                        # 加权平均 - 张量并行
+                        # 加权平均
                         weighted_cos = torch.sum(pred_probs * cos_angles, dim=0)  # [steps_to_process]
                         weighted_sin = torch.sum(pred_probs * sin_angles, dim=0)  # [steps_to_process]
                         
@@ -380,7 +376,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         # 没有角度预测，跳过角度损失
                         continue
                     
-                    # 计算角度一致性损失 - 张量并行
+                    # 计算角度一致性损失
                     velocity_norms = torch.norm(velocity_vectors, dim=1)
                     valid_mask = velocity_norms > 1e-2
                     
@@ -389,7 +385,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         valid_pred_vectors = pred_unit_vectors[valid_mask]
                         valid_velocity_norms = velocity_norms[valid_mask]
                         
-                        # 计算余弦相似度 - 张量并行
+                        # 计算余弦相似度
                         dot_products = torch.sum(valid_pred_vectors * valid_velocity_vectors, dim=1)
                         cosine_similarities = dot_products / valid_velocity_norms
                         cosine_similarities = torch.clamp(cosine_similarities, -1.0, 1.0)
@@ -435,14 +431,14 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         
         optimizer.zero_grad()  # 清零梯度：避免梯度累积     
         encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
-        # predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
-        predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+        predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+        # predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
 
         # 正确处理锚点和标签，保持对应关系
         loss, n_correct, n_samples, batch_stats = cal_performance(
             predVal, 
-            # correctionVal,  # 添加correctionVal参数
-            None,  # 添加correctionVal参数
+            correctionVal,  # 添加correctionVal参数
+            # None,  # 添加correctionVal参数
             batch['anchor'].to(device),
             batch['labels'].to(device),
             batch['trajectory'].to(device),  # 轨迹点：[N, 3]
@@ -507,14 +503,14 @@ def eval_epoch(model, validationData, device, stage=1):
         for batch in tqdm(validationData, mininterval=2):  # 遍历验证数据批次，使用tqdm显示进度
 
             encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
-            # predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
-            predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+            predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+            # predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
 
             # 正确处理锚点和标签，保持对应关系
             loss, n_correct, n_samples, batch_stats = cal_performance(
                 predVal,
-                # correctionVal,  # 添加correctionVal参数
-                None,  # 添加correctionVal参数
+                correctionVal,  # 添加correctionVal参数
+                # None,  # 添加correctionVal参数
                 batch['anchor'].to(device),
                 batch['labels'].to(device),
                 batch['trajectory'].to(device),  # 轨迹点：[N, 3]
@@ -736,8 +732,10 @@ if __name__ == "__main__":
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
             lr_mul = 0.1,
+            # lr_mul = 3e-2,
             d_model = 512,
-            n_warmup_steps = 3200
+            n_warmup_steps = 800
+            # n_warmup_steps = 3200
         )
         
         # 第一阶段训练

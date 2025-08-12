@@ -294,8 +294,8 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
         # 将锚点的概率值和标签值映射到对应的像素位置
         for token_idx, (anchor_row, anchor_col) in enumerate(hashTable):
             if 0 <= anchor_row < map_height and 0 <= anchor_col < map_width:
-                pred_prob_map[anchor_row, anchor_col] = pred_prob_step[token_idx]
-                gt_labels_map[anchor_row, anchor_col] = gt_labels_step[token_idx]
+                pred_prob_map[anchor_col, anchor_row] = pred_prob_step[token_idx]
+                gt_labels_map[anchor_col, anchor_row] = gt_labels_step[token_idx]
         
         # 左侧子图 - 预测概率分布
         ax_pred = fig.add_subplot(gs[step, 0])
@@ -341,7 +341,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
 
 if __name__ == "__main__":
     stage = 1
-    epoch = 34
+    epoch = 39
     envType_list = ['desert']
     # envType_list = ['hill']
     save_path = 'predictions'
@@ -368,6 +368,7 @@ if __name__ == "__main__":
     # path_index = np.random.choice(range(500), size=1)[0]
     # path_index_list = list(np.random.choice(range(500), size=6, replace=False))
     path_index_list = list([163, 119, 340, 416, 148, 260])
+    # path_index_list = list([11, 22, 33, 44, 55, 66])
     print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 

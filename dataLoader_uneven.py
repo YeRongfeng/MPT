@@ -62,17 +62,20 @@ grid_2d = np.meshgrid(X, Y)  # 创建X-Y坐标网格
 
 # 网格点重排：将2D网格转换为(N, 2)的点列表，N=144个锚点
 # 注意：必须与hashTable的生成顺序保持一致！
-# hashTable按列优先顺序：for c in range(output_grid) for r in range(output_grid)
+# hashTable按行优先顺序：for r in range(output_grid) for c in range(output_grid)
 # 因此grid_points也必须按相同顺序重排
 XX, YY = grid_2d[0], grid_2d[1]  # XX是x坐标矩阵，YY是y坐标矩阵
 grid_points = np.array([[XX[r, c], YY[r, c]] 
-                       for c in range(output_grid) for r in range(output_grid)])  # 形状：(144, 2)
+                       for r in range(output_grid) for c in range(output_grid)])  # 形状：(144, 2)
 
 # print(grid_points)
 
 # 哈希表：锚点索引到像素坐标的映射表
-hashTable = [(anchor_spacing*r+boundary_offset, anchor_spacing*c+boundary_offset)
-             for c in range(output_grid) for r in range(output_grid)]
+# 修正：与grid_points保持一致的[x, y]顺序（而不是[r, c]=[y, x]顺序）
+hashTable = [(anchor_spacing*c+boundary_offset, anchor_spacing*r+boundary_offset)
+             for r in range(output_grid) for c in range(output_grid)]
+
+# print(hashTable[:5])  # 打印前5个锚点坐标
 
 # 【网格系统说明】
 # 1. 锚点分布：12x12=144个锚点均匀分布在地图上
