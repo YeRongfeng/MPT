@@ -341,7 +341,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
 
 if __name__ == "__main__":
     stage = 1
-    epoch = 39
+    epoch = 94
     envType_list = ['desert']
     # envType_list = ['hill']
     save_path = 'predictions'
@@ -367,8 +367,8 @@ if __name__ == "__main__":
     # 随机选择一个路径用于概率图对比
     # path_index = np.random.choice(range(500), size=1)[0]
     # path_index_list = list(np.random.choice(range(500), size=6, replace=False))
-    path_index_list = list([163, 119, 340, 416, 148, 260])
-    # path_index_list = list([11, 22, 33, 44, 55, 66])
+    # path_index_list = list([163, 119, 340, 416, 148, 260])
+    path_index_list = list([11, 22, 33, 44, 55, 66])
     print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 
