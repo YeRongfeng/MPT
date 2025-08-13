@@ -341,8 +341,9 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
 
 if __name__ == "__main__":
     stage = 1
-    epoch = 94
-    envType_list = ['desert']
+    epoch = 99
+    # envType_list = ['desert']
+    envType_list = ['desert','map1','map3','map4']
     # envType_list = ['hill']
     save_path = 'predictions'
 
@@ -363,18 +364,28 @@ if __name__ == "__main__":
 
     _ = transformer.eval()
 
-    envType_random = np.random.choice(envType_list, size=1)[0]
+    # envType_random = np.random.choice(envType_list, size=1)[0]
     # 随机选择一个路径用于概率图对比
     # path_index = np.random.choice(range(500), size=1)[0]
     # path_index_list = list(np.random.choice(range(500), size=6, replace=False))
     # path_index_list = list([163, 119, 340, 416, 148, 260])
-    path_index_list = list([11, 22, 33, 44, 55, 66])
-    print(f"Evaluating environment: {envType_random}")
+    # path_index_list = list([11, 22, 33, 44, 55, 66])
+    path_index_list = list([0, 6, 13, 22, 34, 46])
+    # print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 
-    # 绘制多条轨迹的预测概率图和GT标签图对比
-    for path_index in path_index_list:
-        plot_predProb_map(path_index, envType_random, save_path)
+    # # 绘制多条轨迹的预测概率图和GT标签图对比
+    # for path_index in path_index_list:
+    #     plot_predProb_map(path_index, envType_random, save_path)
         
-    # 绘制多组轨迹对比图
-    plot_elevation_map(path_index_list, envType_random, save_path)
+    # # 绘制多组轨迹对比图
+    # plot_elevation_map(path_index_list, envType_random, save_path)
+    
+    for env in envType_list:
+        print(f"Evaluating environment: {env}")
+        # 绘制多条轨迹的预测概率图和GT标签图对比
+        for path_index in path_index_list:
+            plot_predProb_map(path_index, env, save_path)
+
+        # 绘制多组轨迹对比图
+        plot_elevation_map(path_index_list, env, save_path)

@@ -731,8 +731,8 @@ if __name__ == "__main__":
         stage1_optimizer = Optim.ScheduledOptim(
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
-            lr_mul = 0.1,
-            # lr_mul = 3e-2,
+            # lr_mul = 0.1,
+            lr_mul = 3e-2,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200

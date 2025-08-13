@@ -11,7 +11,7 @@ from scipy.interpolate import CubicSpline
 # 参数
 MAP_SIZE = 10.0          # 地图尺寸（米）
 RESOLUTION = 0.02        # 网格分辨率（米），500x500点
-MAX_HEIGHT = 1.5
+MAX_HEIGHT = 3.0
 MIN_HEIGHT = 0.0
 # RNG_SEED = 42
 RNG_SEED = time.time_ns() % (2**32)  # 使用当前时间的纳秒部分作为种子，确保每次运行不同
@@ -20,8 +20,8 @@ random.seed(RNG_SEED)
 np.random.seed(RNG_SEED)
 
 num_pts = int(MAP_SIZE / RESOLUTION)
-x = np.linspace(0, MAP_SIZE, num_pts)
-y = np.linspace(0, MAP_SIZE, num_pts)
+x = np.linspace(-MAP_SIZE/2, MAP_SIZE/2, num_pts)
+y = np.linspace(-MAP_SIZE/2, MAP_SIZE/2, num_pts)
 xx, yy = np.meshgrid(x, y, indexing='xy')
 
 # 生成多尺度Perlin噪声（适配10m尺度）
@@ -64,22 +64,26 @@ base = 0.8 * global_up + 0.5 * meso_up + 0.15 * micro_up
 # 这里加入一个宏观弧度起伏，模拟缓坡/大波动
 # 以地图中心为原点，构造一个抛物面或者二维正弦曲面弧度
 # 例如抛物面：z = A * ( (x - center_x)^2 + (y - center_y)^2 )
-center_x, center_y = MAP_SIZE / 2, MAP_SIZE / 2
-A = random.uniform(-0.05, 0.05)  # 控制弧度幅度和方向，正负决定凸起或凹陷
+# center_x, center_y = MAP_SIZE / 2, MAP_SIZE / 2
+# A = random.uniform(-0.05, 0.05)  # 控制弧度幅度和方向，正负决定凸起或凹陷
 
-paraboloid = A * ((xx - center_x)**2 + (yy - center_y)**2)
+# paraboloid = A * ((xx - center_x)**2 + (yy - center_y)**2)
 
 # 或者用二维正弦波（替代抛物面，波动更自然）
-# wave_amp = 0.1
-# wave_freq = 2 * math.pi / MAP_SIZE  # 一个周期跨整个地图
-# sinusoid = wave_amp * (np.sin(wave_freq * xx) + np.sin(wave_freq * yy))
+# wave_amp = 1.0
+wave_amp = random.uniform(0.5, 2.0)  # 波动幅度
+wave_freq = 2 * math.pi / MAP_SIZE  # 一个周期跨整个地图
+offset_x = random.uniform(0, 2 * math.pi)
+offset_y = random.uniform(0, 2 * math.pi)
+# 生成二维正弦波
+sinusoid = wave_amp * (np.sin(wave_freq * xx + offset_x) + np.sin(wave_freq * yy + offset_y))
 
 # 将宏观弧度加到基础噪声中
-base += paraboloid
+base += sinusoid
 
 # 轻微倾斜，增加自然感
 tilt_angle = random.uniform(-math.pi / 6, math.pi / 6)
-tilt = ((xx - MAP_SIZE / 2) * math.cos(tilt_angle) + (yy - MAP_SIZE / 2) * math.sin(tilt_angle)) / MAP_SIZE
+tilt = (xx * math.cos(tilt_angle) + yy * math.sin(tilt_angle)) / MAP_SIZE
 base += 0.05 * tilt
 
 # 归一化到0~1
@@ -91,10 +95,63 @@ def add_elliptical_peak(hmap, cx, cy, a, b, angle_deg, height, exponent=1.3):
     th = math.radians(angle_deg)
     xr = (xx - cx) * math.cos(th) + (yy - cy) * math.sin(th)
     yr = -(xx - cx) * math.sin(th) + (yy - cy) * math.cos(th)
-    r2 = (xr / a) ** 2 + (yr / b) ** 2
+    
+    # 添加不对称性：使用不同的exponent对不同方向
+    # 引入角度依赖的变形
+    angle_to_center = np.arctan2(yr, xr)
+    
+    # 创建角度依赖的半径变形，模拟真实山峰的不规则形状
+    angular_variation = 0.2 * np.sin(3 * angle_to_center + random.uniform(0, 2*math.pi))
+    radial_variation = 1 + angular_variation + 0.1 * np.sin(5 * angle_to_center + random.uniform(0, 2*math.pi))
+    
+    # 基础椭圆距离
+    r2_base = (xr / a) ** 2 + (yr / b) ** 2
+    
+    # 添加径向不规则性
+    r2 = r2_base * radial_variation
+    
+    # 添加噪声扰动，打破对称性（向量化版本）
+    noise_scale = 0.1
+    noise_seed_x = random.random() * 100
+    noise_seed_y = random.random() * 100
+    
+    # 只对峰附近区域添加噪声，提高效率
+    mask = r2_base < 9
+    if np.any(mask):
+        nx = xr[mask] / (a * 0.5)
+        ny = yr[mask] / (b * 0.5)
+        
+        noise_values = np.zeros(len(nx))
+        for idx in range(len(nx)):
+            noise_values[idx] = noise_scale * (
+                noise.pnoise2(nx[idx] + noise_seed_x, ny[idx] + noise_seed_y, octaves=2) +
+                0.5 * noise.pnoise2(nx[idx] * 3 + noise_seed_x, ny[idx] * 3 + noise_seed_y, octaves=1)
+            )
+        
+        noise_distortion = np.zeros_like(xr)
+        noise_distortion[mask] = noise_values
+        r2 += noise_distortion
+    else:
+        # 如果没有符合条件的点，就不添加噪声
+        pass
+    
+    # 确保r2不会变成负数
+    r2 = np.maximum(r2, 0.01)
+    
+    # 基础影响函数
     influence = np.exp(-r2)
-    influence = influence ** exponent
-    hmap += height * influence
+    
+    # 添加方向性的exponent变化，使峰的不同侧面有不同的陡峭程度
+    directional_exponent = exponent * (1 + 0.3 * np.cos(angle_to_center + random.uniform(0, 2*math.pi)))
+    directional_exponent = np.clip(directional_exponent, 0.2, 2.5)
+    
+    influence = influence ** directional_exponent
+    
+    # 添加高度的局部变化
+    height_variation = 1 + 0.15 * np.sin(2 * angle_to_center + random.uniform(0, 2*math.pi))
+    local_height = height * height_variation
+    
+    hmap += local_height * influence
     return hmap
 
 
@@ -102,10 +159,61 @@ def add_elliptical_valley(hmap, cx, cy, a, b, angle_deg, depth, exponent=1.0):
     th = math.radians(angle_deg)
     xr = (xx - cx) * math.cos(th) + (yy - cy) * math.sin(th)
     yr = -(xx - cx) * math.sin(th) + (yy - cy) * math.cos(th)
-    r2 = (xr / a) ** 2 + (yr / b) ** 2
+    
+    # 与峰类似的不对称处理
+    angle_to_center = np.arctan2(yr, xr)
+    
+    # 创建角度依赖的形状变形
+    angular_variation = 0.15 * np.sin(2 * angle_to_center + random.uniform(0, 2*math.pi))
+    radial_variation = 1 + angular_variation + 0.08 * np.sin(4 * angle_to_center + random.uniform(0, 2*math.pi))
+    
+    # 基础椭圆距离
+    r2_base = (xr / a) ** 2 + (yr / b) ** 2
+    
+    # 添加径向不规则性
+    r2 = r2_base * radial_variation
+    
+    # 添加噪声扰动（比峰稍微小一些，因为谷通常比峰更规则）
+    noise_scale = 0.08
+    noise_seed_x = random.random() * 100
+    noise_seed_y = random.random() * 100
+    
+    # 只对谷附近区域添加噪声
+    mask = r2_base < 16
+    if np.any(mask):
+        nx = xr[mask] / (a * 0.5)
+        ny = yr[mask] / (b * 0.5)
+        
+        noise_values = np.zeros(len(nx))
+        for idx in range(len(nx)):
+            noise_values[idx] = noise_scale * (
+                noise.pnoise2(nx[idx] + noise_seed_x, ny[idx] + noise_seed_y, octaves=2) +
+                0.3 * noise.pnoise2(nx[idx] * 4 + noise_seed_x, ny[idx] * 4 + noise_seed_y, octaves=1)
+            )
+        
+        noise_distortion = np.zeros_like(xr)
+        noise_distortion[mask] = noise_values
+        r2 += noise_distortion
+    else:
+        pass
+    
+    # 确保r2不会变成负数
+    r2 = np.maximum(r2, 0.01)
+    
+    # 基础影响函数
     influence = np.exp(-r2)
-    influence = influence ** exponent
-    hmap += depth * influence
+    
+    # 添加方向性的exponent变化
+    directional_exponent = exponent * (1 + 0.2 * np.cos(angle_to_center + random.uniform(0, 2*math.pi)))
+    directional_exponent = np.clip(directional_exponent, 0.3, 2.0)
+    
+    influence = influence ** directional_exponent
+    
+    # 添加深度的局部变化
+    depth_variation = 1 + 0.1 * np.sin(3 * angle_to_center + random.uniform(0, 2*math.pi))
+    local_depth = depth * depth_variation
+    
+    hmap += local_depth * influence
     return hmap
 
 
@@ -135,12 +243,12 @@ def generate_smooth_ridge_path(length=10, num_points=40, max_curve=2.5):
     # 平移到地图中心附近，保证路径完全在地图内
     min_xy = path_rot.min(axis=0)
     max_xy = path_rot.max(axis=0)
-    shift = np.array([MAP_SIZE/2, MAP_SIZE/2]) - (min_xy + max_xy)/2
-    shift += np.random.uniform(-MAP_SIZE/2, MAP_SIZE/2, size=2)  # 随机偏移增强自然感
+    shift = np.array([0, 0]) - (min_xy + max_xy)/2  # 中心对准原点
+    shift += np.random.uniform(-MAP_SIZE/4, MAP_SIZE/4, size=2)  # 随机偏移增强自然感
     path_final = path_rot + shift
     
     # 裁剪，防止越界
-    path_final = np.clip(path_final, 0, MAP_SIZE)
+    path_final = np.clip(path_final, -MAP_SIZE/2, MAP_SIZE/2)
     return path_final
 
 def add_continuous_ridge(hmap, path, width, height):
@@ -189,12 +297,12 @@ if generate_ridge:
     ridge_path = generate_smooth_ridge_path(length=random.uniform(8.0, 10.0),
                                         num_points=200,
                                         max_curve=random.uniform(1.0, 2.5))
-    ridge_width = random.uniform(0.7, 1.0)
-    ridge_height = random.uniform(0.5, 1.4)
+    ridge_width = random.uniform(0.7, 1.3)
+    ridge_height = random.uniform(0.5, 1.1)
     heightmap = add_continuous_ridge(heightmap, ridge_path, ridge_width, ridge_height)
 
     heightmap = gaussian_filter(heightmap, sigma=1.2)
-    peaks_num = 0
+    peaks_num = random.randint(0, 1)
 else:
     peaks_num = random.randint(1, 3)
 # 主要地形特征 - 1~2个椭圆峰 + 0~1个椭圆谷
@@ -204,21 +312,21 @@ min_dist = 2.5  # 峰间距米
 # peaks_num = random.randint(1, 3)
 for _ in range(peaks_num):
     for _ in range(50):
-        cx = random.uniform(1.5, MAP_SIZE - 1.5)
-        cy = random.uniform(1.5, MAP_SIZE - 1.5)
+        cx = random.uniform(-MAP_SIZE/2 + 0.5, MAP_SIZE/2 - 0.5)
+        cy = random.uniform(-MAP_SIZE/2 + 0.5, MAP_SIZE/2 - 0.5)
         if all(math.hypot(cx - px, cy - py) > min_dist for (px, py) in placed_centers):
             break
     placed_centers.append((cx, cy))
-    a = random.uniform(2.0, 3.0)
+    a = random.uniform(1.0, 3.0)
     b = random.uniform(1.6, 2.4)
     angle = random.uniform(0, 360)
-    height = random.uniform(0.4, 1.3)
-    heightmap = add_elliptical_peak(heightmap, cx, cy, a, b, angle, height, exponent=random.uniform(1.1, 1.5))
+    height = random.uniform(0.4, 1.5)
+    heightmap = add_elliptical_peak(heightmap, cx, cy, a, b, angle, height, exponent=random.uniform(0.3, 1.0))
 
 if random.random() < 0.5:
     for _ in range(50):
-        cx = random.uniform(2.0, MAP_SIZE - 2.0)
-        cy = random.uniform(2.0, MAP_SIZE - 2.0)
+        cx = random.uniform(-MAP_SIZE/2 + 1.0, MAP_SIZE/2 - 1.0)
+        cy = random.uniform(-MAP_SIZE/2 + 1.0, MAP_SIZE/2 - 1.0)
         if all(math.hypot(cx - px, cy - py) > min_dist for (px, py) in placed_centers):
             break
     placed_centers.append((cx, cy))
@@ -235,7 +343,7 @@ heightmap = gaussian_filter(heightmap, sigma=1.0)
 micro_detail_cycles = 20
 micro_detail_noise = perlin_noise_grid(low_res, micro_detail_cycles, octaves=2, seed=random.random() * 100)
 micro_detail = upsample(micro_detail_noise, (num_pts, num_pts))
-heightmap += micro_detail * 0.01  # 振幅缩小3倍
+heightmap += micro_detail * random.uniform(0.02, 0.05)
 
 # 再次归一化限制范围
 heightmap = np.clip(heightmap, MIN_HEIGHT, MAX_HEIGHT)
@@ -246,9 +354,9 @@ print(f"Generated ridge: {generate_ridge}")
 
 # 保存高度图
 plt.figure(figsize=(6, 6))
-plt.imshow(heightmap.T, origin='lower', extent=[0, MAP_SIZE, 0, MAP_SIZE], cmap='terrain', interpolation='bilinear')
+plt.imshow(heightmap.T, origin='lower', extent=[-MAP_SIZE/2, MAP_SIZE/2, -MAP_SIZE/2, MAP_SIZE/2], cmap='terrain', interpolation='bilinear')
 plt.colorbar(label='Height (m)')
-plt.title('10m x 10m Terrain with Ridge' if generate_ridge else '10m x 10m Terrain')
+plt.title('10m x 10m Terrain with Ridge (Centered)' if generate_ridge else '10m x 10m Terrain (Centered)')
 plt.xlabel('X (m)')
 plt.ylabel('Y (m)')
 plt.tight_layout()
@@ -262,7 +370,13 @@ pcd.points = o3d.utility.Vector3dVector(points)
 
 import matplotlib.cm as cm
 
-norm_heights = (heightmap.ravel() - MIN_HEIGHT) / (MAX_HEIGHT - MIN_HEIGHT)
+# 设置着色参考高度范围，让白色对应一个合理的高度值而不是最大值
+# 这样可以保持顶部区域的可视性
+COLOR_MAX_HEIGHT = MAX_HEIGHT * 1.  # 让150%的最大高度对应白色
+COLOR_MIN_HEIGHT = MIN_HEIGHT
+
+# 使用固定的颜色映射范围，而不是基于实际高度范围
+norm_heights = np.clip((heightmap.ravel() - COLOR_MIN_HEIGHT) / (COLOR_MAX_HEIGHT - COLOR_MIN_HEIGHT), 0.0, 1.0)
 colors = cm.terrain(norm_heights)[:, :3]
 pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float32))
 

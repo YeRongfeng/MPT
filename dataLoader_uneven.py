@@ -171,6 +171,42 @@ def PaddedSequence(batch):
     return data
 
 def get_encoder_input(normal_z, goal_state, start_state, normal_x, normal_y):
+    """
+    构造编码输入，包含数据验证和修复机制
+    """
+    
+    # # 输入数据验证和修复
+    # def validate_and_fix_normal_component(component, component_name, default_value=0.0):
+    #     """验证和修复法向量分量"""
+    #     if not np.all(np.isfinite(component)):
+    #         invalid_count = np.sum(~np.isfinite(component))
+    #         print(f"Warning: {component_name} contains {invalid_count} invalid values, applying fixes")
+    #         component = np.nan_to_num(component, nan=default_value, posinf=1.0, neginf=-1.0)
+        
+    #     # 约束到合理范围
+    #     component = np.clip(component, -1.0, 1.0)
+    #     return component
+    
+    # # 修复各个法向量分量
+    # normal_x = validate_and_fix_normal_component(normal_x, "normal_x", 0.0)
+    # normal_y = validate_and_fix_normal_component(normal_y, "normal_y", 0.0) 
+    # normal_z = validate_and_fix_normal_component(normal_z, "normal_z", 1.0)  # Z默认向上
+    
+    # 逐点归一化法向量，确保单位长度
+    for i in range(normal_z.shape[0]):
+        for j in range(normal_z.shape[1]):
+            norm_vec = np.array([normal_x[i, j], normal_y[i, j], normal_z[i, j]])
+            norm_length = np.linalg.norm(norm_vec)
+            
+            if norm_length > 1e-8:
+                norm_vec = norm_vec / norm_length
+            else:
+                norm_vec = np.array([0.0, 0.0, 1.0])  # 默认向上
+            
+            normal_x[i, j] = norm_vec[0]
+            normal_y[i, j] = norm_vec[1]
+            normal_z[i, j] = norm_vec[2]
+    
     # 构造编码输入[H, W, 6]
     goal_pos = goal_state[:2]  # 终点位置 (x, y)
     start_pos = start_state[:2]  # 起点位置 (x, y)
@@ -196,29 +232,26 @@ def get_encoder_input(normal_z, goal_state, start_state, normal_x, normal_y):
     context_map = np.zeros((*normal_z.shape[:2], 3))  # [H, W, 3]
     context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 0] = 1.0  # 终点标记为1
     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 0] = -1.0  # 起点标记为-1
+    
+    # 检查角度值是否有效
+    if not (np.isfinite(goal_angle) and np.isfinite(start_angle)):
+        print("Warning: Invalid angles detected, using default values")
+        goal_angle = 0.0
+        start_angle = 0.0
+    
     context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 1] = np.cos(goal_angle)  # 终点朝向
     context_map[goal_start_y:goal_end_y, goal_start_x:goal_end_x, 2] = np.sin(goal_angle)  # 终点朝向
     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 1] = np.cos(start_angle)  # 起点朝向
     context_map[start_start_y:start_end_y, start_start_x:start_end_x, 2] = np.sin(start_angle)  # 起点朝向
 
-    # # 构造θ=<nx,ny>->(cosθ, sinθ)的映射
-    # angle_map = np.zeros((normal_z.shape[0], normal_z.shape[1], 2))  # [H, W, 2]
-    # for i in range(normal_z.shape[0]):
-    #     for j in range(normal_z.shape[1]):
-    #         n_xy_norm = np.linalg.norm([normal_x[i, j], normal_y[i, j]])
-            
-    #         if n_xy_norm == 0:
-    #             # 如果法向量为零，避免除以零
-    #             angle_map[i, j, 0] = 0.0
-    #             angle_map[i, j, 1] = 0.0
-    #         else:
-    #             # 归一化法向量
-    #             angle_map[i, j, 0] = normal_x[i, j] / n_xy_norm
-    #             angle_map[i, j, 1] = normal_y[i, j] / n_xy_norm
-    
-    # # 拼接为6通道
-    # encoded_input = np.concatenate((normal_z[:, :, None], context_map[:, :, :3], angle_map[:, :, :2]), axis=2)  # [H, W, 6]
+    # 拼接为6通道
     encoded_input = np.concatenate((normal_x[:, :, None], normal_y[:, :, None], normal_z[:, :, None], context_map[:, :, :3]), axis=2)
+    
+    # 最终检查编码输入的有效性
+    if not np.all(np.isfinite(encoded_input)):
+        print("Warning: Final encoded input contains invalid values, applying final cleanup")
+        encoded_input = np.nan_to_num(encoded_input, nan=0.0, posinf=1.0, neginf=-1.0)
+    
     return encoded_input
 
 # def get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y):
