@@ -162,6 +162,7 @@ def PaddedSequence(batch):
     # 由于所有样本已经具有固定尺寸，直接堆叠即可
     data = {
         'map': torch.stack([batch_i['map'] for batch_i in valid_batch]),  # [B, C, H, W]
+        'pose': torch.stack([batch_i['pose'] for batch_i in valid_batch]),  # [B, 2, 4] - 起点和终点位姿
         'anchor': torch.stack([batch_i['anchor'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'labels': torch.stack([batch_i['labels'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'length': torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch]),  # [B,] - 序列长度
@@ -733,13 +734,24 @@ class UnevenPathDataLoader(Dataset):
         # 3. 生成编码输入
         path = trajectory[:, :3]  # [N+2, 3]
         
-        encoded_input = get_encoder_input(
-            normal_z, 
-            goal_state=path[-1, :],  # 终点位姿
-            start_state=path[0, :],  # 起点位姿
-            normal_x=normal_x, 
-            normal_y=normal_y
-        )
+        map_input = torch.concatenate((
+            # torch.tensor(elevation, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
+            torch.tensor(normal_x, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
+            torch.tensor(normal_y, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
+            torch.tensor(normal_z, dtype=torch.float32).unsqueeze(0)   # [1, H, W]
+        ), dim=0)
+
+        start_pose = torch.tensor([path[0, 0], path[0, 1], np.cos(path[0, 2]), np.sin(path[0, 2])], dtype=torch.float32)  # [4] 起点位姿 [x, y, cos(yaw), sin(yaw)]
+        goal_pose = torch.tensor([path[-1, 0], path[-1, 1], np.cos(path[-1, 2]), np.sin(path[-1, 2])], dtype=torch.float32)  # [4] 终点位姿 [x, y, cos(yaw), sin(yaw)]
+        pose_input = torch.stack((start_pose, goal_pose), dim=0)  # [2, 4] 起点和终点位姿
+        
+        # encoded_input = get_encoder_input(
+        #     normal_z, 
+        #     goal_state=path[-1, :],  # 终点位姿
+        #     start_state=path[0, :],  # 起点位姿
+        #     normal_x=normal_x, 
+        #     normal_y=normal_y
+        # )
         
         # encoded_input = get_encoder_input(
         #     normal_z, 
@@ -845,7 +857,9 @@ class UnevenPathDataLoader(Dataset):
         
         # 转换为PyTorch张量
         return {
-            'map': torch.as_tensor(encoded_input, dtype=torch.float).permute(2, 0, 1),  # 地图：(C, H, W) - 转换为channels-first格式
+            # 'map': torch.as_tensor(encoded_input, dtype=torch.float).permute(2, 0, 1),  # 地图：(C, H, W) - 转换为channels-first格式
+            'map': torch.as_tensor(map_input, dtype=torch.float),  # 地图：(C, H, W) - map_input已经是正确的channels-first格式，无需permute
+            'pose': torch.as_tensor(pose_input, dtype=torch.float),  # 起点和终点位姿：(2, 4)
             'anchor': anchor,  # 锚点索引：(N, M)
             'labels': labels,  # 锚点标签：(N, M)
             'trajectory': torch.as_tensor(trajectory, dtype=torch.float),  # 轨迹点：[N, 3]

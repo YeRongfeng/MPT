@@ -147,7 +147,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             else:
                 print(f"Warning: No valid positive labels found for classification loss")
             
-            # 批量计算准确率 - 完全张量并行化处理，无for循环
+            # 批量计算准确率
             # threshold = max(0.01, 1.0 / num_tokens * 2)
             threshold = 0.5 / num_tokens
             
@@ -155,7 +155,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             valid_anchor_mask_acc = (anchorPoint != -1) & (trueLabel != -1) & (anchorPoint < num_tokens)
             
             if valid_anchor_mask_acc.any():
-                # 使用高级索引一次性提取所有有效的预测和标签 - 完全张量并行
+                # 使用高级索引一次性提取所有有效的预测和标签
                 step_indices_acc, anchor_indices_acc = torch.where(valid_anchor_mask_acc)
                 
                 if len(step_indices_acc) > 0:
@@ -163,11 +163,11 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     valid_anchor_positions = anchorPoint[step_indices_acc, anchor_indices_acc]  # [total_valid]
                     valid_label_values = trueLabel[step_indices_acc, anchor_indices_acc]        # [total_valid]
                     
-                    # 批量获取对应的预测值 - 张量并行
+                    # 批量获取对应的预测值
                     valid_step_preds = all_step_preds[step_indices_acc]                         # [total_valid, num_tokens]
                     selected_preds = valid_step_preds[torch.arange(len(step_indices_acc), device=predVals.device), valid_anchor_positions]  # [total_valid]
                     
-                    # 批量计算预测类别和统计 - 完全张量并行
+                    # 批量计算预测类别和统计
                     batch_class_preds = (selected_preds > threshold).long()                     # [total_valid]
                     batch_correct = batch_class_preds.eq(valid_label_values.long())             # [total_valid]
                     
@@ -430,8 +430,11 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
     for batch_idx, batch in enumerate(pbar):  # 遍历训练数据批次，使用tqdm显示进度
         
         optimizer.zero_grad()  # 清零梯度：避免梯度累积     
-        encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
-        predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+        # encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
+        # predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+        map_input = batch['map'].float().to(device)
+        pose_input = batch['pose'].float().to(device)
+        predVal, correctionVal = model(map_input, pose_input)  # 前向传播：获取模型预测值和修正值
         # predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
 
         # 正确处理锚点和标签，保持对应关系
@@ -502,8 +505,11 @@ def eval_epoch(model, validationData, device, stage=1):
     with torch.no_grad():  # 禁用梯度计算：节省内存并加速评估
         for batch in tqdm(validationData, mininterval=2):  # 遍历验证数据批次，使用tqdm显示进度
 
-            encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
-            predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+            # encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
+            # predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+            map_input = batch['map'].float().to(device)
+            pose_input = batch['pose'].float().to(device)
+            predVal, correctionVal = model(map_input, pose_input)  # 前向传播：获取模型预测值和修正值
             # predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
 
             # 正确处理锚点和标签，保持对应关系
@@ -622,6 +628,20 @@ if __name__ == "__main__":
     torch_seed = np.random.randint(low=0, high=1000)  # 生成随机种子
     torch.manual_seed(torch_seed)  # 设置PyTorch随机种子，确保结果可复现
     
+    # model_args = dict(        # 定义模型参数字典
+    #     n_layers=6,           # Transformer编码器层数：6层
+    #     n_heads=6,            # 多头注意力的头数：8->6个头
+    #     d_k=128,              # Key向量的维度：192->128
+    #     d_v=64,               # Value向量的维度：96->64
+    #     d_model=512,          # 模型的主要特征维度：512
+    #     d_inner=768,         # 前馈网络的隐藏层维度：1024->768
+    #     pad_idx=None,         # 填充标记的索引：无
+    #     n_position=15*15,     # 支持的最大位置数：225(15×15)
+    #     dropout=0.1,          # Dropout概率：0.1
+    #     train_shape=[12, 12], # 训练时的地图形状：12×12
+    #     output_dim=10,        # 输出维度：10
+    # )
+    
     model_args = dict(        # 定义模型参数字典
         n_layers=6,           # Transformer编码器层数：6层
         n_heads=8,            # 多头注意力的头数：3->8个头
@@ -635,20 +655,6 @@ if __name__ == "__main__":
         train_shape=[12, 12], # 训练时的地图形状：12×12
         output_dim=10,        # 输出维度：10
     )
-    
-    # model_args = dict(        # 定义模型参数字典
-    #     n_layers=10,           # Transformer编码器层数：10层
-    #     n_heads=12,            # 多头注意力的头数：12个头
-    #     d_k=256,              # Key向量的维度：512->192
-    #     d_v=192,               # Value向量的维度：256->96
-    #     d_model=512,          # 模型的主要特征维度：512
-    #     d_inner=2048,         # 前馈网络的隐藏层维度：2048
-    #     pad_idx=None,         # 填充标记的索引：无
-    #     n_position=15*15,     # 支持的最大位置数：225(15×15)
-    #     dropout=0.15,          # Dropout概率：0.15
-    #     train_shape=[12, 12], # 训练时的地图形状：12×12
-    #     output_dim=10,        # 输出维度：10
-    # )
 
     transformer = Models.UnevenTransformer(**model_args)  # 使用参数字典初始化Transformer模型
 
@@ -732,7 +738,7 @@ if __name__ == "__main__":
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
             # lr_mul = 0.1,
-            lr_mul = 3e-2,
+            lr_mul = 2e-2,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200

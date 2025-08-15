@@ -36,7 +36,20 @@ def getHashTable(mapSize):
 
 def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     # Identitfy Anchor points
-    encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
+    # encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
+    map_input = torch.concatenate((
+        # torch.tensor(elevation, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
+        torch.tensor(normal_x, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
+        torch.tensor(normal_y, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
+        torch.tensor(normal_z, dtype=torch.float32).unsqueeze(0)   # [1, H, W]
+    ), dim=0)
+    
+    encoder_input = map_input.permute(1, 2, 0).numpy()  # [H, W, C] -> [C, H, W]
+
+    start_pose = torch.tensor([start_pos[0], start_pos[1], np.cos(start_pos[2]), np.sin(start_pos[2])], dtype=torch.float32)  # [4] 起点位姿 [x, y, cos(yaw), sin(yaw)]
+    goal_pose = torch.tensor([goal_pos[0], goal_pos[1], np.cos(goal_pos[2]), np.sin(goal_pos[2])], dtype=torch.float32)  # [4] 终点位姿 [x, y, cos(yaw), sin(yaw)]
+    pose_input = torch.stack((start_pose, goal_pose), dim=0)  # [2, 4] 起点和终点位姿
+    
     hashTable = getHashTable(normal_z.shape)
     
     # print(f"Hash table size: {len(hashTable)}")
@@ -63,7 +76,8 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     print(f"Encoder input tensor shape: {encoder_input.shape}")
     
     try:
-        predVal, correctionVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
+        # predVal, correctionVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
+        predVal, correctionVal = model(map_input[None,:].cuda(),pose_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
         # predVal = model(encoder_input[None,:].cuda())  # Shape: (batch_size, channels, height, width) -> (batch_size, num_tokens, output_dim), (batch_size, num_tokens, 3, output_dim)
     except Exception as e:
         print(f"Model forward error: {e}")

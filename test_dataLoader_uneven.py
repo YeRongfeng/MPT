@@ -21,13 +21,14 @@ sys.modules['numpy._core.multiarray'] = np.core.multiarray
 
 if __name__ == '__main__':
     # 测试加载数据集
-    env_list = ['desert']
+    # env_list = ['desert']
+    env_list = ['map4']
     # env_list = ['hill']
     dataFolder = '/home/yrf/MPT/data/test_training/val'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
     
     # 测试数据集idx=0的返回值
-    path_index = 148
+    path_index = 1
     sample = dataset[path_index]
     print(sample['map'].shape)
     print(sample['anchor'].shape)
@@ -50,7 +51,7 @@ if __name__ == '__main__':
     plt.subplots_adjust(wspace=0.3)  # 增加子图间的水平间距
 
     # 绘制高程热力图(图1)
-    elevation_masked = np.ma.masked_invalid(sample['map'][0, 2, :, :])  # 第0通道是normal_z
+    elevation_masked = np.ma.masked_invalid(sample['map'][2, :, :])  # 第0通道是normal_z
     im = ax[0, 0].imshow(elevation_masked, extent=[-5, 5, -5, 5],
                     origin='lower', cmap='jet', aspect='equal')
 
@@ -64,16 +65,16 @@ if __name__ == '__main__':
     for i in range(0, 100, step):
         for j in range(0, 100, step):
             # 修正索引：normal_x是第0通道，normal_y是第1通道，normal_z是第2通道
-            if not (np.isnan(sample['map'][0, 0, i, j]) or
-                    np.isnan(sample['map'][0, 1, i, j]) or
-                    np.isnan(sample['map'][0, 2, i, j])):
+            if not (np.isnan(sample['map'][0, i, j]) or
+                    np.isnan(sample['map'][1, i, j]) or
+                    np.isnan(sample['map'][2, i, j])):
 
                 # 栅格中心坐标
                 cx = x[j]
                 cy = y[i]
                 
-                nx = sample['map'][0, 0, i, j]
-                ny = sample['map'][0, 1, i, j]
+                nx = sample['map'][0, i, j]
+                ny = sample['map'][1, i, j]
 
                 # 箭头长度（根据地图尺寸自适应）
                 arrow_scale = min(10, 10) / 30
@@ -87,22 +88,22 @@ if __name__ == '__main__':
     ax[0, 0].grid(True, alpha=0.3)
     ax[0, 0].set_title('Normal_z and Surface Normals')
 
-    # 绘制上下文（图2）
-    context = sample['map'][0, 3, :, :]  # 第1通道是context
-    im = ax[0, 1].imshow(context, extent=[-5, 5, -5, 5],
-                    origin='lower', cmap='jet', aspect='equal')
+    # # 绘制上下文（图2）
+    # context = sample['map'][3, :, :]  # 第1通道是context
+    # im = ax[0, 1].imshow(context, extent=[-5, 5, -5, 5],
+    #                 origin='lower', cmap='jet', aspect='equal')
     
-    # 添加起点和终点图例
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor='green', label='start (-1)'),
-        Patch(facecolor='red', label='target (1)')
-    ]
-    ax[0, 1].scatter(trajectory[0, 0], trajectory[0, 1], color='green', label='start (-1)', s=50)
-    ax[0, 1].scatter(trajectory[-1, 0], trajectory[-1, 1], color='red', label='target (1)', s=50)
-    ax[0, 1].legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.05), loc='upper center', ncol=2)
-    ax[0, 1].set_title('Context Map')
-    ax[0, 1].grid(True, alpha=0.3)
+    # # 添加起点和终点图例
+    # from matplotlib.patches import Patch
+    # legend_elements = [
+    #     Patch(facecolor='green', label='start (-1)'),
+    #     Patch(facecolor='red', label='target (1)')
+    # ]
+    # ax[0, 1].scatter(trajectory[0, 0], trajectory[0, 1], color='green', label='start (-1)', s=50)
+    # ax[0, 1].scatter(trajectory[-1, 0], trajectory[-1, 1], color='red', label='target (1)', s=50)
+    # ax[0, 1].legend(handles=legend_elements, bbox_to_anchor=(0.5, -0.05), loc='upper center', ncol=2)
+    # ax[0, 1].set_title('Context Map')
+    # ax[0, 1].grid(True, alpha=0.3)
     
     # 绘制锚点信息
     anchor = sample['anchor']  # [num_layers, max_anchors]
@@ -399,7 +400,7 @@ if __name__ == '__main__':
                 continue
                 
             anchor_idx = anchor_idx.item()
-            hash_row, hash_col = hashTable[anchor_idx]
+            hash_col, hash_row = hashTable[anchor_idx]
             
             # 将像素坐标转换为实际坐标
             cx = -5 + hash_col * 0.1   # 列对应x坐标

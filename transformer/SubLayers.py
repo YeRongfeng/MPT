@@ -442,6 +442,112 @@ class MultiHeadAttention(nn.Module):
         return q  # 返回多头注意力的最终输出
 
 
+class SharedKVProjections(nn.Module):
+    """
+    共享投影模块：用于跨注意力模块共享键值投影权重
+    
+    设计原则：
+    1. 参数效率：共享自注意力的KV投影权重
+    2. 结构一致性：保持多头注意力原有架构
+    3. 梯度隔离：确保共享权重梯度正确传播
+    """
+    def __init__(self, base_module):
+        super().__init__()
+        # 直接引用基础模块的参数（不复制）
+        self.w_ks = base_module.w_ks
+        self.w_vs = base_module.w_vs
+
+    def forward(self, x):
+        """投影函数保持与原始模块一致"""
+        return self.w_ks(x), self.w_vs(x)
+
+
+class CrossAttention(nn.Module):
+    """
+    Cross Attention Module (Key/Value来自另一序列)
+    适用于Transformer中的Encoder-Decoder交互
+    """
+    def __init__(self, n_head, d_model, d_k, d_v, kv_projections=None, dropout=0.1):
+        super().__init__()
+        self.n_head = n_head
+        self.d_k = d_k
+        self.d_v = d_v
+        
+        # Query投影层：用于目标序列
+        self.w_qs = nn.Linear(d_model, n_head * d_k, bias=False)
+        
+        # 共享或独立的KV投影
+        if kv_projections is not None:
+            self.kv_projections = kv_projections
+            self.k_proj = None
+            self.v_proj = None
+        else:
+            self.kv_projections = None
+            self.k_proj = nn.Linear(d_model, n_head * d_k, bias=False)
+            self.v_proj = nn.Linear(d_model, n_head * d_v, bias=False)
+        
+        # 输出投影层：将多头结果融合回d_model维度
+        self.fc = nn.Linear(n_head * d_v, d_model, bias=False)
+        
+        # 共享的缩放点积注意力模块
+        self.attention = ScaledDotProductAttention(temperature=d_k ** 0.5)
+        
+        self.dropout = nn.Dropout(dropout)
+        # 层归一化：稳定交叉注意力输出
+        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+        
+    def project_kv(self, context):
+        if self.kv_projections is None:
+            # 默认KV投影
+            k = self.k_proj(context)
+            v = self.v_proj(context)
+            return k, v
+        else:
+            # kv_projections必须是可调用的nn.Module
+            return self.kv_projections(context)
+
+    def forward(self, query, context, context_mask=None):
+        """
+        query: 目标序列 [batch_size, tgt_len, d_model]
+        context: 上下文序列 [batch_size, src_len, d_model]
+        context_mask: 上下文掩码 [batch_size, src_len]
+        """
+        # 保留原始query用于残差连接
+        residual = query
+        
+        # 投影并重塑形状用于多头计算
+        q = self.w_qs(query).view(query.size(0), query.size(1), self.n_head, self.d_k)
+        # 键值投影（使用共享或独立权重）
+        k, v = self.project_kv(context)
+        k = k.view(context.size(0), context.size(1), self.n_head, self.d_k)
+        v = v.view(context.size(0), context.size(1), self.n_head, self.d_v)
+
+        # 调整维度顺序：[batch_size, n_head, seq_len, d_k/d_v]
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        
+        # 准备上下文掩码（如需）
+        mask = None
+        if context_mask is not None:
+            # 扩展掩码维度：1.添加头维度 2.添加查询维度 3.转置键维度
+            mask = context_mask.unsqueeze(1).unsqueeze(1).transpose(2, 3)
+        
+        # 执行交叉注意力计算
+        q = self.attention(q, k, v, mask=mask)
+        
+        # 合并多头输出：[batch_size, tgt_len, n_head * d_v]
+        q = q.transpose(1, 2).contiguous().view(query.size(0), query.size(1), -1)
+        
+        # 最终投影
+        q = self.dropout(self.fc(q))
+        # 残差连接
+        q += residual
+        
+        # 层归一化
+        q = self.layer_norm(q)
+        
+        return q
+
+
 class PositionwiseFeedForward(nn.Module):
     """
     PositionwiseFeedForward - 位置前馈网络
