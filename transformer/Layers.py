@@ -214,35 +214,24 @@ class EncoderLayer(nn.Module):
     
 class PoseWiseEncoderLayer(nn.Module):
     """
-    轻量版：map 自注意力 + 低秩 pose→map 融合 + FiLM 调制 + yaw 稳定性分支
+    map 自注意力 + yaw-aware gating + yaw 稳定性分支
     """
-    def __init__(self, d_model, d_inner, n_head, d_k, d_v,
-                 yaw_bins=18, rank=32, dropout=0.1):
+    def __init__(self, d_model, d_inner, n_head, d_k, d_v, yaw_bins=36, dropout=0.1):
         super().__init__()
+        
         # 1) 地图自注意力：保持上下文建模能力
         self.map_sa = MultiHeadAttention(n_head, d_model, d_k, d_v, dropout=dropout)
-
-        # 2) 低秩 cross：map/pose 分别到 r 维做注意力，再回投到 d_model
-        self.r = rank
-        self.map_q = nn.Linear(d_model, rank, bias=False)
-        self.pose_k = nn.Linear(d_model, rank, bias=False)
-        self.pose_v = nn.Linear(d_model, rank, bias=False)
-        self.back_proj = nn.Linear(rank, d_model, bias=False)  # 低秩回投
-
-        # 3) FiLM 条件：用 pose 上下文（2 枚 token 的聚合）生成 (γ,β)
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(2 * d_model, d_model // 2), nn.GELU(),
-            nn.Linear(d_model // 2, 2 * d_model)
-        )
+        
+        # 2) 角度感知 gating (类似 attention bias)
+        self.angle_proj = nn.Linear(d_model, yaw_bins, bias=False)  # 将 token 投影到角度分布
+        self.gate_proj = nn.Linear(yaw_bins, d_model, bias=False)   # 将角度分布映射回调制向量
         self.norm = nn.LayerNorm(d_model)
 
-        # 4) FFN
+        # 3) FFN
         self.ffn = PositionwiseFeedForward(d_model, d_inner, dropout=dropout)
 
-        # 5) yaw 稳定性分支（每个 map token 输出 K 个 yaw bin 的 logits）
-        self.stab_head = nn.Linear(d_model, yaw_bins)
 
-    def forward(self, map_tokens, pose_tokens, slf_attn_mask=None, cross_attn_mask=None):
+    def forward(self, map_tokens, slf_attn_mask=None):
         """
         map_tokens: [B, N, D]    pose_tokens: [B, 2, D]
         返回:
@@ -253,33 +242,20 @@ class PoseWiseEncoderLayer(nn.Module):
 
         # 1) 地图自注意力
         map_feat = self.map_sa(map_tokens, map_tokens, map_tokens, mask=slf_attn_mask)  # [B,N,D]
+        
+        # 2) yaw-aware gating
+        # 每个 token → soft angle 分布
+        angle_logits = self.angle_proj(map_feat)  # [B, N, n_angle_bins]
+        angle_weights = torch.softmax(angle_logits, dim=-1)  # 概率分布
+        # 映射回调制向量
+        gate = self.gate_proj(angle_weights)  # [B, N, D]
+        fused_feat = self.norm(map_feat * (1 + torch.tanh(gate)))  # 残差调制 + LN
 
-        # 2) 低秩 pose→map 融合（超轻量 cross）
-        #   注意力在 rank 维上完成：Q=map_q(map_feat), K=pose_k(pose), V=pose_v(pose)
-        Q = self.map_q(map_feat)            # [B,N,r]
-        K = self.pose_k(pose_tokens)        # [B,2,r]
-        V = self.pose_v(pose_tokens)        # [B,2,r]
-        attn = torch.softmax((Q @ K.transpose(1, 2)) / (self.r ** 0.5), dim=-1)  # [B,N,2]
-        pose_ctx_r = attn @ V               # [B,N,r]
-        pose_ctx = self.back_proj(pose_ctx_r)  # [B,N,D]  低秩回投
-
-        # 3) FiLM 调制（用全局 pose 条件）
-        #   把 2 枚 pose token 在 d_model 维直接拼接做条件
-        cond = torch.cat([pose_tokens[:, 0, :], pose_tokens[:, 1, :]], dim=-1)  # [B,2D]
-        gamma_beta = self.cond_mlp(cond)                                        # [B,2D]
-        gamma, beta = gamma_beta.chunk(2, dim=-1)                               # [B,D]
-        map_norm = self.norm(map_feat + pose_ctx)                               # [B,N,D]
-        map_mod  = map_norm * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)      # FiLM
-
-        # 4) FFN
-        out = self.ffn(map_mod)  # [B,N,D]
-
-        # 5) yaw 稳定性分支（辅助图）
-        yaw_logits = self.stab_head(out)  # [B,N,K]
-
-        aux = dict(yaw_logits=yaw_logits,
-                   pose_ctx=pose_tokens)  # 也可返回 cond / attn 供可视化
-        return out, aux
+        # 3) FFN
+        out = self.ffn(fused_feat)  # [B,N,D]
+        # out = self.ffn(fused_feat) + map_feat  # [B,N,D]
+        
+        return out
 
 
 class DecoderLayer(nn.Module):

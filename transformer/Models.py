@@ -758,40 +758,12 @@ class PoseTokenInjector(nn.Module):
 
 
 class UnevenEncoder(nn.Module):
-    """
-    Encoder - Transformer编码器用于路径规划
-    
-    【系统概述】
-    将2D地图输入转换为高维特征表示的编码器模块。结合卷积神经网络的局部特征提取能力
-    和Transformer的全局建模能力，为路径规划任务提供强大的地图理解能力。
-    
-    【核心创新】
-    1. CNN-Transformer混合架构：先用CNN提取局部特征，再用Transformer建模全局关系
-    2. 自适应patch embedding：将地图划分为patches，每个patch作为一个token
-    3. 空间位置编码：为每个patch注入2D空间位置信息
-    4. 多层自注意力：通过堆叠的注意力层捕获复杂的空间依赖关系
-    
-    【技术优势】
-    - 全局感受野：每个位置都能感知到整个地图的信息
-    - 并行计算：相比RNN，Transformer支持高效的并行训练
-    - 长距离依赖：自注意力机制天然适合建模远距离的空间关系
-    - 可解释性：注意力权重可以可视化，理解模型的决策过程
-    
-    【应用场景】
-    1. 地图特征提取：将原始地图转换为语义丰富的特征表示
-    2. 障碍物识别：识别地图中的可通行和不可通行区域
-    3. 路径可达性分析：评估不同位置之间的连通性
-    4. 全局路径规划：为后续的路径搜索提供指导信息
-    
+    """    
     【架构设计】
     输入地图 -> CNN特征提取 -> Patch Embedding -> 位置编码 -> 多层Transformer -> 输出特征
-       |                                    |
-       -------> Pose Token Injector ---------
-    
-    在MPT框架中的定位：
-    - 特征提取器：将地图转换为Transformer可处理的token序列
-    - 全局建模器：捕获地图中的长距离空间依赖关系
-    - 语义编码器：为路径规划提供高级语义特征
+       |                                    ^
+       v                                    |
+       -------> Pose Token Injector -------->
     """
 
     def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, pad_idx, dropout, n_position, train_shape):
@@ -799,7 +771,7 @@ class UnevenEncoder(nn.Module):
         
         self.map_fe = nn.Sequential(
             # Block 1
-            nn.Conv2d(3, d_model//8, kernel_size=3, padding=1),
+            nn.Conv2d(6, d_model//8, kernel_size=3, padding=1),
             nn.BatchNorm2d(d_model//8),
             nn.ReLU(),
             nn.MaxPool2d(2),  # 50×50
@@ -824,32 +796,6 @@ class UnevenEncoder(nn.Module):
             nn.BatchNorm2d(d_model),
             nn.ReLU(),             
         )
-        
-        # self.map_fe = nn.Sequential(
-        #     # Block 1 (深度可分离)
-        #     nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),  # 下采样
-        #     nn.BatchNorm2d(64),
-        #     nn.ReLU(),
-            
-        #     # Block 2 (深度可分离)
-        #     nn.Conv2d(64, 64, kernel_size=3, padding=1, groups=64),  # 深度卷积
-        #     nn.Conv2d(64, 128, kernel_size=1),  # 逐点卷积
-        #     nn.BatchNorm2d(128),
-        #     nn.ReLU(),
-        #     nn.MaxPool2d(2),  # 25×25
-
-        #     # Block 3 (深度可分离)
-        #     nn.Conv2d(128, 128, kernel_size=3, padding=1, groups=128),  # 深度卷积
-        #     nn.Conv2d(128, 256, kernel_size=1),  # 逐点卷积
-        #     nn.BatchNorm2d(256),
-        #     nn.ReLU(),
-        #     nn.MaxPool2d(2),  # 12×12
-
-        #     # Block 4 (优化输出)
-        #     nn.Conv2d(256, 512, kernel_size=1),  # 高效通道扩展
-        #     nn.BatchNorm2d(512),
-        #     nn.ReLU()
-        # )
 
         self.reorder_dims = Rearrange('b c h w -> b (h w) c')  # 维度重排：将4D卷积输出(batch,channels,height,width)转换为3D序列格式(batch,seq_len,channels)
         
@@ -862,15 +808,16 @@ class UnevenEncoder(nn.Module):
 
         self.dropout = nn.Dropout(p=dropout)  # Dropout层：随机置零部分神经元，防止过拟合
         self.layer_stack = nn.ModuleList([  # 构建多层Transformer编码器堆栈
-            PoseWiseEncoderLayer(d_model, d_inner, n_heads, d_k, d_v, 
-                                 yaw_bins=18, rank=32, dropout=dropout)  # 创建单个编码器层：包含自注意力和前馈网络
+            PoseWiseEncoderLayer(d_model, d_inner, n_heads, d_k, d_v, yaw_bins=36, dropout=dropout)  # 创建单个编码器层：包含自注意力和前馈网络
+            # EncoderLayer(d_model, d_inner, n_heads, d_k, d_v, dropout=dropout)  # 创建单个编码器层：包含自注意力和前馈网络
             for _ in range(n_layers)  # 重复n_layers次，构建深层网络
         ])
 
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)  # 层归一化：标准化特征分布，稳定训练过程，eps防止除零错误
         
 
-    def forward(self, input_map, input_pose, returns_attns=False):
+    # def forward(self, input_map, input_pose, returns_attns=False):
+    def forward(self, input_map, returns_attns=False):
         enc_slf_attn_list = []
 
         # 1) CNN -> map tokens
@@ -879,41 +826,47 @@ class UnevenEncoder(nn.Module):
         map_tokens = self.reorder_dims(map_feat)                 # [B, N_map, D]
         map_tokens = self.position_enc(map_tokens, conv_shape=conv_map_shape if not self.training else None)
 
-        # 2) pose tokens (轻量 injector)
-        pose_tokens = self.pose_injector(input_pose, map_bounds=(-5,5,-5,5))  # [B, 2, D]
+        # # 2) pose tokens (轻量 injector)
+        # pose_tokens = self.pose_injector(input_pose, map_bounds=(-5,5,-5,5))  # [B, 2, D]
 
         # optional normalization/dropout (保留)
         map_tokens = self.dropout(self.layer_norm(map_tokens))
-        pose_tokens = self.dropout(self.layer_norm(pose_tokens))
-
-        # 3) 逐层调用 encoder 层，收集 aux（例如 yaw_logits）
-        yaw_logits_layers = []   # 用于聚合每层的 yaw logits（可选）
-        last_pose_ctx = None
-
+        # pose_tokens = self.dropout(self.layer_norm(pose_tokens))
+        
         for enc_layer in self.layer_stack:
-            # 注意：轻量版 forward 返回 (out_map_tokens, aux_dict)
-            map_tokens, aux = enc_layer(map_tokens, pose_tokens)   # map_tokens: [B, N_map, D]
-            # aux 预期包含 'yaw_logits' : [B, N_map, K]，以及可能的 'pose_ctx'
-            if aux is not None:
-                if 'yaw_logits' in aux:
-                    yaw_logits_layers.append(aux['yaw_logits'])     # 收集以便后续聚合
-                if 'pose_ctx' in aux:
-                    last_pose_ctx = aux['pose_ctx']                # 可选：保留最后一层的 pose 上下文
+            # 逐层调用 encoder 层，收集自注意力权重
+            map_tokens = enc_layer(map_tokens, slf_attn_mask=None)
+            
+        return map_tokens
 
-        # 4) 聚合 yaw logits（两种常见方式：取平均或取最后一层）
-        if len(yaw_logits_layers) > 0:
-            # yaw_logits_layers: list of tensors [B, N_map, K]
-            # 方案 A：跨层求平均（更稳定）
-            yaw_logits_stack = torch.stack(yaw_logits_layers, dim=0)  # [n_layers, B, N_map, K]
-            yaw_logits_agg = yaw_logits_stack.mean(dim=0)            # [B, N_map, K]
-            # 方案 B（可替换）：用最后一层： yaw_logits_agg = yaw_logits_layers[-1]
-        else:
-            yaw_logits_agg = None
+        # # 3) 逐层调用 encoder 层，收集 aux（例如 yaw_logits）
+        # yaw_logits_layers = []   # 用于聚合每层的 yaw logits（可选）
+        # last_pose_ctx = None
 
-        # 5) 最终编码输出：返回融合过 pose 的 map_tokens，以及聚合的 yaw_logits 供后续使用
-        if returns_attns:
-            return map_tokens, last_pose_ctx, yaw_logits_agg, enc_slf_attn_list
-        return map_tokens, last_pose_ctx, yaw_logits_agg
+        # for enc_layer in self.layer_stack:
+        #     # 注意：轻量版 forward 返回 (out_map_tokens, aux_dict)
+        #     map_tokens, aux = enc_layer(map_tokens, pose_tokens)   # map_tokens: [B, N_map, D]
+        #     # aux 预期包含 'yaw_logits' : [B, N_map, K]，以及可能的 'pose_ctx'
+        #     if aux is not None:
+        #         if 'yaw_logits' in aux:
+        #             yaw_logits_layers.append(aux['yaw_logits'])     # 收集以便后续聚合
+        #         if 'pose_ctx' in aux:
+        #             last_pose_ctx = aux['pose_ctx']                # 可选：保留最后一层的 pose 上下文
+
+        # # 4) 聚合 yaw logits（两种常见方式：取平均或取最后一层）
+        # if len(yaw_logits_layers) > 0:
+        #     # yaw_logits_layers: list of tensors [B, N_map, K]
+        #     # 方案 A：跨层求平均（更稳定）
+        #     yaw_logits_stack = torch.stack(yaw_logits_layers, dim=0)  # [n_layers, B, N_map, K]
+        #     yaw_logits_agg = yaw_logits_stack.mean(dim=0)            # [B, N_map, K]
+        #     # 方案 B（可替换）：用最后一层： yaw_logits_agg = yaw_logits_layers[-1]
+        # else:
+        #     yaw_logits_agg = None
+
+        # # 5) 最终编码输出：返回融合过 pose 的 map_tokens，以及聚合的 yaw_logits 供后续使用
+        # if returns_attns:
+        #     return map_tokens, last_pose_ctx, yaw_logits_agg, enc_slf_attn_list
+        # return map_tokens, last_pose_ctx, yaw_logits_agg
 
 
 class Decoder(nn.Module):
@@ -1417,6 +1370,34 @@ class UnevenTransformer(Transformer):
         #               padding=1),               
         # )
         
+        # self.encoder.to_patch_embedding = nn.Sequential(
+        #     # Block 1
+        #     nn.Conv2d(3, d_model//8, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(d_model//8),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(2),  # 50×50
+            
+        #     # Block 2
+        #     nn.Conv2d(d_model//8, d_model//4, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(d_model//4),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(2),  # 25×25
+            
+        #     # Block 3
+        #     nn.Conv2d(d_model//4, d_model//2, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(d_model//2),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(2),  # 12×12
+            
+        #     # Block 4
+        #     nn.Conv2d(d_model//2, d_model, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(d_model),
+        #     nn.ReLU(),
+        #     nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
+        #     nn.BatchNorm2d(d_model),
+        #     nn.ReLU(),             
+        # )
+        
         # 重新定义编码器的CNN特征提取部分
         self.encoder = UnevenEncoder(  # 使用自定义的UnevenEncoder处理不平坦地面的输入
             n_layers=n_layers,  # 编码器层数：控制模型深度和表达能力
@@ -1504,9 +1485,11 @@ class UnevenTransformer(Transformer):
     #     correction_reshaped = rearrange(correction_sigmoid, '(b c) (n d) -> b c n d', b=batch_size, n=3)
     #     return seq_logit_softmax, correction_reshaped  # 返回分类预测结果和位置修正预测结果
     
-    def forward(self, map_input, pose_input):
+    # def forward(self, map_input, pose_input):
+    def forward(self, map_input):
         # 模型前向传播函数，需要输出分类结果和修正结果
-        map_tokens, last_pose_ctx, yaw_logits_agg, *_ = self.encoder(map_input, pose_input)  # 编码阶段：通过编码器处理输入地图和位姿信息，获得特征表示，*_忽略可能的注意力权重返回值
+        # map_tokens, last_pose_ctx, yaw_logits_agg, *_ = self.encoder(map_input, pose_input)  # 编码阶段：通过编码器处理输入地图和位姿信息，获得特征表示，*_忽略可能的注意力权重返回值
+        map_tokens = self.encoder(map_input)  # 编码阶段：通过编码器处理输入地图和位姿信息，获得特征表示，*_忽略可能的注意力权重返回值
 
         # enc_output = self.layer_norm(enc_output)  # 输出层归一化：对编码器输出进行层归一化，稳定训练过程
 
@@ -1526,4 +1509,5 @@ class UnevenTransformer(Transformer):
         
         # 重排修正预测结果：将(batch, seq_len, 3*output_dim) -> (batch, seq_len, 3, output_dim)
         correction_reshaped = rearrange(correction_sigmoid, '(b c) (n d) -> b c n d', b=batch_size, n=3)
+        # return seq_logit_softmax, correction_reshaped, yaw_logits_agg  # 返回分类预测结果和位置修正预测结果
         return seq_logit_softmax, correction_reshaped  # 返回分类预测结果和位置修正预测结果

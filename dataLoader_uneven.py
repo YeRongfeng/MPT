@@ -162,11 +162,12 @@ def PaddedSequence(batch):
     # 由于所有样本已经具有固定尺寸，直接堆叠即可
     data = {
         'map': torch.stack([batch_i['map'] for batch_i in valid_batch]),  # [B, C, H, W]
-        'pose': torch.stack([batch_i['pose'] for batch_i in valid_batch]),  # [B, 2, 4] - 起点和终点位姿
+        # 'pose': torch.stack([batch_i['pose'] for batch_i in valid_batch]),  # [B, 2, 4] - 起点和终点位姿
         'anchor': torch.stack([batch_i['anchor'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'labels': torch.stack([batch_i['labels'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'length': torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch]),  # [B,] - 序列长度
-        'trajectory': torch.stack([batch_i['trajectory'] for batch_i in valid_batch])  # [B, N+2, 3]
+        'trajectory': torch.stack([batch_i['trajectory'] for batch_i in valid_batch]),  # [B, N+2, 3]
+        # 'yaw_stability': torch.stack([batch_i['yaw_stability'] for batch_i in valid_batch]),  # [B, H, W, 18] - yaw分箱倾覆状态
     }
     
     return data
@@ -593,7 +594,209 @@ def compute_terrain_direction(nx, ny, nz, cos_theta, sin_theta):
     
     return np.array([adjusted_cos, adjusted_sin])
 
+def compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=18):
+    """
+    计算地图上每个点的分箱角度是否会倾覆（PyTorch版本，高效批量处理）
     
+    基于相同的物理约束来判断每个yaw_bin角度是否会导致倾覆，
+    不会倾覆的角度分箱标为1，会倾覆的标为0。
+    
+    Args:
+        normal_x: 地形法向量x分量 (H, W) 
+        normal_y: 地形法向量y分量 (H, W)
+        normal_z: 地形法向量z分量 (H, W)
+        yaw_bins: 朝向角度的分箱数量，默认为18
+
+    Returns:
+        torch.Tensor: 每个点每个角度分箱的倾覆状态，形状为(H, W, yaw_bins)，1表示不会倾覆，0表示会倾覆
+    """
+    # 确保输入是torch张量
+    if not isinstance(normal_x, torch.Tensor):
+        normal_x = torch.tensor(normal_x, dtype=torch.float32)
+        normal_y = torch.tensor(normal_y, dtype=torch.float32) 
+        normal_z = torch.tensor(normal_z, dtype=torch.float32)
+    
+    device = normal_x.device
+    H, W = normal_x.shape
+    
+    # 地形约束参数
+    h = 8.0         # 机器人高度
+    min_edge = 10.0 # 最小边长约束
+    max_edge = 20.0 # 最大边长约束
+    
+    # 计算地形倾斜角度对应的tan值
+    terrain_slope = torch.arctan2(torch.sqrt(normal_x**2 + normal_y**2), torch.abs(normal_z))
+    
+    # 计算约束参数b
+    b_vals = h * torch.tan(terrain_slope)
+    
+    # 根据b值分类地形约束类型
+    mask_reachable = b_vals < min_edge  # 完全可达
+    mask_partial = (b_vals >= min_edge) & (b_vals < max_edge)  # 部分可达
+    mask_complex = (b_vals >= max_edge) & (b_vals < torch.sqrt(torch.tensor(max_edge**2 + min_edge**2, device=device)))  # 复杂约束
+    mask_unreachable = b_vals >= torch.sqrt(torch.tensor(max_edge**2 + min_edge**2, device=device))  # 完全不可达
+    
+    # 初始化结果数组：所有角度分箱都标记为不会倾覆(1)
+    yaw_stability = torch.ones((H, W, yaw_bins), dtype=torch.float32, device=device)
+    
+    # 定义角度分箱的中心角度：从-π到π均匀分布
+    bin_angles = torch.linspace(-torch.pi, torch.pi, yaw_bins + 1, device=device)[:-1]  # 去掉最后一个
+    
+    def safe_arctan_transform(nz_vals, theta_local_vals):
+        """安全的arctan变换，考虑角度的正确象限"""
+        tan_vals = torch.tan(theta_local_vals)
+        arctan_result = torch.arctan(nz_vals * tan_vals)
+        
+        # 如果原始角度在第二或第三象限（cos < 0），需要调整arctan结果
+        cos_local = torch.cos(theta_local_vals)
+        sin_local = torch.sin(theta_local_vals)
+        
+        # 调整第二象限的角度：arctan结果需要加π
+        second_quadrant = (cos_local < 0) & (sin_local > 0)
+        arctan_result = torch.where(second_quadrant, arctan_result + torch.pi, arctan_result)
+        
+        # 调整第三象限的角度：arctan结果需要减π
+        third_quadrant = (cos_local < 0) & (sin_local < 0)
+        arctan_result = torch.where(third_quadrant, arctan_result - torch.pi, arctan_result)
+        
+        return arctan_result
+
+    def normalize_angle(angle):
+        """标准化角度到[-π, π]"""
+        angle = torch.where(angle > torch.pi, angle - 2*torch.pi, angle)
+        angle = torch.where(angle < -torch.pi, angle + 2*torch.pi, angle)
+        return angle
+    
+    def check_angle_in_range_vectorized(angles, starts, ends):
+        """向量化检查角度是否在范围内"""
+        # angles: (yaw_bins,), starts: (N,), ends: (N,)
+        # 返回: (N, yaw_bins) 布尔张量
+        angles = angles.unsqueeze(0)  # (1, yaw_bins)
+        starts = starts.unsqueeze(1)  # (N, 1)
+        ends = ends.unsqueeze(1)      # (N, 1)
+        
+        angles = normalize_angle(angles)
+        starts = normalize_angle(starts)
+        ends = normalize_angle(ends)
+        
+        # 正常情况：start <= end
+        normal_case = starts <= ends
+        in_range_normal = (angles >= starts) & (angles <= ends) & normal_case
+        
+        # 跨越边界情况：start > end
+        cross_boundary = starts > ends
+        in_range_cross = ((angles >= starts) | (angles <= ends)) & cross_boundary
+        
+        return in_range_normal | in_range_cross
+    
+    # 处理完全不可达区域：所有角度都标记为会倾覆(0)
+    yaw_stability[mask_unreachable] = 0.0
+    
+    # 处理部分可达区域 - 向量化处理
+    if torch.any(mask_partial):
+        # 获取部分可达区域的坐标和值
+        partial_indices = torch.where(mask_partial)
+        partial_b = b_vals[mask_partial]
+        partial_nx = normal_x[mask_partial]
+        partial_ny = normal_y[mask_partial]
+        partial_nz = normal_z[mask_partial]
+        
+        # 批量计算约束边界角度（局部坐标系）
+        s1_vals = torch.arcsin(min_edge / partial_b)
+        e1_vals = torch.pi - s1_vals
+        s2_vals = -s1_vals
+        e2_vals = -torch.pi + s1_vals
+        
+        # 考虑地形法向量的影响：从局部坐标系转换到全局坐标系
+        normal_proj_angles = torch.arctan2(partial_ny, partial_nx)
+        
+        # 计算全局坐标系下的边界参数
+        s1_transforms = safe_arctan_transform(partial_nz, s1_vals)
+        e1_transforms = safe_arctan_transform(partial_nz, e1_vals)
+        s2_transforms = safe_arctan_transform(partial_nz, s2_vals)
+        e2_transforms = safe_arctan_transform(partial_nz, e2_vals)
+        
+        s1_globals = normalize_angle(normal_proj_angles + s1_transforms)
+        e1_globals = normalize_angle(normal_proj_angles + e1_transforms)
+        s2_globals = normalize_angle(normal_proj_angles + s2_transforms)
+        e2_globals = normalize_angle(normal_proj_angles + e2_transforms)
+        
+        # 向量化检查每个角度分箱是否在不可达区域
+        in_unreachable_region1 = check_angle_in_range_vectorized(bin_angles, s1_globals, e1_globals)  # (N, yaw_bins)
+        in_unreachable_region2 = check_angle_in_range_vectorized(bin_angles, e2_globals, s2_globals)  # (N, yaw_bins)
+        
+        unreachable_mask = in_unreachable_region1 | in_unreachable_region2  # (N, yaw_bins)
+        
+        # 更新yaw_stability
+        for idx, (i, j) in enumerate(zip(partial_indices[0], partial_indices[1])):
+            yaw_stability[i, j, unreachable_mask[idx]] = 0.0
+    
+    # 处理复杂约束区域 - 向量化处理
+    if torch.any(mask_complex):
+        # 获取复杂约束区域的坐标和值
+        complex_indices = torch.where(mask_complex)
+        complex_b = b_vals[mask_complex]
+        complex_nx = normal_x[mask_complex]
+        complex_ny = normal_y[mask_complex]
+        complex_nz = normal_z[mask_complex]
+        
+        # 批量计算复杂约束的边界参数
+        r1_vals = torch.arcsin(min_edge / complex_b)
+        r2_vals = torch.arccos(max_edge / complex_b)
+        
+        # 计算所有边界角度（局部坐标系）
+        s1_vals = -r2_vals
+        e1_vals = r2_vals
+        s2_vals = r1_vals
+        e2_vals = torch.pi - r1_vals
+        p1_vals = torch.pi - r2_vals
+        p2_vals = -torch.pi + r2_vals
+        s3_vals = -torch.pi + r1_vals
+        e3_vals = -r1_vals
+        
+        # 考虑地形法向量的影响：从局部坐标系转换到全局坐标系
+        normal_proj_angles = torch.arctan2(complex_ny, complex_nx)
+        
+        # 计算全局坐标系下的边界参数
+        s1_transforms = safe_arctan_transform(complex_nz, s1_vals)
+        e1_transforms = safe_arctan_transform(complex_nz, e1_vals)
+        s2_transforms = safe_arctan_transform(complex_nz, s2_vals)
+        e2_transforms = safe_arctan_transform(complex_nz, e2_vals)
+        p1_transforms = safe_arctan_transform(complex_nz, p1_vals)
+        p2_transforms = safe_arctan_transform(complex_nz, p2_vals)
+        s3_transforms = safe_arctan_transform(complex_nz, s3_vals)
+        e3_transforms = safe_arctan_transform(complex_nz, e3_vals)
+        
+        s1_globals = normalize_angle(normal_proj_angles + s1_transforms)
+        e1_globals = normalize_angle(normal_proj_angles + e1_transforms)
+        s2_globals = normalize_angle(normal_proj_angles + s2_transforms)
+        e2_globals = normalize_angle(normal_proj_angles + e2_transforms)
+        p1_globals = normalize_angle(normal_proj_angles + p1_transforms)
+        p2_globals = normalize_angle(normal_proj_angles + p2_transforms)
+        s3_globals = normalize_angle(normal_proj_angles + s3_transforms)
+        e3_globals = normalize_angle(normal_proj_angles + e3_transforms)
+        
+        # 向量化检查每个角度分箱是否在不可达区域
+        in_unreachable1 = check_angle_in_range_vectorized(bin_angles, s1_globals, e1_globals)
+        in_unreachable2 = check_angle_in_range_vectorized(bin_angles, s2_globals, e2_globals)
+        in_unreachable3 = check_angle_in_range_vectorized(bin_angles, s3_globals, e3_globals)
+        
+        # 处理p1和p2边界（单侧边界）
+        bin_angles_expanded = bin_angles.unsqueeze(0)  # (1, yaw_bins)
+        p1_expanded = p1_globals.unsqueeze(1)  # (N, 1)
+        p2_expanded = p2_globals.unsqueeze(1)  # (N, 1)
+        
+        in_unreachable_p1 = bin_angles_expanded > p1_expanded
+        in_unreachable_p2 = bin_angles_expanded < p2_expanded
+        
+        unreachable_mask = (in_unreachable1 | in_unreachable2 | in_unreachable3 | 
+                           in_unreachable_p1 | in_unreachable_p2)  # (N, yaw_bins)
+        
+        # 更新yaw_stability
+        for idx, (i, j) in enumerate(zip(complex_indices[0], complex_indices[1])):
+            yaw_stability[i, j, unreachable_mask[idx]] = 0.0
+
+    return yaw_stability
 
 class UnevenPathDataLoader(Dataset):
     """
@@ -741,17 +944,17 @@ class UnevenPathDataLoader(Dataset):
             torch.tensor(normal_z, dtype=torch.float32).unsqueeze(0)   # [1, H, W]
         ), dim=0)
 
-        start_pose = torch.tensor([path[0, 0], path[0, 1], np.cos(path[0, 2]), np.sin(path[0, 2])], dtype=torch.float32)  # [4] 起点位姿 [x, y, cos(yaw), sin(yaw)]
-        goal_pose = torch.tensor([path[-1, 0], path[-1, 1], np.cos(path[-1, 2]), np.sin(path[-1, 2])], dtype=torch.float32)  # [4] 终点位姿 [x, y, cos(yaw), sin(yaw)]
-        pose_input = torch.stack((start_pose, goal_pose), dim=0)  # [2, 4] 起点和终点位姿
+        # start_pose = torch.tensor([path[0, 0], path[0, 1], np.cos(path[0, 2]), np.sin(path[0, 2])], dtype=torch.float32)  # [4] 起点位姿 [x, y, cos(yaw), sin(yaw)]
+        # goal_pose = torch.tensor([path[-1, 0], path[-1, 1], np.cos(path[-1, 2]), np.sin(path[-1, 2])], dtype=torch.float32)  # [4] 终点位姿 [x, y, cos(yaw), sin(yaw)]
+        # pose_input = torch.stack((start_pose, goal_pose), dim=0)  # [2, 4] 起点和终点位姿
         
-        # encoded_input = get_encoder_input(
-        #     normal_z, 
-        #     goal_state=path[-1, :],  # 终点位姿
-        #     start_state=path[0, :],  # 起点位姿
-        #     normal_x=normal_x, 
-        #     normal_y=normal_y
-        # )
+        encoded_input = get_encoder_input(
+            np.abs(normal_z),        # 确保使用的法向量z分量为正值
+            goal_state=path[-1, :],  # 终点位姿
+            start_state=path[0, :],  # 起点位姿
+            normal_x=normal_x, 
+            normal_y=normal_y
+        )
         
         # encoded_input = get_encoder_input(
         #     normal_z, 
@@ -855,12 +1058,17 @@ class UnevenPathDataLoader(Dataset):
         # 将填充位置(-1)的标签设为-1，训练时忽略
         labels[anchor == -1] = -1
         
+        # # 5. 计算yaw_bins倾覆状态
+        # yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
+
         # 转换为PyTorch张量
         return {
-            # 'map': torch.as_tensor(encoded_input, dtype=torch.float).permute(2, 0, 1),  # 地图：(C, H, W) - 转换为channels-first格式
-            'map': torch.as_tensor(map_input, dtype=torch.float),  # 地图：(C, H, W) - map_input已经是正确的channels-first格式，无需permute
-            'pose': torch.as_tensor(pose_input, dtype=torch.float),  # 起点和终点位姿：(2, 4)
+            'map': torch.as_tensor(encoded_input, dtype=torch.float).permute(2, 0, 1),  # 地图：(C, H, W) - 转换为channels-first格式
+            # 'map': torch.as_tensor(map_input, dtype=torch.float),  # 地图：(C, H, W) - map_input已经是正确的channels-first格式，无需permute
+            # 'pose': torch.as_tensor(pose_input, dtype=torch.float),  # 起点和终点位姿：(2, 4)
             'anchor': anchor,  # 锚点索引：(N, M)
             'labels': labels,  # 锚点标签：(N, M)
             'trajectory': torch.as_tensor(trajectory, dtype=torch.float),  # 轨迹点：[N, 3]
+            # 'yaw_stability': torch.as_tensor(yaw_stability, dtype=torch.float),  # yaw分箱倾覆状态：[H, W, 18]
+            'elevation': torch.as_tensor(elevation, dtype=torch.float),  # 高程图：[H, W]
         }

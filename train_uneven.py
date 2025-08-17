@@ -23,16 +23,18 @@ from dataLoader_uneven import hashTable, receptive_field
 
 from torch.utils.tensorboard import SummaryWriter
 
-def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajectory, stage=1):
+from ESDF3d_atpoint import compute_esdf_batch
+
+def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels, trajectory, stage=1):
     """
-    优化版本的性能计算函数 - 使用张量并行计算，去除for循环以提升效率
+    计算loss损失
     
     predVals: [batch_size, num_tokens, output_dim] - 模型预测：144个锚点位置，每个位置10个时间步的预测
     correctionVals: [batch_size, num_tokens, 3, output_dim] - 模型修正预测：位置偏移和角度预测
     anchorPoints: 锚点信息字典，包含hashTable等
     trueLabels: [batch_size, num_layers, max_anchors] - 真实标签
     trajectory: [batch_size, num_steps, 3] - 轨迹数据
-    stage: 1 为第一阶段（只计算分类损失），2 为第二阶段（计算所有损失）
+    stage: 1 为第一阶段, 2 为第二阶段
     """
     # 初始化
     batch_size, num_tokens, output_dim = predVals.shape
@@ -47,17 +49,29 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     # 根据训练阶段设置损失权重
     if stage == 1:
         loss_weights = {
-            'classification': 1e-3,  # 第一阶段专注分类损失
+            'classification': 1e-3,  # 第一阶段专注轨迹回归
             'regression': 3e-4,
-            'uniformity': 0e-3,
+            'uniformity': 3e-4,
             'angle': 3e-4,
+            'smoothness': 0e-4,
+            'capsize': 0e0,
         }
+        # loss_weights = {
+        #     'classification': 0e-3,  # 第二阶段专注安全性优化
+        #     'regression': 0e-4,
+        #     'uniformity': 0e-3,
+        #     'angle': 0e-4,
+        #     'smoothness': 1e-4,
+        #     'capsize': 1e-3,
+        # }
     else:
         loss_weights = {
-            'classification': 1e-2,  # 第二阶段保留少量分类损失
-            'regression': 2e-2,
-            'uniformity': 0e-2,
-            'angle': 0e-2,
+            'classification': 1e-3,  # 第二阶段专注安全性优化
+            'regression': 0e-4,
+            'uniformity': 3e-4,
+            'angle': 3e-4,
+            'smoothness': 1e-4,
+            'capsize': 1e-3,
         }
     
     # 初始化损失和统计
@@ -75,6 +89,48 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
     for i in range(batch_size):
         anchorPoint = anchorPoints[i]  # [num_layers, max_anchors]
         trueLabel = trueLabels[i]  # [num_layers, max_anchors]
+        
+        if loss_weights['regression'] > 0 or loss_weights['angle'] > 0 or loss_weights['smoothness'] > 0 or loss_weights['capsize'] > 0:
+            # 如果需要坐标，那么需要在这里提前计算好坐标
+            available_trajectory_steps = trajectory.shape[1] - 1  # 减去起点，得到可预测的步数
+            steps_to_process = min(output_dim, available_trajectory_steps)
+            
+            if steps_to_process > 0:
+                # 导入全局hashTable
+                from dataLoader_uneven import hashTable
+                    
+                # 将hashTable转换为张量以便并行计算
+                hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
+                
+                # 获取当前样本的预测概率分布
+                # pred_probs = F.softmax(predVals[i, :, :steps_to_process], dim=0)  # [num_tokens, steps_to_process]
+                pred_probs = predVals[i, :, :steps_to_process]
+                
+                # 数值稳定性检查
+                if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
+                    continue
+                
+                # 使用einsum进行高效的加权坐标计算
+                # pred_probs: [num_tokens, steps_to_process], hash_table_tensor: [num_tokens, 2]
+                # 输出: [steps_to_process, 2]
+                weighted_coords = torch.einsum('nt,nc->tc', pred_probs, hash_table_tensor)
+                
+                # 坐标映射到实际坐标系
+                weighted_coords = -5.0 + weighted_coords * 0.1
+                
+                # 应用修正偏移（基于概率计算）
+                if correctionVals is not None:
+                    # 使用概率计算加权偏移
+                    offset_coords = correctionVals[i, :, :2, :steps_to_process]  # [num_tokens, 2, steps_to_process]
+                    weighted_offsets = torch.einsum('nt,nct->tc', pred_probs, offset_coords)
+                    weighted_coords += weighted_offsets
+                    
+                    # 获取预测角度
+                    pred_angles_sigmoid = correctionVals[i, :, 2, :steps_to_process]  # [num_tokens, steps_to_process]
+                    # 使用概率分布加权角度预测 
+                    weighted_angles_sigmoid = torch.sum(pred_probs * pred_angles_sigmoid, dim=0)  # [steps_to_process]
+                    # 将sigmoid输出[0,1]转换为角度范围[-π, π]
+                    weighted_pred_angles = weighted_angles_sigmoid * 2 * np.pi - np.pi  # [steps_to_process]
         
         # =================== 损失1：锚点分类交叉熵损失(L_ce) ===================
         # 修改版本：让真实标签对应点的概率总和接近1，而不要求均匀分布
@@ -193,82 +249,8 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
             # 注意：trajectory已经移除了终点，只包含起点和中间点
             available_trajectory_steps = trajectory.shape[1] - 1  # 减去起点，得到可预测的步数
             steps_to_process = min(output_dim, available_trajectory_steps)
-            
-            if steps_to_process > 0:
-                # 导入全局hashTable
-                from dataLoader_uneven import hashTable
-                    
-                # 将hashTable转换为张量以便并行计算
-                hash_table_tensor = torch.tensor(hashTable, device=predVals.device, dtype=torch.float32, requires_grad=False)  # [num_tokens, 2]
-                
-                # 获取当前样本的预测概率分布
-                # pred_probs = F.softmax(predVals[i, :, :steps_to_process], dim=0)  # [num_tokens, steps_to_process]
-                pred_probs = predVals[i, :, :steps_to_process]
-                
-                # 数值稳定性检查
-                if torch.any(torch.isnan(pred_probs)) or torch.any(torch.isinf(pred_probs)):
-                    continue
-                
-                # 使用einsum进行高效的加权坐标计算 - 张量并行
-                # pred_probs: [num_tokens, steps_to_process], hash_table_tensor: [num_tokens, 2]
-                # 输出: [steps_to_process, 2]
-                weighted_coords = torch.einsum('nt,nc->tc', pred_probs, hash_table_tensor)
-                
-                # 坐标映射到实际坐标系
-                weighted_coords = -5.0 + weighted_coords * 0.1
-                
-                # 应用修正偏移（基于高概率点计算，过滤低概率锚点）
-                if correctionVals is not None:
-                    # 计算动态阈值，过滤低概率锚点
-                    # num_tokens = pred_probs.shape[0]
-                    # threshold = torch.clamp(torch.tensor(max(0.01, 1.0 / num_tokens * 2), device=pred_probs.device), min=0.001)
-                    
-                    # # 为每个时间步创建高概率掩码 - 张量并行
-                    # high_prob_mask = pred_probs > threshold  # [num_tokens, steps_to_process]
-                    
-                    # # 创建过滤后的概率分布 - 完全张量并行，无循环
-                    # filtered_probs = torch.zeros_like(pred_probs)  # [num_tokens, steps_to_process]
-                    
-                    # # 检查每个时间步是否有有效的高概率锚点
-                    # valid_steps_mask = high_prob_mask.any(dim=0)  # [steps_to_process]
-                    
-                    # # 对有有效锚点的时间步进行处理 - 张量并行
-                    # if valid_steps_mask.any():
-                    #     # 提取有效时间步的概率和掩码
-                    #     valid_probs = pred_probs[:, valid_steps_mask]  # [num_tokens, valid_steps]
-                    #     valid_high_prob_mask = high_prob_mask[:, valid_steps_mask]  # [num_tokens, valid_steps]
-                        
-                    #     # 将无效位置设为0，保留有效位置的概率
-                    #     masked_probs = valid_probs * valid_high_prob_mask.float()  # [num_tokens, valid_steps]
-                        
-                    #     # 计算每个时间步的概率和，用于归一化
-                    #     prob_sums = masked_probs.sum(dim=0, keepdim=True)  # [1, valid_steps]
-                    #     prob_sums = torch.clamp(prob_sums, min=1e-8)  # 防止除零
-                        
-                    #     # 归一化
-                    #     normalized_masked_probs = masked_probs / prob_sums  # [num_tokens, valid_steps]
-                        
-                    #     # 将结果放回原位置
-                    #     filtered_probs[:, valid_steps_mask] = normalized_masked_probs
-                    
-                    # # 对没有有效高概率锚点的时间步使用原始归一化概率 - 张量并行
-                    # invalid_steps_mask = ~valid_steps_mask  # [steps_to_process]
-                    # if invalid_steps_mask.any():
-                    #     invalid_probs = pred_probs[:, invalid_steps_mask]  # [num_tokens, invalid_steps]
-                    #     invalid_prob_sums = invalid_probs.sum(dim=0, keepdim=True)  # [1, invalid_steps]
-                    #     invalid_prob_sums = torch.clamp(invalid_prob_sums, min=1e-8)
-                    #     filtered_probs[:, invalid_steps_mask] = invalid_probs / invalid_prob_sums
-                    
-                    # # 使用过滤后的概率计算加权偏移 - 张量并行
-                    # offset_coords = correctionVals[i, :, :2, :steps_to_process]  # [num_tokens, 2, steps_to_process]
-                    # weighted_offsets = torch.einsum('nt,nct->tc', filtered_probs, offset_coords)
-                    # weighted_coords = weighted_coords + weighted_offsets
-                
-                    # 使用概率计算加权偏移 - 张量并行
-                    offset_coords = correctionVals[i, :, :2, :steps_to_process]  # [num_tokens, 2, steps_to_process]
-                    weighted_offsets = torch.einsum('nt,nct->tc', pred_probs, offset_coords)
-                    weighted_coords = weighted_coords + weighted_offsets
-                
+
+            if steps_to_process > 0 and weighted_coords is not None:
                 # 计算与真实轨迹的坐标MSE损失
                 # trajectory[i, 0] 是起点，trajectory[i, 1:steps_to_process+1] 是要预测的中间点
                 true_coords = trajectory[i, 1:1+steps_to_process, :2]  # 从起点后第1个点开始，取steps_to_process个点
@@ -276,16 +258,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 
                 # 添加角度回归监督
                 angle_loss = torch.tensor(0.0, device=predVals.device)
-                if correctionVals is not None and trajectory_copy.shape[2] >= 3:
-                    # 获取预测角度
-                    pred_angles_sigmoid = correctionVals[i, :, 2, :steps_to_process]  # [num_tokens, steps_to_process]
-                    # # 使用过滤后的高概率分布加权角度预测 - 张量并行
-                    # weighted_angles_sigmoid = torch.sum(filtered_probs * pred_angles_sigmoid, dim=0)  # [steps_to_process]
-                    # 使用概率分布加权角度预测 - 张量并行
-                    weighted_angles_sigmoid = torch.sum(pred_probs * pred_angles_sigmoid, dim=0)  # [steps_to_process]
-                    # 将sigmoid输出[0,1]转换为角度范围[-π, π]
-                    weighted_pred_angles = weighted_angles_sigmoid * 2 * np.pi - np.pi  # [steps_to_process]
-                    
+                if weighted_pred_angles is not None and trajectory_copy.shape[2] >= 3:
                     # 获取真实轨迹角度（跳过起点，对应预测的中间点）
                     true_angles = trajectory_copy[i, 1:1+steps_to_process, 2]  # [steps_to_process]
                     
@@ -307,7 +280,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
         # =================== 损失3: 轨迹点分布均匀性损失(L_uni) ===================
         if loss_weights['uniformity'] > 0:
             if weighted_coords is not None and weighted_coords.shape[1] > 0:
-                # 计算相邻点间距离 - 张量并行
+                # 计算相邻点间距离
                 coords = weighted_coords[:, :2]  # [num_steps, 2]
                 diff_coords = coords[1:] - coords[:-1]  # [num_steps-1, 2]
                 distances = torch.norm(diff_coords, dim=1)  # [num_steps-1]
@@ -334,7 +307,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                 goal_xy = goal_state[i][:2]
                 
                 # 使用预测坐标构建完整轨迹（如果有回归损失计算）
-                if loss_weights['regression'] > 0 and weighted_coords is not None:
+                if weighted_coords is not None:
                     # 构建完整轨迹：起点 + 预测点 + 终点
                     full_coords = torch.cat([
                         start_xy.unsqueeze(0),
@@ -345,7 +318,7 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                     # 如果没有回归损失计算，使用真实轨迹坐标
                     full_coords = trajectory_copy[i, :, :2]
                 
-                # 计算速度向量 - 张量并行（中心差分）
+                # 计算速度向量（中心差分）
                 if full_coords.shape[0] >= 3:
                     x_coords = full_coords[:, 0]
                     y_coords = full_coords[:, 1]
@@ -396,6 +369,97 @@ def cal_performance(predVals, correctionVals, anchorPoints, trueLabels, trajecto
                         if not (torch.isnan(angle_loss) or torch.isinf(angle_loss) or angle_loss.item() > 100):
                             total_loss = total_loss + angle_loss * loss_weights['angle']
                             loss_count += 1
+        
+        # =================== 损失5：平滑度损失(L_smo) ===================
+        if loss_weights['smoothness'] > 0:
+            steps_to_process = min(output_dim, trajectory.shape[1])
+            if steps_to_process > 0 and trajectory_copy.shape[1] >= 3:
+                # 获取起点和终点 - 直接使用start_state和goal_state
+                start_xy = start_state[i][:2]
+                goal_xy = goal_state[i][:2]
+                
+                # 使用预测坐标构建完整轨迹（如果有回归损失计算）
+                if weighted_coords is not None:
+                    # 构建完整轨迹：起点 + 预测点 + 终点
+                    full_coords = torch.cat([
+                        start_xy.unsqueeze(0),
+                        weighted_coords,  # 来自回归损失计算的预测坐标
+                        goal_xy.unsqueeze(0)
+                    ], dim=0)  # [steps_to_process+2, 2]
+                else:
+                    # 如果没有回归损失计算，使用真实轨迹坐标
+                    full_coords = trajectory_copy[i, :, :2]
+                    
+                # 计算二阶差分平滑度损失
+                if full_coords.shape[0] >= 3:
+                    x_coords = full_coords[:, 0]
+                    y_coords = full_coords[:, 1]
+                    
+                    # 二阶差分：s_i = (x_{i+1} - 2*x_i + x_{i-1})^2 + (y_{i+1} - 2*y_i + y_{i-1})^2
+                    x_smoothness = (x_coords[2:] - 2 * x_coords[1:-1] + x_coords[:-2]) ** 2
+                    y_smoothness = (y_coords[2:] - 2 * y_coords[1:-1] + y_coords[:-2]) ** 2
+                    
+                    smoothness_loss = torch.mean(x_smoothness + y_smoothness)
+                    
+                    if not (torch.isnan(smoothness_loss) or torch.isinf(smoothness_loss) or smoothness_loss.item() > 100):
+                        total_loss = total_loss + smoothness_loss * loss_weights['smoothness']
+                        loss_count += 1
+        
+        # =================== 损失6：倾覆监督损失(L_badbin) ===================
+        if loss_weights['capsize'] > 0:
+            # 计算各预测点的倾覆esdf值
+            nx, ny, nz = normals[i, 0, :, :], normals[i, 1, :, :], normals[i, 2, :, :]  # 获取法线信息
+            # 将坐标和角度按列堆叠为 [steps_to_process, 3]
+            queries = torch.stack([
+                weighted_coords[:, 0],  # x坐标
+                weighted_coords[:, 1],  # y坐标
+                weighted_pred_angles    # 预测角度
+            ], dim=1).to(dtype=torch.float32, device=predVals.device)  # [steps_to_process, 3]
+            # 将queries重排为 [steps_to_process, 3]
+            queries = queries.t()  # [steps_to_process, 3]
+            esdf_results = compute_esdf_batch(nx, ny, nz, queries,
+                                              resolution=0.1, origin=(-5.0, -5.0),
+                                              yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=predVals.device)
+            # 提取每个返回项的第一个元素
+            if isinstance(esdf_results, (list, tuple)):
+                first_elems = []
+                for item in esdf_results:
+                    if isinstance(item, (list, tuple)):
+                        first_val = item[0]
+                    else:
+                        first_val = item
+                    # 将非 tensor 转为 tensor，并放到正确设备、类型
+                    if not isinstance(first_val, torch.Tensor):
+                        first_val = torch.tensor(first_val, device=predVals.device, dtype=torch.float32)
+                    else:
+                        first_val = first_val.to(device=predVals.device, dtype=torch.float32)
+                    first_elems.append(first_val)
+                if len(first_elems) == 0:
+                    # 兜底：避免空列表导致后续错误
+                    capsize_esdf = torch.tensor([], device=predVals.device, dtype=torch.float32)
+                else:
+                    capsize_esdf = torch.stack(first_elems)  # [steps, ...]
+            else:
+                # 如果直接返回单个值或单个 tensor，直接使用
+                capsize_esdf = esdf_results if isinstance(esdf_results, torch.Tensor) else torch.tensor(esdf_results, device=predVals.device, dtype=torch.float32)
+            
+            d_safe = 0.  # 安全距离（米）
+            kalpa = 0.6  # 安全损失衰减速率
+            
+            # 如果 capsize_esdf 为空则跳过；否则按元素计算并取平均作为损失（可按需改为逐点加权）
+            if capsize_esdf.numel() > 0:
+                # 将倾覆损失的梯度设置为可训练
+                capsize_loss = torch.tensor(0.0, device=predVals.device, requires_grad=True)
+                
+                capsize_loss_per_point = torch.exp(-(capsize_esdf - d_safe) / kalpa)
+                capsize_loss = capsize_loss_per_point.mean()
+                # 数值稳定性检查
+                if not (torch.isnan(capsize_loss) or torch.isinf(capsize_loss) or capsize_loss.item() > 1e6):
+                    total_loss = total_loss + capsize_loss * loss_weights['capsize']
+                    loss_count += 1
+            else:
+                # 没有有效的 esdf 返回，跳过该损失
+                pass
 
     # 确保返回张量类型的损失
     if loss_count == 0:
@@ -433,15 +497,15 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         # encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
         # predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
         map_input = batch['map'].float().to(device)
-        pose_input = batch['pose'].float().to(device)
-        predVal, correctionVal = model(map_input, pose_input)  # 前向传播：获取模型预测值和修正值
+        predVal, correctionVal = model(map_input)  # 前向传播：获取模型预测值和修正值
         # predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+        normals = map_input[:, :3, :, :]  # 获取法线信息 [N, 3, H, W]
 
         # 正确处理锚点和标签，保持对应关系
         loss, n_correct, n_samples, batch_stats = cal_performance(
             predVal, 
             correctionVal,  # 添加correctionVal参数
-            # None,  # 添加correctionVal参数
+            normals,  # 添加法线信息
             batch['anchor'].to(device),
             batch['labels'].to(device),
             batch['trajectory'].to(device),  # 轨迹点：[N, 3]
@@ -508,15 +572,15 @@ def eval_epoch(model, validationData, device, stage=1):
             # encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
             # predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
             map_input = batch['map'].float().to(device)
-            pose_input = batch['pose'].float().to(device)
-            predVal, correctionVal = model(map_input, pose_input)  # 前向传播：获取模型预测值和修正值
+            predVal, correctionVal = model(map_input)  # 前向传播：获取模型预测值和修正值
             # predVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
+            normals = map_input[:, :3, :, :]  # 获取法线信息 [N, 3, H, W]
 
             # 正确处理锚点和标签，保持对应关系
             loss, n_correct, n_samples, batch_stats = cal_performance(
-                predVal,
+                predVal, 
                 correctionVal,  # 添加correctionVal参数
-                # None,  # 添加correctionVal参数
+                normals,  # 添加法线信息
                 batch['anchor'].to(device),
                 batch['labels'].to(device),
                 batch['trajectory'].to(device),  # 轨迹点：[N, 3]
@@ -594,7 +658,7 @@ def load_stage1_checkpoint(model, checkpoint_path, device):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()  # 创建命令行参数解析器
     parser.add_argument('--batchSize', help="Batch size per GPU", required=True, type=int)  # 添加批次大小参数
-    parser.add_argument('--env_list', help="Directory with training and validation data for Maze", default=None) 
+    # parser.add_argument('--env_list', help="Directory with training and validation data for Maze", default=None) 
     parser.add_argument('--dataFolder', help="Directory with training and validation data for Maze", default=None)  # 添加数据文件夹参数
     parser.add_argument('--fileDir', help="Directory to save training Data")  # 添加训练数据保存目录参数
     parser.add_argument('--load_stage1_model', help="Path to stage1 model checkpoint to load and start stage2 training", default=None)  # 加载第一阶段的模型参数，直接开始第二阶段训练
@@ -605,9 +669,13 @@ if __name__ == "__main__":
     if not osp.isdir(dataFolder):  # 检查数据文件夹是否存在
         raise ValueError("Please provide a valid data folder")  # 如果不存在，抛出错误
     
-    assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
-    env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
-    
+    # assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
+    # env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
+
+    env_num = 100
+    env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
+    # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
+
     check_data_folders(dataFolder) # 检查数据文件夹结构
     map_load = True  # 设置加载地图数据标志为True
 
@@ -664,7 +732,7 @@ if __name__ == "__main__":
     transformer.to(device=device)  # 将模型移动到指定设备(CPU或GPU)
     
     # 双阶段训练配置
-    stage1_epochs = 100  # 第一阶段训练轮数：训练除correctionPred外的所有参数
+    stage1_epochs = 40  # 第一阶段训练轮数：训练除correctionPred外的所有参数
     stage2_epochs = 80  # 第二阶段训练轮数：只训练correctionPred参数
     total_epochs = stage1_epochs + stage2_epochs
     
@@ -738,7 +806,7 @@ if __name__ == "__main__":
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
             # lr_mul = 0.1,
-            lr_mul = 2e-2,
+            lr_mul = 3e-2,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200
