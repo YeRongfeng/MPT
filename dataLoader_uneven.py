@@ -177,6 +177,9 @@ def get_encoder_input(normal_z, goal_state, start_state, normal_x, normal_y):
     构造编码输入，包含数据验证和修复机制
     """
     
+    # # 确保 nz 全为非负数
+    # normal_z = torch.abs(normal_z)  # 确保法向量Z分量非负
+    
     # # 输入数据验证和修复
     # def validate_and_fix_normal_component(component, component_name, default_value=0.0):
     #     """验证和修复法向量分量"""

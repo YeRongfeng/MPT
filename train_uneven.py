@@ -24,6 +24,7 @@ from dataLoader_uneven import hashTable, receptive_field
 from torch.utils.tensorboard import SummaryWriter
 
 from ESDF3d_atpoint import compute_esdf_batch
+from grad_optimizer import TrajectoryOptimizer
 
 def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels, trajectory, stage=1):
     """
@@ -55,6 +56,7 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
             'angle': 3e-4,
             'smoothness': 0e-4,
             'capsize': 0e0,
+            'curvature': 0e-4,
         }
         # loss_weights = {
         #     'classification': 0e-3,  # 第二阶段专注安全性优化
@@ -65,13 +67,22 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
         #     'capsize': 1e-3,
         # }
     else:
+        # loss_weights = {
+        #     'classification': 1e-3,  # 第二阶段专注安全性优化
+        #     'regression': 0e-4,
+        #     'uniformity': 3e-4,
+        #     'angle': 3e-4,
+        #     'smoothness': 1e-4,
+        #     'capsize': 1e-3,
+        # }
         loss_weights = {
             'classification': 1e-3,  # 第二阶段专注安全性优化
             'regression': 0e-4,
-            'uniformity': 3e-4,
-            'angle': 3e-4,
+            'uniformity': 0e-4,
+            'angle': 1e-4,
             'smoothness': 1e-4,
-            'capsize': 1e-3,
+            'capsize': 1e-1,
+            'curvature': 0e-3,
         }
     
     # 初始化损失和统计
@@ -90,7 +101,9 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
         anchorPoint = anchorPoints[i]  # [num_layers, max_anchors]
         trueLabel = trueLabels[i]  # [num_layers, max_anchors]
         
-        if loss_weights['regression'] > 0 or loss_weights['angle'] > 0 or loss_weights['smoothness'] > 0 or loss_weights['capsize'] > 0:
+        if loss_weights['regression'] > 0 or loss_weights['angle'] > 0 or \
+            loss_weights['smoothness'] > 0 or loss_weights['capsize'] > 0 or \
+            loss_weights['curvature'] > 0:
             # 如果需要坐标，那么需要在这里提前计算好坐标
             available_trajectory_steps = trajectory.shape[1] - 1  # 减去起点，得到可预测的步数
             steps_to_process = min(output_dim, available_trajectory_steps)
@@ -409,50 +422,44 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
         if loss_weights['capsize'] > 0:
             # 计算各预测点的倾覆esdf值
             nx, ny, nz = normals[i, 0, :, :], normals[i, 1, :, :], normals[i, 2, :, :]  # 获取法线信息
-            # 将坐标和角度按列堆叠为 [steps_to_process, 3]
-            queries = torch.stack([
-                weighted_coords[:, 0],  # x坐标
-                weighted_coords[:, 1],  # y坐标
-                weighted_pred_angles    # 预测角度
-            ], dim=1).to(dtype=torch.float32, device=predVals.device)  # [steps_to_process, 3]
-            # 将queries重排为 [steps_to_process, 3]
-            queries = queries.t()  # [steps_to_process, 3]
-            esdf_results = compute_esdf_batch(nx, ny, nz, queries,
-                                              resolution=0.1, origin=(-5.0, -5.0),
-                                              yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=predVals.device)
-            # 提取每个返回项的第一个元素
-            if isinstance(esdf_results, (list, tuple)):
-                first_elems = []
-                for item in esdf_results:
-                    if isinstance(item, (list, tuple)):
-                        first_val = item[0]
-                    else:
-                        first_val = item
-                    # 将非 tensor 转为 tensor，并放到正确设备、类型
-                    if not isinstance(first_val, torch.Tensor):
-                        first_val = torch.tensor(first_val, device=predVals.device, dtype=torch.float32)
-                    else:
-                        first_val = first_val.to(device=predVals.device, dtype=torch.float32)
-                    first_elems.append(first_val)
-                if len(first_elems) == 0:
-                    # 兜底：避免空列表导致后续错误
-                    capsize_esdf = torch.tensor([], device=predVals.device, dtype=torch.float32)
-                else:
-                    capsize_esdf = torch.stack(first_elems)  # [steps, ...]
+
+            # 将起点、预测点、终点按顺序拼接为查询点（确保都是一维向量并在同一 device 上）
+            # start / goal 从 trajectory 中取出并扩展为一维向量
+            start_x = trajectory[i, 0, 0].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
+            start_y = trajectory[i, 0, 1].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
+            start_yaw = trajectory[i, 0, 2].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
+
+            goal_x = trajectory[i, -1, 0].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
+            goal_y = trajectory[i, -1, 1].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
+            goal_yaw = trajectory[i, -1, 2].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
+
+            # weighted_coords: [steps, 2]，weighted_pred_angles: [steps]（可能为 None）
+            pred_x = weighted_coords[:, 0].to(device=predVals.device, dtype=torch.float32)
+            pred_y = weighted_coords[:, 1].to(device=predVals.device, dtype=torch.float32)
+
+            if 'weighted_pred_angles' in locals() and weighted_pred_angles is not None:
+                pred_yaws = weighted_pred_angles.to(device=predVals.device, dtype=torch.float32)
             else:
-                # 如果直接返回单个值或单个 tensor，直接使用
-                capsize_esdf = esdf_results if isinstance(esdf_results, torch.Tensor) else torch.tensor(esdf_results, device=predVals.device, dtype=torch.float32)
+                # 如果没有角度预测，则用中间轨迹的真实角度作为占位（尽量保证长度一致）
+                steps = pred_x.shape[0]
+                if trajectory.shape[1] >= 1 + steps:
+                    pred_yaws = trajectory[i, 1:1 + steps, 2].to(device=predVals.device, dtype=torch.float32)
+                else:
+                    pred_yaws = torch.zeros_like(pred_x, device=predVals.device, dtype=torch.float32)
+
+            # 拼接：start + preds + goal -> 长度为 steps+2
+            x_seq = torch.cat([start_x, pred_x, goal_x], dim=0)
+            y_seq = torch.cat([start_y, pred_y, goal_y], dim=0)
+            yaw_seq = torch.cat([start_yaw, pred_yaws, goal_yaw], dim=0)
+
+            # 组合为 queries: [steps+2, 3]
+            queries = torch.stack([x_seq, y_seq, yaw_seq], dim=1).to(dtype=torch.float32, device=predVals.device)
             
-            d_safe = 0.  # 安全距离（米）
-            kalpa = 0.6  # 安全损失衰减速率
-            
-            # 如果 capsize_esdf 为空则跳过；否则按元素计算并取平均作为损失（可按需改为逐点加权）
-            if capsize_esdf.numel() > 0:
-                # 将倾覆损失的梯度设置为可训练
-                capsize_loss = torch.tensor(0.0, device=predVals.device, requires_grad=True)
-                
-                capsize_loss_per_point = torch.exp(-(capsize_esdf - d_safe) / kalpa)
-                capsize_loss = capsize_loss_per_point.mean()
+            optimizer = TrajectoryOptimizer(queries, nx, ny, nz, device=device)
+            capsize_loss = optimizer.cost_function()
+
+            # 如果 capsize_loss 为空则跳过；否则按元素计算并取平均作为损失（可按需改为逐点加权）
+            if capsize_loss is not None:       
                 # 数值稳定性检查
                 if not (torch.isnan(capsize_loss) or torch.isinf(capsize_loss) or capsize_loss.item() > 1e6):
                     total_loss = total_loss + capsize_loss * loss_weights['capsize']
@@ -460,6 +467,114 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
             else:
                 # 没有有效的 esdf 返回，跳过该损失
                 pass
+            # # 计算各预测点的倾覆esdf值
+            # nx, ny, nz = normals[i, 0, :, :], normals[i, 1, :, :], normals[i, 2, :, :]  # 获取法线信息
+            # # 将坐标和角度按列堆叠为 [steps_to_process, 3]
+            # queries = torch.stack([
+            #     weighted_coords[:, 0],  # x坐标
+            #     weighted_coords[:, 1],  # y坐标
+            #     weighted_pred_angles    # 预测角度
+            # ], dim=1).to(dtype=torch.float32, device=predVals.device)  # [steps_to_process, 3]
+            # # 将queries重排为 [steps_to_process, 3]
+            # queries = queries.t()  # [steps_to_process, 3]
+            # esdf_results = compute_esdf_batch(nx, ny, nz, queries,
+            #                                   resolution=0.1, origin=(-5.0, -5.0),
+            #                                   yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=predVals.device)
+            # # 提取每个返回项的第一个元素
+            # if isinstance(esdf_results, (list, tuple)):
+            #     first_elems = []
+            #     for item in esdf_results:
+            #         if isinstance(item, (list, tuple)):
+            #             first_val = item[0]
+            #         else:
+            #             first_val = item
+            #         # 将非 tensor 转为 tensor，并放到正确设备、类型
+            #         if not isinstance(first_val, torch.Tensor):
+            #             first_val = torch.tensor(first_val, device=predVals.device, dtype=torch.float32)
+            #         else:
+            #             first_val = first_val.to(device=predVals.device, dtype=torch.float32)
+            #         first_elems.append(first_val)
+            #     if len(first_elems) == 0:
+            #         # 兜底：避免空列表导致后续错误
+            #         capsize_esdf = torch.tensor([], device=predVals.device, dtype=torch.float32)
+            #     else:
+            #         capsize_esdf = torch.stack(first_elems)  # [steps, ...]
+            # else:
+            #     # 如果直接返回单个值或单个 tensor，直接使用
+            #     capsize_esdf = esdf_results if isinstance(esdf_results, torch.Tensor) else torch.tensor(esdf_results, device=predVals.device, dtype=torch.float32)
+            
+            # d_safe = 0.  # 安全距离（米）
+            # kalpa = 0.6  # 安全损失衰减速率
+            
+            # # 如果 capsize_esdf 为空则跳过；否则按元素计算并取平均作为损失（可按需改为逐点加权）
+            # if capsize_esdf.numel() > 0:
+            #     # 将倾覆损失的梯度设置为可训练
+            #     capsize_loss = torch.tensor(0.0, device=predVals.device, requires_grad=True)
+                
+            #     capsize_loss_per_point = torch.exp(-(capsize_esdf - d_safe) / kalpa)
+            #     capsize_loss = capsize_loss_per_point.mean()
+            #     # 数值稳定性检查
+            #     if not (torch.isnan(capsize_loss) or torch.isinf(capsize_loss) or capsize_loss.item() > 1e6):
+            #         total_loss = total_loss + capsize_loss * loss_weights['capsize']
+            #         loss_count += 1
+            # else:
+            #     # 没有有效的 esdf 返回，跳过该损失
+            #     pass
+            
+        # =================== 损失7：曲率损失(L_curvature) ===================
+        if loss_weights['curvature'] > 0:
+            steps_to_process = min(output_dim, trajectory.shape[1])
+            if steps_to_process > 0 and trajectory_copy.shape[1] >= 3:
+                # 获取起点和终点 - 直接使用start_state和goal_state
+                start_xy = start_state[i][:2]
+                goal_xy = goal_state[i][:2]
+                
+                # 使用预测坐标构建完整轨迹（如果有回归损失计算）
+                if weighted_coords is not None:
+                    # 构建完整轨迹：起点 + 预测点 + 终点
+                    full_coords = torch.cat([
+                        start_xy.unsqueeze(0),
+                        weighted_coords,  # 来自回归损失计算的预测坐标
+                        goal_xy.unsqueeze(0)
+                    ], dim=0)  # [steps_to_process+2, 2]
+                else:
+                    # 如果没有回归损失计算，使用真实轨迹坐标
+                    full_coords = trajectory_copy[i, :, :2]
+                    
+                # 计算曲率损失（使用差分近似速度和加速度）
+                if full_coords.shape[0] >= 3:
+                    x_coords = full_coords[:, 0].to(device=device, dtype=torch.float32)
+                    y_coords = full_coords[:, 1].to(device=device, dtype=torch.float32)
+                    
+                    # 速度：前向差分 v_k = x_{k+1} - x_k  -> 长度 N-1
+                    vx = x_coords[1:] - x_coords[:-1]   # [N-1]
+                    vy = y_coords[1:] - y_coords[:-1]   # [N-1]
+                    
+                    # 加速度：差分速度 a_k = v_{k+1} - v_k -> 长度 N-2
+                    ax = vx[1:] - vx[:-1]   # [N-2]
+                    ay = vy[1:] - vy[:-1]   # [N-2]
+                    
+                    # 对齐以计算曲率：使用 xdot = vx[:-1], xdd = ax
+                    xdot = vx[:-1]  # [N-2]
+                    ydot = vy[:-1]  # [N-2]
+                    xdd = ax
+                    ydd = ay
+                    
+                    # 计算曲率：|x' y'' - y' x''| / (x'^2 + y'^2)^{3/2}
+                    num = torch.abs(xdot * ydd - ydot * xdd)
+                    denom = (xdot ** 2 + ydot ** 2) ** 1.5 + 1e-9
+                    # 更稳健的分母下界，避免速度接近0时曲率爆炸
+                    denom = torch.clamp(denom, min=1e-3)
+                    curvature = num / denom
+                    
+                    # 曲率惩罚：只惩罚超过阈值的部分
+                    curvature_threshold = 2.1
+                    curvature_cost = torch.mean(F.relu(curvature - curvature_threshold))
+                    
+                    # 数值稳定性检查并加入损失
+                    if not (torch.isnan(curvature_cost) or torch.isinf(curvature_cost) or curvature_cost.item() > 100):
+                        total_loss = total_loss + curvature_cost * loss_weights['curvature']
+                        loss_count += 1
 
     # 确保返回张量类型的损失
     if loss_count == 0:
@@ -672,7 +787,7 @@ if __name__ == "__main__":
     # assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
     # env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
 
-    env_num = 100
+    env_num = 25
     env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
     # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
 
@@ -732,7 +847,7 @@ if __name__ == "__main__":
     transformer.to(device=device)  # 将模型移动到指定设备(CPU或GPU)
     
     # 双阶段训练配置
-    stage1_epochs = 40  # 第一阶段训练轮数：训练除correctionPred外的所有参数
+    stage1_epochs = 160  # 第一阶段训练轮数：训练除correctionPred外的所有参数
     stage2_epochs = 80  # 第二阶段训练轮数：只训练correctionPred参数
     total_epochs = stage1_epochs + stage2_epochs
     
@@ -877,13 +992,17 @@ if __name__ == "__main__":
     
     # 第二阶段：冻结其他参数，只训练correctionPred
     print("=== Stage 2: Training only correctionPred parameters ===")
-    for param in transformer.parameters():
-        param.requires_grad = False
-    for param in transformer.correctionPred.parameters():
-        param.requires_grad = True
-    for param in transformer.classPred.parameters():
-        param.requires_grad = True
-    # transformer.train()  # 设置模型为训练模式
+    # for param in transformer.parameters():
+    #     param.requires_grad = False
+    # for param in transformer.correctionPred.parameters():
+    #     param.requires_grad = True
+    # for param in transformer.classPred.parameters():
+    #     param.requires_grad = True
+    transformer.train()  # 设置模型为训练模式
+    # for param in transformer.encoder.map_fe.parameters():
+    #     param.requires_grad = False
+    # for param in transformer.encoder.pose_injector.parameters():
+    #     param.requires_grad = False
     
     # 打印参数状态
     print_model_parameters(transformer, "Stage 2")
@@ -892,10 +1011,10 @@ if __name__ == "__main__":
     stage2_optimizer = Optim.ScheduledOptim(
         optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                    betas=(0.9, 0.98), eps=1e-9),
-        # lr_mul = 1.0,
-        lr_mul = 0.1,
+        lr_mul = 1.0,
+        # lr_mul = 0.1,
         d_model = 512,
-        n_warmup_steps = 3200
+        n_warmup_steps = 800
     )
     
     # 第二阶段训练
@@ -933,7 +1052,7 @@ if __name__ == "__main__":
         train_n_correct_list.append(train_accuracy)
         val_n_correct_list.append(val_accuracy)
 
-        if (n+1)%5==0:
+        if (n+1)%1==0:
             if isinstance(transformer, nn.DataParallel):
                 state_dict = transformer.module.state_dict()
             else:

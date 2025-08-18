@@ -22,13 +22,14 @@ sys.modules['numpy._core.multiarray'] = np.core.multiarray
 if __name__ == '__main__':
     # 测试加载数据集
     # env_list = ['desert']
-    env_list = ['map4']
+    # env_list = ['map4']
+    env_list = ['env000020']
     # env_list = ['hill']
-    dataFolder = '/home/yrf/MPT/data/test_training/val'
+    dataFolder = '/home/yrf/MPT/data/terrain/train'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
     
     # 测试数据集idx=0的返回值
-    path_index = 1
+    path_index = 2
     sample = dataset[path_index]
     print(sample['map'].shape)
     print(sample['anchor'].shape)

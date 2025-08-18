@@ -18,9 +18,6 @@ class TrajectoryOptimizer:
             pts_t = points.to(device=self.device, dtype=torch.float32)
         else:
             pts_t = torch.tensor(np.array(points), device=self.device, dtype=torch.float32)
-
-        # 确保初始化参考量不保留来自外部 points 的计算图（避免多余梯度）
-        pts_t = pts_t.detach()
         self.N = pts_t.shape[0]
         # 用于计算/反向传播的 tensor 版本
         self.initial_positions_tensor = pts_t[:, :2]        # (N,2) tensor on device
@@ -73,36 +70,35 @@ class TrajectoryOptimizer:
         self.K_cost = 200
         self.t_dense = torch.linspace(0.0, 1.0, self.K_cost, device=self.device, dtype=torch.float32)
 
-        # 参考样条、参考yaw、端点参考速度均为常数：使用 no_grad 并 detach 保存，避免构造多余计算图
-        control_yaws_ref = torch.cat(
-            [self.start_yaw.unsqueeze(0), self.yaws_tensor[1:-1], self.end_yaw.unsqueeze(0)]
-        ) if self.N > 2 else torch.cat([self.start_yaw.unsqueeze(0), self.end_yaw.unsqueeze(0)])
+        # 参考控制点（初始位置） -> 计算一次参考样条（natural spline）
+        orig_pos_torch = self.initial_positions_tensor
+        Sx_ref, Sy_ref, Sx_dot_ref, Sy_dot_ref = self._evaluate_spline(orig_pos_torch, self.t_dense)
 
-        with torch.no_grad():
-            orig_pos_torch = self.initial_positions_tensor.detach()
-            Sx_ref, Sy_ref, Sx_dot_ref, Sy_dot_ref = self._evaluate_spline(orig_pos_torch, self.t_dense)
-            cos_ref = torch.cos(control_yaws_ref.detach())
-            sin_ref = torch.sin(control_yaws_ref.detach())
-            Scos_ref, _ = self._evaluate_scalar_spline(cos_ref, self.t_dense)
-            Ssin_ref, _ = self._evaluate_scalar_spline(sin_ref, self.t_dense)
-            yaw_ref_dense = torch.atan2(Ssin_ref, Scos_ref)
+        # 缓存参考轨迹及导数（不 detach，这里保留梯度通道以便需要时回传）
+        self.Sx_ref = Sx_ref
+        self.Sy_ref = Sy_ref
+        self.Sx_dot_ref = Sx_dot_ref
+        self.Sy_dot_ref = Sy_dot_ref
 
-            speed_start = torch.sqrt(Sx_dot_ref[0] ** 2 + Sy_dot_ref[0] ** 2) + 1e-6
-            speed_end   = torch.sqrt(Sx_dot_ref[-1] ** 2 + Sy_dot_ref[-1] ** 2) + 1e-6
-            yaw0 = self.start_yaw
-            yawn = self.end_yaw
+        # also compute a reference yaw profile from the provided yaw values (interpolated)
+        control_yaws_ref = torch.cat([self.start_yaw.unsqueeze(0), self.yaws_tensor[1:-1], self.end_yaw.unsqueeze(0)]) if self.N > 2 else torch.cat([self.start_yaw.unsqueeze(0), self.end_yaw.unsqueeze(0)])
+        cos_ref = torch.cos(control_yaws_ref)
+        sin_ref = torch.sin(control_yaws_ref)
+        Scos_ref, _ = self._evaluate_scalar_spline(cos_ref, self.t_dense)
+        Ssin_ref, _ = self._evaluate_scalar_spline(sin_ref, self.t_dense)
+        self.yaw_ref_dense = torch.atan2(Ssin_ref, Scos_ref)
 
-        # 把参考量保成 detached 常量（无梯度）
-        self.Sx_ref = Sx_ref.detach()
-        self.Sy_ref = Sy_ref.detach()
-        self.Sx_dot_ref = Sx_dot_ref.detach()
-        self.Sy_dot_ref = Sy_dot_ref.detach()
-        self.yaw_ref_dense = yaw_ref_dense.detach()
+        # 预计算端点的参考速度幅值并根据固定 yaw 构造端点一阶导数 d0/dn（tensor）
+        speed_start = torch.sqrt(self.Sx_dot_ref[0] ** 2 + self.Sy_dot_ref[0] ** 2) + 1e-6
+        speed_end   = torch.sqrt(self.Sx_dot_ref[-1] ** 2 + self.Sy_dot_ref[-1] ** 2) + 1e-6
 
-        self.d0x = (torch.cos(yaw0) * speed_start).to(device=self.device, dtype=torch.float32).detach()
-        self.d0y = (torch.sin(yaw0) * speed_start).to(device=self.device, dtype=torch.float32).detach()
-        self.dnx = (torch.cos(yawn) * speed_end).to(device=self.device, dtype=torch.float32).detach()
-        self.dny = (torch.sin(yawn) * speed_end).to(device=self.device, dtype=torch.float32).detach()
+        yaw0 = self.start_yaw
+        yawn = self.end_yaw
+
+        self.d0x = (torch.cos(yaw0) * speed_start).to(device=self.device, dtype=torch.float32)
+        self.d0y = (torch.sin(yaw0) * speed_start).to(device=self.device, dtype=torch.float32)
+        self.dnx = (torch.cos(yawn) * speed_end).to(device=self.device, dtype=torch.float32)
+        self.dny = (torch.sin(yawn) * speed_end).to(device=self.device, dtype=torch.float32)
 
     # ------------------------------
     # ---- Natural Cubic Spline ----
@@ -417,25 +413,25 @@ class TrajectoryOptimizer:
         yaw_endpoint_cost = torch.mean(torch.abs(yaw_diff_start)) + torch.mean(torch.abs(yaw_diff_end))
 
         # combine weights
-        weights = {
-            'follow': 0.,        # 方向跟随
-            'smooth': 1e-1,      # 平滑度正则化 2e-1
-            'yaw': 1e-1,         # 朝向一致性 3e-1
-            'curvature': 1e1,    # 最大曲率约束 1e1
-            'accelerate': 1e-1,  # 大加速度惩罚
-            'terrain': 1e-1,     # 地形惩罚
-            'endpoints': 1e4     # 强力惩罚端点 yaw 对齐
-        }
-        
         # weights = {
         #     'follow': 0.,        # 方向跟随
-        #     'smooth': 0e-1,      # 平滑度正则化 2e-1
-        #     'yaw': 0e-1,         # 朝向一致性 3e-1
-        #     'curvature': 0e1,    # 最大曲率约束 1e1
-        #     'accelerate': 0e-1,  # 大加速度惩罚
+        #     'smooth': 1e-1,      # 平滑度正则化 2e-1
+        #     'yaw': 1e-1,         # 朝向一致性 3e-1
+        #     'curvature': 1e1,    # 最大曲率约束 1e1
+        #     'accelerate': 1e-1,  # 大加速度惩罚
         #     'terrain': 1e-1,     # 地形惩罚
         #     'endpoints': 1e4     # 强力惩罚端点 yaw 对齐
         # }
+        
+        weights = {
+            'follow': 0.,        # 方向跟随
+            'smooth': 0e-1,      # 平滑度正则化 2e-1
+            'yaw': 0e-1,         # 朝向一致性 3e-1
+            'curvature': 0e1,    # 最大曲率约束 1e1
+            'accelerate': 0e-1,  # 大加速度惩罚
+            'terrain': 1e-1,     # 地形惩罚
+            'endpoints': 1e4     # 强力惩罚端点 yaw 对齐
+        }
 
         total_cost = (
             weights['follow'] * follow_cost +
