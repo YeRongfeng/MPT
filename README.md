@@ -67,6 +67,7 @@ uv run train_uneven.py --batchSize=32 --env_list=desert --dataFolder=data/test_t
 uv run train_uneven.py --batchSize=32 --env_list=desert,map1,map3,map4 --dataFolder=data/test_training --fileDir=data/uneven --load_stage1_model=data/uneven/stage1_model_epoch_39.pkl
 
 uv run train_uneven.py --batchSize=64 --dataFolder=data/terrain_dataset --fileDir=data/uneven --load_stage1_model=data/uneven/stage1_model_epoch_39.pkl
+uv run train_uneven.py --batchSize=20 --dataFolder=data/terrain --fileDir=data/uneven --load_stage1_model=data/uneven/stage1_model_epoch_39.pkl
 
 # 正常的两阶段训练
 uv run train_uneven.py --batchSize 32 --env_list uneven --dataFolder /path/to/data --fileDir /path/to/save

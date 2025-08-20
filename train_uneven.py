@@ -24,9 +24,9 @@ from dataLoader_uneven import hashTable, receptive_field
 from torch.utils.tensorboard import SummaryWriter
 
 from ESDF3d_atpoint import compute_esdf_batch
-from grad_optimizer import TrajectoryOptimizer
+from grad_optimizer import TrajectoryOptimizerSE2
 
-def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels, trajectory, stage=1):
+def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, trueLabels, trajectory, stage=1):
     """
     计算loss损失
     
@@ -56,7 +56,7 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
             'angle': 3e-4,
             'smoothness': 0e-4,
             'capsize': 0e0,
-            'curvature': 0e-4,
+            'curvature': 1e-4,
         }
         # loss_weights = {
         #     'classification': 0e-3,  # 第二阶段专注安全性优化
@@ -76,12 +76,12 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
         #     'capsize': 1e-3,
         # }
         loss_weights = {
-            'classification': 1e-3,  # 第二阶段专注安全性优化
+            'classification': 0e-3,  # 第二阶段专注安全性优化
             'regression': 0e-4,
             'uniformity': 0e-4,
-            'angle': 1e-4,
-            'smoothness': 1e-4,
-            'capsize': 1e-1,
+            'angle': 0e-4,
+            'smoothness': 0e-4,
+            'capsize': 1e-2,
             'curvature': 0e-3,
         }
     
@@ -420,53 +420,39 @@ def cal_performance(predVals, correctionVals, normals, anchorPoints, trueLabels,
         
         # =================== 损失6：倾覆监督损失(L_badbin) ===================
         if loss_weights['capsize'] > 0:
-            # 计算各预测点的倾覆esdf值
             nx, ny, nz = normals[i, 0, :, :], normals[i, 1, :, :], normals[i, 2, :, :]  # 获取法线信息
+            stability_cost_map = cost_map[i, :, :]  # [num_layers, max_anchors]
 
-            # 将起点、预测点、终点按顺序拼接为查询点（确保都是一维向量并在同一 device 上）
-            # start / goal 从 trajectory 中取出并扩展为一维向量
-            start_x = trajectory[i, 0, 0].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
-            start_y = trajectory[i, 0, 1].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
-            start_yaw = trajectory[i, 0, 2].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
-
-            goal_x = trajectory[i, -1, 0].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
-            goal_y = trajectory[i, -1, 1].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
-            goal_yaw = trajectory[i, -1, 2].unsqueeze(0).to(device=predVals.device, dtype=torch.float32)
-
-            # weighted_coords: [steps, 2]，weighted_pred_angles: [steps]（可能为 None）
-            pred_x = weighted_coords[:, 0].to(device=predVals.device, dtype=torch.float32)
-            pred_y = weighted_coords[:, 1].to(device=predVals.device, dtype=torch.float32)
-
-            if 'weighted_pred_angles' in locals() and weighted_pred_angles is not None:
-                pred_yaws = weighted_pred_angles.to(device=predVals.device, dtype=torch.float32)
-            else:
-                # 如果没有角度预测，则用中间轨迹的真实角度作为占位（尽量保证长度一致）
-                steps = pred_x.shape[0]
-                if trajectory.shape[1] >= 1 + steps:
-                    pred_yaws = trajectory[i, 1:1 + steps, 2].to(device=predVals.device, dtype=torch.float32)
-                else:
-                    pred_yaws = torch.zeros_like(pred_x, device=predVals.device, dtype=torch.float32)
-
-            # 拼接：start + preds + goal -> 长度为 steps+2
-            x_seq = torch.cat([start_x, pred_x, goal_x], dim=0)
-            y_seq = torch.cat([start_y, pred_y, goal_y], dim=0)
-            yaw_seq = torch.cat([start_yaw, pred_yaws, goal_yaw], dim=0)
-
-            # 组合为 queries: [steps+2, 3]
-            queries = torch.stack([x_seq, y_seq, yaw_seq], dim=1).to(dtype=torch.float32, device=predVals.device)
+            full_coords = torch.cat([
+                start_state[i][:2].unsqueeze(0),  # 起点
+                weighted_coords,  # 来自回归损失计算的预测坐标
+                goal_state[i][:2].unsqueeze(0)  # 终点
+            ], dim=0)  # [steps_to_process+2, 2]
+            full_yaws = torch.cat([
+                start_state[i][2].unsqueeze(0).unsqueeze(0),  # 起点角度
+                weighted_pred_angles.unsqueeze(0),  # 来自回归损失计算的预测角度
+                goal_state[i][2].unsqueeze(0).unsqueeze(0)  # 终点角度
+            ], dim=0)  # [steps_to_process+2, 1]
             
-            optimizer = TrajectoryOptimizer(queries, nx, ny, nz, device=device)
+            # 将坐标和角度按列堆叠为 [steps_to_process+2, 3]
+            full_traj = torch.stack([
+                full_coords[:, 0],  # x坐标
+                full_coords[:, 1],  # y坐标
+                full_yaws.squeeze(1)  # 预测角度
+            ], dim=1).to(dtype=torch.float32, device=predVals.device)
+            
+            map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
+            resolution = 0.1
+            origin = (-5.0, -5.0, -np.pi) # x, y, yaw
+            map_info = {
+                'resolution': resolution,
+                'origin': origin,
+                'size': map_size
+            }
+            optimizer = TrajectoryOptimizerSE2(full_traj, stability_cost_map, map_info, device=device)
+            # 获得优化轨迹的损失
             capsize_loss = optimizer.cost_function()
 
-            # 如果 capsize_loss 为空则跳过；否则按元素计算并取平均作为损失（可按需改为逐点加权）
-            if capsize_loss is not None:       
-                # 数值稳定性检查
-                if not (torch.isnan(capsize_loss) or torch.isinf(capsize_loss) or capsize_loss.item() > 1e6):
-                    total_loss = total_loss + capsize_loss * loss_weights['capsize']
-                    loss_count += 1
-            else:
-                # 没有有效的 esdf 返回，跳过该损失
-                pass
             # # 计算各预测点的倾覆esdf值
             # nx, ny, nz = normals[i, 0, :, :], normals[i, 1, :, :], normals[i, 2, :, :]  # 获取法线信息
             # # 将坐标和角度按列堆叠为 [steps_to_process, 3]
@@ -621,6 +607,7 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
             predVal, 
             correctionVal,  # 添加correctionVal参数
             normals,  # 添加法线信息
+            batch['cost_map'].to(device),  # 添加cost_map参数
             batch['anchor'].to(device),
             batch['labels'].to(device),
             batch['trajectory'].to(device),  # 轨迹点：[N, 3]
@@ -696,6 +683,7 @@ def eval_epoch(model, validationData, device, stage=1):
                 predVal, 
                 correctionVal,  # 添加correctionVal参数
                 normals,  # 添加法线信息
+                batch['cost_map'].to(device),  # 添加cost_map参数
                 batch['anchor'].to(device),
                 batch['labels'].to(device),
                 batch['trajectory'].to(device),  # 轨迹点：[N, 3]
@@ -787,7 +775,7 @@ if __name__ == "__main__":
     # assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
     # env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
 
-    env_num = 25
+    env_num = 40
     env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
     # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
 
@@ -847,7 +835,7 @@ if __name__ == "__main__":
     transformer.to(device=device)  # 将模型移动到指定设备(CPU或GPU)
     
     # 双阶段训练配置
-    stage1_epochs = 160  # 第一阶段训练轮数：训练除correctionPred外的所有参数
+    stage1_epochs = 100  # 第一阶段训练轮数：训练除correctionPred外的所有参数
     stage2_epochs = 80  # 第二阶段训练轮数：只训练correctionPred参数
     total_epochs = stage1_epochs + stage2_epochs
     

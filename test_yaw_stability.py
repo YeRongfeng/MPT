@@ -14,14 +14,14 @@ def test_yaw_stability_computation():
     print("测试yaw稳定性计算功能...")
     
     # 从数据加载器获取真实地图数据
-    data_folder = '/home/yrf/MPT/data/test_training/val'
+    data_folder = '/home/yrf/MPT/data/terrain_test/val'
     if not os.path.exists(data_folder):
         print("数据文件夹不存在，跳过测试")
         return False
     
     # 查找可用的环境
     env_list = []
-    for env_name in ['map4']:
+    for env_name in ['env000001']:
         env_path = os.path.join(data_folder, env_name)
         if os.path.exists(env_path):
             env_list.append(env_name)
@@ -77,29 +77,29 @@ def test_yaw_stability_computation():
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
         # 法向量可视化
-        im1 = axes[0, 0].imshow(normal_x_np, cmap='RdBu', vmin=-1, vmax=1)
+        im1 = axes[0, 0].imshow(normal_x_np, cmap='RdBu', vmin=-1, vmax=1, origin='lower')
         axes[0, 0].set_title('Normal X')
         plt.colorbar(im1, ax=axes[0, 0])
-        
-        im2 = axes[0, 1].imshow(normal_y_np, cmap='RdBu', vmin=-1, vmax=1)
+
+        im2 = axes[0, 1].imshow(normal_y_np, cmap='RdBu', vmin=-1, vmax=1, origin='lower')
         axes[0, 1].set_title('Normal Y')
         plt.colorbar(im2, ax=axes[0, 1])
-        
-        im3 = axes[0, 2].imshow(normal_z_np, cmap='Blues', vmin=0, vmax=1)
+
+        im3 = axes[0, 2].imshow(normal_z_np, cmap='Blues', vmin=0, vmax=1, origin='lower')
         axes[0, 2].set_title('Normal Z')
         plt.colorbar(im3, ax=axes[0, 2])
         
         # 稳定性可视化
-        im4 = axes[1, 0].imshow(stable_counts_np, cmap='viridis')
+        im4 = axes[1, 0].imshow(stable_counts_np, cmap='viridis', origin='lower')
         axes[1, 0].set_title('Stable Yaw Count')
         plt.colorbar(im4, ax=axes[1, 0])
         
         # 显示特定角度的稳定性（0度和90度）
-        im5 = axes[1, 1].imshow(yaw_stability_np[:, :, 0], cmap='RdYlGn')
+        im5 = axes[1, 1].imshow(yaw_stability_np[:, :, 0], cmap='RdYlGn', origin='lower')
         axes[1, 1].set_title('Stability at 0°')
         plt.colorbar(im5, ax=axes[1, 1])
         
-        im6 = axes[1, 2].imshow(yaw_stability_np[:, :, 4], cmap='RdYlGn')  # 约90度
+        im6 = axes[1, 2].imshow(yaw_stability_np[:, :, 4], cmap='RdYlGn', origin='lower')  # 约90度
         axes[1, 2].set_title('Stability at ~90°')
         plt.colorbar(im6, ax=axes[1, 2])
         
@@ -122,14 +122,14 @@ def test_dataloader_integration():
     print("\n测试数据加载器集成...")
     
     # 检查数据目录是否存在
-    data_folder = '/home/yrf/MPT/data/test_training/val'
+    data_folder = '/home/yrf/MPT/data/terrain_test/val'
     if not os.path.exists(data_folder):
         print("数据文件夹不存在，跳过数据加载器测试")
         return False
     
     # 查找可用的环境
     env_list = []
-    for env_name in ['map4']:
+    for env_name in ['env000001']:
         env_path = os.path.join(data_folder, env_name)
         if os.path.exists(env_path):
             env_list.append(env_name)
