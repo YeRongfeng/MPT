@@ -343,13 +343,13 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
 
 if __name__ == "__main__":
     # stage = 1
-    # epoch = 159
+    # epoch = 4
     stage = 2
-    epoch = 0
+    epoch = 39
     # envType_list = ['desert']
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000012']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000011']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     # envType_list = ['desert','map1','map3','map4']
     # envType_list = ['hill']
     save_path = 'predictions'

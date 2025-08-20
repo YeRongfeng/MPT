@@ -26,7 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 from ESDF3d_atpoint import compute_esdf_batch
 from grad_optimizer import TrajectoryOptimizerSE2
 
-def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, trueLabels, trajectory, stage=1):
+def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map, anchorPoints, trueLabels, trajectory, stage=1):
     """
     计算loss损失
     
@@ -49,23 +49,26 @@ def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, t
     
     # 根据训练阶段设置损失权重
     if stage == 1:
-        loss_weights = {
-            'classification': 1e-3,  # 第一阶段专注轨迹回归
-            'regression': 3e-4,
-            'uniformity': 3e-4,
-            'angle': 3e-4,
-            'smoothness': 0e-4,
-            'capsize': 0e0,
-            'curvature': 1e-4,
-        }
         # loss_weights = {
-        #     'classification': 0e-3,  # 第二阶段专注安全性优化
-        #     'regression': 0e-4,
-        #     'uniformity': 0e-3,
-        #     'angle': 0e-4,
+        #     'classification': 1e-3,  # 第一阶段专注轨迹回归
+        #     'regression': 3e-4,
+        #     'uniformity': 3e-4,
+        #     'angle': 3e-4,
         #     'smoothness': 1e-4,
-        #     'capsize': 1e-3,
+        #     'capsize': 0e0,
+        #     'curvature': 1e-5,
+        #     'stability': 1e-3,  # 轨迹点稳定性结果预测
         # }
+        loss_weights = {
+            'classification': 1e-2,  # 第一阶段专注轨迹回归
+            'regression': 3e-5,
+            'uniformity': 3e-5,
+            'angle': 3e-5,
+            'smoothness': 1e-5,
+            'capsize': 0e-2,
+            'curvature': 1e-6,
+            'stability': 1e-3,  # 轨迹点稳定性结果预测
+        }
     else:
         # loss_weights = {
         #     'classification': 1e-3,  # 第二阶段专注安全性优化
@@ -76,13 +79,14 @@ def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, t
         #     'capsize': 1e-3,
         # }
         loss_weights = {
-            'classification': 0e-3,  # 第二阶段专注安全性优化
+            'classification': 0e-1,  # 第二阶段专注安全性优化
             'regression': 0e-4,
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 1e-2,
+            'capsize': 8e-7,
             'curvature': 0e-3,
+            'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
     
     # 初始化损失和统计
@@ -103,7 +107,7 @@ def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, t
         
         if loss_weights['regression'] > 0 or loss_weights['angle'] > 0 or \
             loss_weights['smoothness'] > 0 or loss_weights['capsize'] > 0 or \
-            loss_weights['curvature'] > 0:
+            loss_weights['curvature'] > 0 or loss_weights['stability'] > 0:
             # 如果需要坐标，那么需要在这里提前计算好坐标
             available_trajectory_steps = trajectory.shape[1] - 1  # 减去起点，得到可预测的步数
             steps_to_process = min(output_dim, available_trajectory_steps)
@@ -421,7 +425,7 @@ def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, t
         # =================== 损失6：倾覆监督损失(L_badbin) ===================
         if loss_weights['capsize'] > 0:
             nx, ny, nz = normals[i, 0, :, :], normals[i, 1, :, :], normals[i, 2, :, :]  # 获取法线信息
-            stability_cost_map = cost_map[i, :, :]  # [num_layers, max_anchors]
+            stability_cost_map = cost_map[i, :, :, :]  # [num_layers, max_anchors]
 
             full_coords = torch.cat([
                 start_state[i][:2].unsqueeze(0),  # 起点
@@ -429,16 +433,16 @@ def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, t
                 goal_state[i][:2].unsqueeze(0)  # 终点
             ], dim=0)  # [steps_to_process+2, 2]
             full_yaws = torch.cat([
-                start_state[i][2].unsqueeze(0).unsqueeze(0),  # 起点角度
-                weighted_pred_angles.unsqueeze(0),  # 来自回归损失计算的预测角度
-                goal_state[i][2].unsqueeze(0).unsqueeze(0)  # 终点角度
+                start_state[i][2].unsqueeze(0),  # 起点角度
+                weighted_pred_angles,  # 来自回归损失计算的预测角度
+                goal_state[i][2].unsqueeze(0)  # 终点角度
             ], dim=0)  # [steps_to_process+2, 1]
             
             # 将坐标和角度按列堆叠为 [steps_to_process+2, 3]
             full_traj = torch.stack([
                 full_coords[:, 0],  # x坐标
                 full_coords[:, 1],  # y坐标
-                full_yaws.squeeze(1)  # 预测角度
+                full_yaws  # 预测角度
             ], dim=1).to(dtype=torch.float32, device=predVals.device)
             
             map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
@@ -451,7 +455,13 @@ def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, t
             }
             optimizer = TrajectoryOptimizerSE2(full_traj, stability_cost_map, map_info, device=device)
             # 获得优化轨迹的损失
-            capsize_loss = optimizer.cost_function()
+            capsize_loss = torch.tensor(0.0, device=predVals.device, requires_grad=True)
+            # 直接基于模型输出的 full_traj 计算代价并保留计算图，以便梯度能回传到模型
+            capsize_loss = optimizer.cost_on_poses(full_traj)
+            # 数值稳定性检查
+            if not (torch.isnan(capsize_loss) or torch.isinf(capsize_loss) or capsize_loss.item() > 1000):
+                total_loss = total_loss + capsize_loss * loss_weights['capsize']
+                loss_count += 1
 
             # # 计算各预测点的倾覆esdf值
             # nx, ny, nz = normals[i, 0, :, :], normals[i, 1, :, :], normals[i, 2, :, :]  # 获取法线信息
@@ -561,6 +571,48 @@ def cal_performance(predVals, correctionVals, normals, cost_map, anchorPoints, t
                     if not (torch.isnan(curvature_cost) or torch.isinf(curvature_cost) or curvature_cost.item() > 100):
                         total_loss = total_loss + curvature_cost * loss_weights['curvature']
                         loss_count += 1
+                        
+        # =================== 损失8：轨迹点稳定性损失(L_stability) ===================
+        if loss_weights['stability'] > 0:
+            # 这个损失是模型最终会输出一个稳定性预测值，用于间接监督模型对问题的建模理解
+            if correctionVals is not None:
+                stability_preds_raw = correctionVals[i, :, 3, :steps_to_process]  # [num_tokens, steps]
+                pred_probs = predVals[i, :, :steps_to_process]  # [num_tokens, steps]
+                # 对 token 维度加权求和，得到每个 time step 的稳定性预测（[steps]）
+                stability_preds = torch.sum(stability_preds_raw * pred_probs, dim=0)
+                stability_preds = stability_preds.to(dtype=torch.float32, device=predVals.device)
+                
+                # 将坐标和角度按列堆叠为 [steps_to_process+2, 3]
+                weighted_traj = torch.stack([
+                    weighted_coords[:, 0],  # x坐标
+                    weighted_coords[:, 1],  # y坐标
+                    weighted_pred_angles  # 预测角度
+                ], dim=1).to(dtype=torch.float32, device=predVals.device)
+                
+                # 将预测的轨迹点位姿去cost_map中查找稳定性值
+                # 先将轨迹点转换为cost_map索引
+                map_size = (100, 100, 36)  # 假设cost_map是100x100x36的
+                resolution = 0.1  # 假设分辨率是0.1米
+                origin = (-5.0, -5.0, -np.pi)  # 假设原点是(-5.0, -5.0, -π)
+                id_x = ((weighted_traj[:, 0] - origin[0]) / resolution).long()  # x坐标索引
+                id_y = ((weighted_traj[:, 1] - origin[1]) / resolution).long()  # y坐标索引
+                id_yaw = ((weighted_traj[:, 2] - origin[2]) / (2 * np.pi / map_size[2])).long()  # yaw索引
+                
+                # 确保索引在有效范围内
+                id_x = torch.clamp(id_x, 0, map_size[0] - 1)
+                id_y = torch.clamp(id_y, 0, map_size[1] - 1)
+                id_yaw = torch.clamp(id_yaw, 0, map_size[2] - 1)
+                
+                # 使用索引从cost_map中获取稳定性值
+                yaw_stability = yaw_stabilities[i, :, :, :]  # [num_layers, max_anchors]
+                stability_values = yaw_stability[id_x, id_y, id_yaw]  # [steps_to_process]
+                
+                # 计算稳定性损失：让预测的稳定性值接近真实值
+                stability_loss = F.mse_loss(stability_preds, stability_values)
+                # 数值稳定性检查
+                if not (torch.isnan(stability_loss) or torch.isinf(stability_loss) or stability_loss.item() > 100):
+                    total_loss = total_loss + stability_loss * loss_weights['stability']
+                    loss_count += 1
 
     # 确保返回张量类型的损失
     if loss_count == 0:
@@ -607,6 +659,7 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
             predVal, 
             correctionVal,  # 添加correctionVal参数
             normals,  # 添加法线信息
+            batch['yaw_stability'].to(device),  # 添加yaw_stability参数
             batch['cost_map'].to(device),  # 添加cost_map参数
             batch['anchor'].to(device),
             batch['labels'].to(device),
@@ -623,6 +676,8 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         
         # 梯度裁剪：防止梯度爆炸 - 平衡稳定性和学习效率
         max_grad_norm = 5.0  # 适度控制，平衡稳定性和学习速度
+        if stage == 2:
+            max_grad_norm = 0.5  # 第二阶段更严格的梯度裁剪
         
         # 进行梯度裁剪，返回的是裁剪前的原始梯度范数
         original_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, norm_type=2)
@@ -683,6 +738,7 @@ def eval_epoch(model, validationData, device, stage=1):
                 predVal, 
                 correctionVal,  # 添加correctionVal参数
                 normals,  # 添加法线信息
+                batch['yaw_stability'].to(device),  # 添加yaw_stability参数
                 batch['cost_map'].to(device),  # 添加cost_map参数
                 batch['anchor'].to(device),
                 batch['labels'].to(device),
@@ -999,8 +1055,8 @@ if __name__ == "__main__":
     stage2_optimizer = Optim.ScheduledOptim(
         optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                    betas=(0.9, 0.98), eps=1e-9),
-        lr_mul = 1.0,
-        # lr_mul = 0.1,
+        # lr_mul = 1.0,
+        lr_mul = 1e-3,
         d_model = 512,
         n_warmup_steps = 800
     )

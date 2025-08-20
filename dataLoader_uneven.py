@@ -167,7 +167,7 @@ def PaddedSequence(batch):
         'labels': torch.stack([batch_i['labels'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'length': torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch]),  # [B,] - 序列长度
         'trajectory': torch.stack([batch_i['trajectory'] for batch_i in valid_batch]),  # [B, N+2, 3]
-        # 'yaw_stability': torch.stack([batch_i['yaw_stability'] for batch_i in valid_batch]),  # [B, H, W, 18] - yaw分箱倾覆状态
+        'yaw_stability': torch.stack([batch_i['yaw_stability'] for batch_i in valid_batch]),  # [B, H, W, 36] - yaw分箱倾覆状态
         'cost_map': torch.stack([batch_i['cost_map'] for batch_i in valid_batch]),  # [B, H, W, yaw_bins] - 成本图
     }
     
@@ -1249,7 +1249,7 @@ class UnevenPathDataLoader(Dataset):
             'anchor': anchor,  # 锚点索引：(N, M)
             'labels': labels,  # 锚点标签：(N, M)
             'trajectory': torch.as_tensor(trajectory, dtype=torch.float),  # 轨迹点：[N, 3]
-            'yaw_stability': torch.as_tensor(yaw_stability, dtype=torch.float),  # yaw分箱倾覆状态：[H, W, 18]
+            'yaw_stability': torch.as_tensor(yaw_stability, dtype=torch.float),  # yaw分箱倾覆状态：[H, W, 36]
             'cost_map': torch.as_tensor(cost_map, dtype=torch.float),  # 成本图：[H, W, yaw_bins]
             'elevation': torch.as_tensor(elevation, dtype=torch.float),  # 高程图：[H, W]
         }

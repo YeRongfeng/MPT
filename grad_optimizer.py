@@ -555,6 +555,109 @@ class TrajectoryOptimizerSE2:
         )
          
         return total_cost
+    
+    def cost_on_poses(self, ctrl_poses):
+        """
+        直接对外部提供的控制点(ctrl_poses: [N,3])计算代价，
+        保留输入张量的计算图（不创建新的 Parameter / detach），
+        以便梯度能回传到外部（例如模型输出）。
+        """
+        device = self.device
+        # 确保 ctrl_poses 在正确设备和 dtype
+        ctrl = ctrl_poses.to(device=device, dtype=torch.float32)
+
+        # 插值得到密集轨迹（复用已有接口）
+        Sx, Sy, Syaw, Sx_dot, Sy_dot, Syaw_dot, Sx_ddot, Sy_ddot, Syaw_ddot = self._evaluate_spline_se2(ctrl, self.t_dense)
+
+        # occupancy / obstacle cost
+        dense_traj_world = torch.stack([Sx, Sy, Syaw], dim=1)
+        grid_coords = self.world_to_grid_normalized(dense_traj_world)
+        occupancy_values = F.grid_sample(self.occupancy_map, grid_coords, mode='bilinear', padding_mode='border', align_corners=True)
+        obstacle_cost = torch.mean(occupancy_values)
+
+        # smoothness
+        smoothness_cost = torch.mean(Sx_ddot**2 + Sy_ddot**2 + Syaw_ddot**2)
+
+        # curvature with low-speed gate
+        eps = 1e-9
+        speed = torch.sqrt(Sx_dot**2 + Sy_dot**2 + eps)
+        geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-9)
+        v_thresh = 0.08
+        gate_k = 80.0
+        gate = torch.sigmoid((speed - v_thresh) * gate_k)
+        curvature_limit = 2.1
+        curvature_violation = torch.relu(geom_curvature - curvature_limit)
+        curvature_cost = torch.mean(gate * curvature_violation)
+
+        # yaw per meter
+        v_eps = 1e-3
+        yaw_per_meter = torch.abs(Syaw_dot) / (speed + v_eps)
+        yaw_per_meter_limit = 2.0
+        yaw_per_meter_violation = torch.relu(yaw_per_meter - yaw_per_meter_limit)
+        yaw_per_meter_cost = torch.mean(yaw_per_meter_violation**2)
+
+        # control cost
+        w_angular_vel = 0.1
+        control_cost = torch.mean(Sx_dot**2 + Sy_dot**2) + w_angular_vel * torch.mean(Syaw_dot**2)
+
+        # angle diff cost (sin^2 保持允许倒车)
+        tangent_angle = torch.atan2(Sy_dot, Sx_dot)
+        angle_diff = tangent_angle - Syaw
+        angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
+        # angle_diff_cost = torch.mean(torch.sin(angle_diff)**2)
+        angle_diff_cost = torch.mean(1.0 - torch.cos(angle_diff))
+
+        # endpoints yaw cost (使用 ctrl 的首尾)
+        start_yaw_opt = ctrl[0, 2]
+        end_yaw_opt = ctrl[-1, 2]
+        yaw0 = self.start_pose[2]
+        yawn = self.end_pose[2]
+        yaw_diff_start = torch.atan2(torch.sin(start_yaw_opt - yaw0), torch.cos(start_yaw_opt - yaw0))
+        yaw_diff_end = torch.atan2(torch.sin(end_yaw_opt - yawn), torch.cos(end_yaw_opt - yawn))
+        yaw_endpoint_cost = torch.mean(torch.abs(yaw_diff_start)) + torch.mean(torch.abs(yaw_diff_end))
+
+        # control smoothness on control points if available (use ctrl directly)
+        ctrl_smoothness_cost = torch.tensor(0.0, device=device)
+        if ctrl.shape[0] >= 3:
+            ctrl_x = ctrl[:, 0]
+            ctrl_y = ctrl[:, 1]
+            ctrl_x_dot = ctrl_x[1:] - ctrl_x[:-1]
+            ctrl_y_dot = ctrl_y[1:] - ctrl_y[:-1]
+            if ctrl_x_dot.shape[0] >= 2:
+                ctrl_x_ddot = ctrl_x_dot[1:] - ctrl_x_dot[:-1]
+                ctrl_y_ddot = ctrl_y_dot[1:] - ctrl_y_dot[:-1]
+                ctrl_smoothness_cost = torch.mean(ctrl_x_ddot**2 + ctrl_y_ddot**2)
+
+        # out of bounds
+        map_limit = 5.0
+        overflow_x = torch.relu(torch.abs(Sx) - map_limit)
+        overflow_y = torch.relu(torch.abs(Sy) - map_limit)
+        out_of_bounds_cost = torch.mean(overflow_x + overflow_y)
+
+        weights = {
+            'obstacle': 1e1,
+            'smoothness': 1e-4,
+            'curvature': 5e2,
+            'yaw_per_meter': 1e2,
+            'control': 1e-2,
+            'angle_diff': 4e4,
+            'endpoints': 1e4,
+            'control_smoothness': 0e3,
+            'out_of_bounds': 1e8,
+        }
+
+        total_cost = (
+            weights['obstacle'] * obstacle_cost +
+            weights['smoothness'] * smoothness_cost +
+            weights['curvature'] * curvature_cost +
+            weights['yaw_per_meter'] * yaw_per_meter_cost +
+            weights['control'] * control_cost +
+            weights['angle_diff'] * angle_diff_cost +
+            weights['endpoints'] * yaw_endpoint_cost +
+            weights['control_smoothness'] * ctrl_smoothness_cost +
+            weights['out_of_bounds'] * out_of_bounds_cost
+        )
+        return total_cost
 
     def optimize(self, iterations=300, lr=0.01, verbose=True):
         """执行优化循环"""
