@@ -1443,7 +1443,7 @@ class UnevenTransformer(Transformer):
             # 输入尺寸：(batch_size, seq_len, d_model + output_dim)
             Rearrange('b c d_model -> (b c) d_model 1 1'),  # 维度重排：将3D特征张量重排为4D格式，适配卷积层输入
             
-            nn.Conv2d(d_model + output_dim, 4*output_dim, kernel_size=1),  # 1x1卷积：将(d_model+output_dim)维特征映射为3*(output_dim=)n步的预测输出
+            nn.Conv2d(d_model + output_dim, 3*output_dim, kernel_size=1),  # 1x1卷积：将(d_model+output_dim)维特征映射为3*(output_dim=)n步的预测输出
             
             # # 第一层：特征提取和降维
             # nn.Conv2d(d_model + output_dim, (d_model + output_dim) // 2, kernel_size=3, padding=1),
@@ -1508,6 +1508,6 @@ class UnevenTransformer(Transformer):
         correction_sigmoid = F.sigmoid(correction)  # 对修正预测结果进行Sigmoid归一化，确保输出在[0, 1]范围内
         
         # 重排修正预测结果：将(batch, seq_len, 3*output_dim) -> (batch, seq_len, 3, output_dim)
-        correction_reshaped = rearrange(correction_sigmoid, '(b c) (n d) -> b c n d', b=batch_size, n=4)
+        correction_reshaped = rearrange(correction_sigmoid, '(b c) (n d) -> b c n d', b=batch_size, n=3)
         # return seq_logit_softmax, correction_reshaped, yaw_logits_agg  # 返回分类预测结果和位置修正预测结果
         return seq_logit_softmax, correction_reshaped  # 返回分类预测结果和位置修正预测结果

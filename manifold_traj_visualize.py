@@ -86,12 +86,12 @@ if __name__ == "__main__":
     # stage = 1
     # epoch = 4
     stage = 2
-    epoch = 39
+    epoch = 30
     envNum = np.random.randint(0, 99)  # 随机选择环境id
-    envList = ['env000022']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envList = ['env000025']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     dataset_path = 'data/terrain/train'
     save_path = 'predictions'
-    path_id = 0
+    path_id = 22
 
     modelFolder = 'data/uneven'
     # modelFolder = 'data/uneven_old'
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     # print("Voxel->world sample (x,y,yaw):", cols[:5], rows[:5], bins[:5])
 
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-    fig1 = plt.figure(figsize=(12, 9))
+    fig1 = plt.figure(figsize=(12, 9), dpi=120)
     ax1 = fig1.add_subplot(111, projection='3d')
     # 若点太多则下采样，避免绘图过慢或内存占用过大
     max_points = 200000
@@ -214,10 +214,25 @@ if __name__ == "__main__":
     # 绘制初始轨迹
     ax1.plot(initial_trajectory[:, 0], initial_trajectory[:, 1], initial_trajectory[:, 2],
              color='blue', linewidth=2, label='Initial Trajectory')
-    
+    # 绘制控制点
+    ax1.scatter(trajectory[1:-1, 0], trajectory[1:-1, 1], trajectory[1:-1, 2],
+                color='blue', s=20, marker='o')
+
     # 绘制预测轨迹
     ax1.plot(pred_trajectory[:, 0], pred_trajectory[:, 1], pred_trajectory[:, 2],
              color='green', linewidth=2, label='Predicted Trajectory')
+    # 绘制预测轨迹控制点
+    ax1.scatter(predTraj[1:-1, 0], predTraj[1:-1, 1], predTraj[1:-1, 2],
+                color='green', s=20, marker='o')
+
+    # 绘制起点和终点（起点用三角形，终点用五角星）
+    ax1.scatter(initial_trajectory[0, 0], initial_trajectory[0, 1], initial_trajectory[0, 2],
+                color='red', s=50, marker='^', label='Start Point')
+    ax1.scatter(initial_trajectory[-1, 0], initial_trajectory[-1, 1], initial_trajectory[-1, 2],
+                color='orange', s=50, marker='*', label='End Point')
+
+    # 增加图例
+    ax1.legend(loc='upper right', fontsize=10)
     
     ax1.set_xlabel('X (cols)')
     ax1.set_ylabel('Y (rows)')

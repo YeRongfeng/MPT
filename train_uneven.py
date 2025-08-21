@@ -67,7 +67,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'smoothness': 1e-5,
             'capsize': 0e-2,
             'curvature': 1e-6,
-            'stability': 1e-3,  # 轨迹点稳定性结果预测
+            'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
     else:
         # loss_weights = {
@@ -84,7 +84,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 6e-7,
+            'capsize': 3e-7,
             'curvature': 0e-3,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
