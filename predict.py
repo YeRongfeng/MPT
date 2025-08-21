@@ -20,6 +20,9 @@ from dataLoader_uneven import get_encoder_input, receptive_field
 from eval_model_uneven import getHashTable, get_patch
 import torch
 
+# dataset_path = 'data/terrain_dataset/val'
+dataset_path = 'data/terrain/train'
+
 def generate_ground_truth_labels(trajectory, hashTable, output_dim):
     """
     生成ground truth标签图，与dataLoader_uneven中的逻辑相同
@@ -69,8 +72,6 @@ def generate_ground_truth_labels(trajectory, hashTable, output_dim):
 
 # Define the network
 device='cuda' if torch.cuda.is_available() else 'cpu'
-
-
 
 def plot_single_trajectory(ax, elevation_masked, trajectory, predTraj=None, output_dim=None, is_pred=False):
     """绘制单个轨迹子图的辅助函数"""
@@ -156,7 +157,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
                      bottom=0.08, top=0.9, wspace=0.15, hspace=0.3)  # 手动设置边距和间距
     
     # 加载环境数据，所有子图共用同一个环境
-    envFolder = osp.join('data/terrain/val', envType)
+    envFolder = osp.join(dataset_path, envType)
     # envFolder = osp.join('data/test_training/val', envType)
     env_path = osp.join(envFolder, f'map.p')
     with open(env_path, 'rb') as f:
@@ -243,7 +244,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
         save_path: 保存路径
     """
     # 加载环境数据
-    envFolder = osp.join('data/terrain/val', envType)
+    envFolder = osp.join(dataset_path, envType)
     # envFolder = osp.join('data/test_training/val', envType)
     env_path = osp.join(envFolder, f'map.p')
     with open(env_path, 'rb') as f:
@@ -349,7 +350,7 @@ if __name__ == "__main__":
     # envType_list = ['desert']
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000011']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000022']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     # envType_list = ['desert','map1','map3','map4']
     # envType_list = ['hill']
     save_path = 'predictions'

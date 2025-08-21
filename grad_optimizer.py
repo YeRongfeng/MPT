@@ -634,13 +634,25 @@ class TrajectoryOptimizerSE2:
         overflow_y = torch.relu(torch.abs(Sy) - map_limit)
         out_of_bounds_cost = torch.mean(overflow_x + overflow_y)
 
+        # weights = {
+        #     'obstacle': 2e1,
+        #     'smoothness': 1e-4,
+        #     'curvature': 5e2,
+        #     'yaw_per_meter': 1e2,
+        #     'control': 1e-2,
+        #     'angle_diff': 4e4,
+        #     'endpoints': 1e4,
+        #     'control_smoothness': 0e3,
+        #     'out_of_bounds': 1e8,
+        # }
+        
         weights = {
             'obstacle': 1e1,
             'smoothness': 1e-4,
             'curvature': 5e2,
             'yaw_per_meter': 1e2,
             'control': 1e-2,
-            'angle_diff': 4e4,
+            'angle_diff': 1e4,
             'endpoints': 1e4,
             'control_smoothness': 0e3,
             'out_of_bounds': 1e8,

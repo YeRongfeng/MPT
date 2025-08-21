@@ -903,6 +903,30 @@ wheels = [
 ]
 
 [[package]]
+name = "jupyter-server"
+version = "1.0.11"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ipython-genutils" },
+    { name = "jinja2" },
+    { name = "jupyter-client" },
+    { name = "jupyter-core" },
+    { name = "nbconvert" },
+    { name = "nbformat" },
+    { name = "prometheus-client" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
+    { name = "pyzmq" },
+    { name = "send2trash" },
+    { name = "terminado" },
+    { name = "tornado" },
+    { name = "traitlets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4f/2f/c03a23c7ca42645a81ca13c4bc216a7964d07f8563b73e94f05d995386f8/jupyter_server-1.0.11.tar.gz", hash = "sha256:28ea9ecd066b32fa21c8e8e9d7c006c89d7c50a3131a10b0729fe5f09b1beb2e", size = 229684, upload-time = "2020-12-16T22:23:25.794Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/32/38fb177370915171c13fa1e733ae10936b10108437dda459d405bc739b52/jupyter_server-1.0.11-py3-none-any.whl", hash = "sha256:99a470be0cbf2d61d4d789a6b11bf1d6014a656c17d5e4095c19fbb98c52e1a0", size = 179930, upload-time = "2020-12-16T22:23:24.03Z" },
+]
+
+[[package]]
 name = "jupyterlab-pygments"
 version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1233,6 +1257,7 @@ dependencies = [
     { name = "jupyter-client" },
     { name = "jupyter-console" },
     { name = "jupyter-core" },
+    { name = "jupyter-server" },
     { name = "jupyterlab-pygments" },
     { name = "jupyterlab-widgets" },
     { name = "keyring" },
@@ -1358,6 +1383,7 @@ requires-dist = [
     { name = "jupyter-client", specifier = "==6.2.0" },
     { name = "jupyter-console", specifier = "==6.4.0" },
     { name = "jupyter-core", specifier = "==4.7.1" },
+    { name = "jupyter-server", specifier = ">=1.0.11" },
     { name = "jupyterlab-pygments", specifier = "==0.1.2" },
     { name = "jupyterlab-widgets", specifier = "==1.0.0" },
     { name = "keyring", specifier = "==10.6.0" },

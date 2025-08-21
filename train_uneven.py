@@ -84,7 +84,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 8e-7,
+            'capsize': 6e-7,
             'curvature': 0e-3,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
