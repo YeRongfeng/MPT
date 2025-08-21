@@ -800,7 +800,7 @@ class UnevenEncoder(nn.Module):
         self.reorder_dims = Rearrange('b c h w -> b (h w) c')  # 维度重排：将4D卷积输出(batch,channels,height,width)转换为3D序列格式(batch,seq_len,channels)
         
         # self.pose_injector = PoseTokenInjector(d_model, in_pose_dim=4, map_feat_dim=d_model, hidden=128, use_map_feature=True)  # 初始化姿态注入器：将SE2姿态转换为pose tokens，并结合局部特征
-        # self.pose_injector = PoseTokenInjector(d_model)  # 初始化姿态注入器：将SE2姿态转换为pose tokens，并结合局部特征
+        self.pose_injector = PoseTokenInjector(d_model)  # 初始化姿态注入器：将SE2姿态转换为pose tokens，并结合局部特征
 
         # Position Encoding.
         # NOTE: Current setup for adding position encoding after patch Embedding.

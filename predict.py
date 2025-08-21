@@ -346,11 +346,11 @@ if __name__ == "__main__":
     # stage = 1
     # epoch = 4
     stage = 2
-    epoch = 30
+    epoch = 79
     # envType_list = ['desert']
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000025']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000012']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     # envType_list = ['desert','map1','map3','map4']
     # envType_list = ['hill']
     save_path = 'predictions'
@@ -380,7 +380,10 @@ if __name__ == "__main__":
     # path_index_list = list([11, 22, 33, 44, 55, 66])
     # path_index_list = list([0, 6, 13, 22, 34, 46])
     # path_index_list = list([0, 1, 2, 3, 4, 4])  # 测试前5条路径
-    path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
+    # path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
+    path_index_list = list([16, 17, 18, 19, 20, 21])  # 测试前5条路径
+    # path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
+    # path_index_list = list([28, 29, 30, 31, 32, 33])  # 测试前5条路径
     # print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pickle
 
-from skimage import io, measure
+from skimage import io
 
 import sys
 sys.modules['numpy._core'] = np
@@ -24,14 +24,12 @@ from dataLoader_uneven import compute_map_yaw_bins
 from grad_optimizer import TrajectoryOptimizerSE2
 import torch
 
-from scipy.ndimage import binary_fill_holes
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def get_yaw_stability_edge(yaw_stability, fraction_of_local_max=0.5, valid_mask=None):
     """
     生成 3D 边界体素 (H, W, B)，改进了与地图边界 (map edge) 交接处的处理：
-    - valid_mask: 可选 (H,W) bool 数组, True 表示该 (x,y) 在地图内部（有效）。
+    - valid_mask: 可选 (H,W) bool 数组，True 表示该 (x,y) 在地图内部（有效）。
       如果提供则能正确区分“地图外部”与“yaw_stability==0 的内部区域”；
       如果不提供，函数会尝试使用 local_max>0 做近似（可能不完美，会打印提示）。
 
@@ -133,10 +131,10 @@ if __name__ == "__main__":
     stage = 2
     epoch = 79
     envNum = np.random.randint(0, 99)  # 随机选择环境id
-    envList = ['env000012']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envList = ['env000004']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     dataset_path = 'data/terrain/train'
     save_path = 'predictions'
-    path_id = 24
+    path_id = 21
 
     modelFolder = 'data/uneven'
     # modelFolder = 'data/uneven_old'
@@ -217,52 +215,54 @@ if __name__ == "__main__":
     # 将原始的预测轨迹转换为 numpy 数组
     predTraj = predTraj.cpu().numpy()
 
-    # --- 替换原有散点图代码为等值面可视化 ---
+    # --- 图1：在yaw_stability图中绘制轨迹 ---
+    H, W, B = yaw_stability_edge.shape
 
-    # 绘制等值面之前，需要将 yaw_stability_edge 转换为一个表示完整区域的体素
-    # 我们将 yaw_stability_edge 的值取反，得到一个“可达区域”的掩码
-    # 1 - yaw_stability_edge 得到的体素中，0 是边界/不可达，1 是可达
-    # reachable_mask = 1 - yaw_stability_edge
-    reachable_mask = yaw_stability
-    # 然后将孔洞（即不可达区域）填充起来
-    # binary_fill_holes 寻找值为 False 的连通区域（即 0），并将其内部的 True 区域填充为 False
-    # 这里我们是对 reachable_mask 进行操作，所以 1-reachable_mask 就是不可达区域
-    unreachable_volume = 1 - binary_fill_holes(reachable_mask)
-    
-    H, W, B = unreachable_volume.shape
+    # 找到所有边界点的索引 (row, col, bin)
+    rows, cols, bins = np.where(yaw_stability_edge > 0)
+    # rows = rows / float(H) * 10.0 - 5.0  # 将行索引映射到实际坐标
+    # cols = cols / float(W) * 10.0 - 5.0  # 将列索引映射到实际坐标
+    # bins = bins / float(B) * 2 * np.pi - np.pi  # 将 bin 映射为 [-pi, pi]
+    # 使用 map_info 的 origin/resolution 做精确映射到世界坐标（避免坐标轴反向/交换问题）
     res = map_info['resolution']
     origin_x, origin_y, origin_yaw = map_info['origin']
+    # cols -> x_world，rows -> y_world
+    # 注意：图像行索引通常从上到下（row=0 在上），而地图 origin 通常是左下角，
+    # 所以 world_y = origin_y + (H - 1 - row) * res
+    x_world = origin_x + cols * res
+    y_world = origin_y + (H - 1 - rows) * res
+    # yaw: bins 映射到角度/弧度；origin_yaw 通常为 -pi
+    yaw_world = origin_yaw + bins * (2.0 * np.pi / float(B))
+    # 覆盖变量以便后续绘图直接使用 cols(rows)=x(y)
+    cols = x_world
+    rows = y_world
+    bins = yaw_world
+    # # 可选：输出少量样本用于检查（运行时可注释掉）
+    # print("Voxel->world sample (x,y,yaw):", cols[:5], rows[:5], bins[:5])
+    
+    # 覆盖变量以便后续绘图直接使用 cols(rows)=x(y)
+    cols = x_world
+    rows = y_world
+    bins = yaw_world
 
-    # 创建坐标网格
-    x_coords = origin_x + np.arange(W) * res
-    y_coords = origin_y + (H - 1 - np.arange(H)) * res
-    yaw_coords = origin_yaw + np.arange(B) * (2.0 * np.pi / B)
-    X_grid, Y_grid, Z_grid = np.meshgrid(x_coords, y_coords, yaw_coords, indexing='ij')
+    # 为后续绘图统一命名并检查形状（修复 x_pts/y_pts/yaw_rad 未定义问题）
+    x_pts = np.asarray(cols)
+    y_pts = np.asarray(rows)
+    yaw_rad = np.asarray(bins)
+    if not (x_pts.shape == y_pts.shape == yaw_rad.shape):
+        raise ValueError(f"Point arrays shape mismatch: {x_pts.shape}, {y_pts.shape}, {yaw_rad.shape}")
 
-    # 使用 marching_cubes 提取等值面
-    try:
-        verts, faces, normals, values = measure.marching_cubes(unreachable_volume, level=0.5)
-        # 映射回世界坐标
-        verts[:, 0] = origin_x + verts[:, 0] * res
-        verts[:, 1] = origin_y + (H - 1 - verts[:, 1]) * res
-        verts[:, 2] = origin_yaw + verts[:, 2] * (2.0 * np.pi / B)
-    except ValueError:
-        print("Warning: No isosurface found. Skipping surface plot.")
-        verts, faces = None, None
-
-    from mpl_toolkits.mplot3d import Axes3D
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
     import matplotlib as mpl
 
     # --------- 可调参数（按需修改） ----------
-    figsize = (10, 8)
+    figsize = (8.0, 6.0)
     dpi = 200
     font_family = "serif"
     base_fontsize = 10
-    # 交点绘制参数（防止未定义错误）
-    intersection_marker_size = 40
-    intersection_marker_style = 'x'
-    initial_intersection_color = 'lime'
-    predicted_intersection_color = 'cyan'
+    max_points = 200000
+    point_size = 20           # <-- 放大点：你要的点大小（原来 6）
+    side_axis_frac = 0.05     # 伪轴距离数据边界的相对偏移（0.05 = 5%）
     # ----------------------------------------
 
     mpl.rcParams.update({
@@ -275,20 +275,52 @@ if __name__ == "__main__":
         "ytick.labelsize": base_fontsize - 1,
     })
 
+    # 下采样（避免渲染过慢）
+    n_pts = x_pts.shape[0]
+    if n_pts > max_points:
+        idx = np.random.choice(n_pts, max_points, replace=False)
+        x_pts = x_pts[idx]; y_pts = y_pts[idx]; yaw_rad = yaw_rad[idx]
+
+    # 颜色映射
+    norm = mpl.colors.Normalize(vmin=-np.pi, vmax=np.pi)
+    cmap = mpl.cm.viridis
+    colors = cmap(norm(yaw_rad))
+
+    # 帮助函数：在 3D 中实现等比例刻度
+    def set_axes_equal(ax: Axes3D):
+        x_limits = ax.get_xlim3d()
+        y_limits = ax.get_ylim3d()
+        z_limits = ax.get_zlim3d()
+        x_range = abs(x_limits[1] - x_limits[0])
+        y_range = abs(y_limits[1] - y_limits[0])
+        z_range = abs(z_limits[1] - z_limits[0])
+        max_range = max([x_range, y_range, z_range])
+        x_middle = np.mean(x_limits)
+        y_middle = np.mean(y_limits)
+        z_middle = np.mean(z_limits)
+        ax.set_xlim3d([x_middle - max_range/2, x_middle + max_range/2])
+        ax.set_ylim3d([y_middle - max_range/2, y_middle + max_range/2])
+        ax.set_zlim3d([z_middle - max_range/2, z_middle + max_range/2])
+
     # 创建图
     fig = plt.figure(figsize=figsize, dpi=dpi)
     ax = fig.add_subplot(111, projection='3d')
 
-    # 绘制等值面
-    if verts is not None:
-        ax.plot_trisurf(verts[:, 0], verts[:, 1], verts[:, 2],
-                        triangles=faces,
-                        color='red',
-                        alpha=0.3,
-                        label='Unreachable Region',
-                        edgecolor='none',
-                        antialiased=True,
-                        zorder=1)
+    # 显式设置 z 轴范围以保证在任何情况下都可见（yaw 范围 -pi..pi）
+    ax.set_zlim(-np.pi, np.pi)
+
+    # 绘制边界体素（放大点）
+    sc = ax.scatter(x_pts, y_pts, yaw_rad,
+                    s=point_size,                # 放大点
+                    c=colors,
+                    marker='o',
+                    linewidths=0,
+                    alpha=0.8,
+                    # alpha=1.0,
+                    edgecolors='none',
+                    rasterized=True,
+                    # depthshade=True,
+                    zorder=1)
 
     # 绘制轨迹与控制点（保持层次）
     ax.plot(initial_trajectory[:, 0], initial_trajectory[:, 1], initial_trajectory[:, 2],
@@ -312,121 +344,60 @@ if __name__ == "__main__":
     ax.text(initial_trajectory[-1, 0], initial_trajectory[-1, 1], initial_trajectory[-1, 2] + 0.05,
             "Goal", fontsize=base_fontsize, va='bottom', ha='center', zorder=8)
 
+    # colorbar
+    mappable = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array([])
+    cbar = plt.colorbar(mappable, ax=ax, pad=0.12, shrink=0.6)
+    cbar.set_label('Yaw (rad)', fontsize=base_fontsize)
+    cbar.ax.tick_params(labelsize=base_fontsize - 1)
+
     # 轴标签 / 标题
     ax.set_xlabel('X (m)', labelpad=6)
     ax.set_ylabel('Y (m)', labelpad=6)
     ax.set_zlabel('Yaw (rad)', labelpad=8)
-    ax.set_title('Yaw Stability Isosurface & Trajectories', pad=10)
+    ax.set_title('Yaw Stability Edge (x, y, yaw)', pad=10)
 
-    # NOTE：视角
-    ax.view_init(elev=10, azim=20)
-    
-    # 手动设置坐标范围以确保等比例
-    max_range = np.array([initial_trajectory[:, 0].max()-initial_trajectory[:, 0].min(),
-                          initial_trajectory[:, 1].max()-initial_trajectory[:, 1].min(),
-                          initial_trajectory[:, 2].max()-initial_trajectory[:, 2].min()]).max() / 2.0
-    mid_x = (initial_trajectory[:, 0].max()+initial_trajectory[:, 0].min()) * 0.5
-    mid_y = (initial_trajectory[:, 1].max()+initial_trajectory[:, 1].min()) * 0.5
-    mid_z = (initial_trajectory[:, 2].max()+initial_trajectory[:, 2].min()) * 0.5
-    ax.set_xlim(mid_x - max_range, mid_x + max_range)
-    ax.set_ylim(mid_y - max_range, mid_y + max_range)
-    ax.set_zlim(mid_z - max_range, mid_z + max_range)
-
-    # 强制坐标范围为 X: [-5,5], Y: [-5,5], Z(yaw): [-pi, pi]
-    ax.set_xlim(-5.0, 5.0)
-    ax.set_ylim(-5.0, 5.0)
-    ax.set_zlim(-np.pi, np.pi)
+    # 视角
+    ax.view_init(elev=30, azim=-60)
+    set_axes_equal(ax)
 
     # 关闭网格，优化面板边框显示
     ax.grid(False)
     ax.xaxis.pane.set_edgecolor('k'); ax.yaxis.pane.set_edgecolor('k'); ax.zaxis.pane.set_edgecolor('k')
 
-    # plt.tight_layout()
-    # outname_pdf = 'yaw_stability_isosurface_3d.pdf'
-    # outname_svg = 'yaw_stability_isosurface_3d.svg'
-    # plt.savefig(outname_pdf, dpi=600, bbox_inches='tight')
-    # plt.savefig(outname_svg, dpi=600, bbox_inches='tight')
-    # plt.show()
+    # --------- 绘制“左侧伪 z 轴”（保证在任何视角都可见） ----------
+    # 选择伪轴位置：放在 x 范围最左、y 范围最下，并略向外偏移一点
+    x_min, x_max = np.min(x_pts), np.max(x_pts)
+    y_min, y_max = np.min(y_pts), np.max(y_pts)
+    x_range = x_max - x_min if x_max != x_min else 1.0
+    y_range = y_max - y_min if y_max != y_min else 1.0
 
-    def is_inside(point):
-        """检查一个世界坐标点是否在不可达区域内 (近似)."""
-        x, y, yaw = point
-        # col 对应 x，row 对应 y（注意 y 轴在体素中被翻转）
-        col = int(np.round((x - origin_x) / res))
-        # world_y = origin_y + (H-1 - v_y) * res  =>  v_y = (H-1) - (world_y - origin_y)/res
-        row = int(np.round((H - 1) - (y - origin_y) / res))
-        bin_yaw = int(np.round((yaw - origin_yaw) / (2 * np.pi / B))) % B
-        if 0 <= row < H and 0 <= col < W and 0 <= bin_yaw < B:
-            return unreachable_volume[row, col, bin_yaw] > 0.5
-        return False
+    x_pos = x_min - side_axis_frac * x_range
+    y_pos = y_min - side_axis_frac * y_range
+    z_min, z_max = -np.pi, np.pi
 
-    def find_intersections(trajectory):
-        """寻找轨迹与等值面的近似交点（返回世界坐标点列表）。"""
-        intersections = []
-        for i in range(len(trajectory) - 1):
-            p1 = trajectory[i]
-            p2 = trajectory[i + 1]
+    # 主轴线
+    ax.plot([x_pos, x_pos], [y_pos, y_pos], [z_min, z_max], color='k', linewidth=1.0, zorder=20)
 
-            inside1 = is_inside(p1)
-            inside2 = is_inside(p2)
+    # 刻度与刻度标签（你可以调整 n_ticks）
+    n_ticks = 5
+    ticks = np.linspace(z_min, z_max, n_ticks)
+    tick_len = 0.015 * (x_range if x_range>0 else 1.0)  # 刻度横向长度（相对于 x 范围）
+    for t in ticks:
+        # 横向小刻度线
+        ax.plot([x_pos, x_pos + tick_len], [y_pos, y_pos], [t, t], color='k', linewidth=1.0, zorder=20)
+        # 文本标签（放在刻度线右侧）
+        ax.text(x_pos + 1.6*tick_len, y_pos, t, f"{t:.2f}", fontsize=base_fontsize-1, va='center', ha='left', zorder=21)
 
-            if inside1 != inside2:
-                # 简单取线段中点作为近似交点；也可改为细分插值定位
-                mid = 0.5 * (p1 + p2)
-                intersections.append((float(mid[0]), float(mid[1]), float(mid[2])))
-        return intersections
+    # 给伪轴加上轴名
+    ax.text(x_pos, y_pos, z_max + 0.08*(z_max - z_min), 'Yaw (rad)', fontsize=base_fontsize, va='bottom', ha='center', zorder=21)
 
-    # 寻找交点
-    initial_intersections = find_intersections(initial_trajectory)
-    predicted_intersections = find_intersections(pred_trajectory)
-    
-    print(f"Initial Intersections: {len(initial_intersections)}")
-    print(f"Predicted Intersections: {len(predicted_intersections)}")
-
-    # 绘制交点（注意空列表处理）
-    if len(initial_intersections) > 0:
-        ax.scatter(*zip(*initial_intersections),
-                   s=intersection_marker_size,
-                   marker=intersection_marker_style,
-                   color=initial_intersection_color,
-                   label=f'Initial Intersections ({len(initial_intersections)})',
-                   zorder=7)
-    if len(predicted_intersections) > 0:
-        ax.scatter(*zip(*predicted_intersections),
-                   s=intersection_marker_size,
-                   marker=intersection_marker_style,
-                   color=predicted_intersection_color,
-                   label=f'Predicted Intersections ({len(predicted_intersections)})',
-                   zorder=7)
-
-    # 显示图例（已在前面用 safe_handles 创建，避免 Poly3DCollection 导致的问题）
-    # 注：删除重复的 ax.legend(...) 调用，避免 AttributeError
-    # （之前在文件中已经使用 safe_handles/safe_labels 添加了不可达区域的 proxy patch）
-    # ax.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98))
-    
-    # 图例：避免 Poly3DCollection 在 legend 时触发 AttributeError
-    import matplotlib.patches as mpatches
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-    handles, labels = ax.get_legend_handles_labels()
-    # 过滤掉会导致问题的 Poly3DCollection（如 plot_trisurf 返回的对象）
-    safe_pairs = [(h, l) for h, l in zip(handles, labels) if not isinstance(h, Poly3DCollection)]
-    safe_handles = [h for h, _ in safe_pairs]
-    safe_labels = [l for _, l in safe_pairs]
-
-    # 如果绘制了不可达面，使用 proxy patch 添加图例项
-    if verts is not None:
-        unreach_patch = mpatches.Patch(color='red', alpha=0.3, label='Unreachable Region')
-        safe_handles.insert(0, unreach_patch)
-        safe_labels.insert(0, unreach_patch.get_label())
-
-    ax.legend(handles=safe_handles, labels=safe_labels, loc='upper left', bbox_to_anchor=(0.02, 0.98))
+    # 图例（放在图外）
+    ax.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98))
 
     plt.tight_layout()
-    outname_pdf_intersections = 'yaw_stability_intersections_3d.pdf'
-    outname_svg_intersections = 'yaw_stability_intersections_3d.svg'
-    outname_png_intersections = 'yaw_stability_intersections_3d.png'
-    plt.savefig(outname_pdf_intersections, dpi=300, bbox_inches='tight')
-    plt.savefig(outname_svg_intersections, dpi=300, bbox_inches='tight')
-    plt.savefig(outname_png_intersections, dpi=300, bbox_inches='tight')
+    outname_pdf = 'yaw_stability_edge_3d.pdf'
+    outname_svg = 'yaw_stability_edge_3d.svg'
+    plt.savefig(outname_pdf, dpi=600, bbox_inches='tight')
+    plt.savefig(outname_svg, dpi=600, bbox_inches='tight')
     plt.show()
