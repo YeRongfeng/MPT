@@ -14,14 +14,14 @@ def test_yaw_stability_computation():
     print("测试yaw稳定性计算功能...")
     
     # 从数据加载器获取真实地图数据
-    data_folder = '/home/yrf/MPT/data/terrain_test/val'
+    data_folder = '/home/yrf/MPT/data/terrain/train'
     if not os.path.exists(data_folder):
         print("数据文件夹不存在，跳过测试")
         return False
     
     # 查找可用的环境
     env_list = []
-    for env_name in ['env000001']:
+    for env_name in ['env000009']:
         env_path = os.path.join(data_folder, env_name)
         if os.path.exists(env_path):
             env_list.append(env_name)

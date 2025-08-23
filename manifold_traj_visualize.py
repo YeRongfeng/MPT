@@ -28,104 +28,69 @@ from scipy.ndimage import binary_fill_holes
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def get_yaw_stability_edge(yaw_stability, fraction_of_local_max=0.5, valid_mask=None):
+def compute_unstable_pose(Sx, Sy, Syaw, yaw_stability):
     """
-    生成 3D 边界体素 (H, W, B)，改进了与地图边界 (map edge) 交接处的处理：
-    - valid_mask: 可选 (H,W) bool 数组, True 表示该 (x,y) 在地图内部（有效）。
-      如果提供则能正确区分“地图外部”与“yaw_stability==0 的内部区域”；
-      如果不提供，函数会尝试使用 local_max>0 做近似（可能不完美，会打印提示）。
-
-    返回 float32 数组 shape (H, W, B)，1 表示该 voxel 位于边界。
+    使用 torch 实现，支持 Sx/Sy/Syaw 为 torch.Tensor（可在 GPU 上）或 numpy array。
+    返回：num_capsize (int), capsize_points (list of (x,y,yaw) floats)
     """
-    if torch.is_tensor(yaw_stability):
-        ys_np = yaw_stability.cpu().numpy()
+    # 将输入统一为 torch.Tensor（放在 Sx 的 device 上或 cpu）
+    if torch.is_tensor(Sx):
+        device = Sx.device
     else:
-        ys_np = np.asarray(yaw_stability)
+        device = torch.device("cpu")
+    Sx_t = torch.as_tensor(Sx, device=device, dtype=torch.float32)
+    Sy_t = torch.as_tensor(Sy, device=device, dtype=torch.float32)
+    Syaw_t = torch.as_tensor(Syaw, device=device, dtype=torch.float32)
 
-    H, W, B = ys_np.shape
-    
-    ys_np = 1-ys_np
+    ys_t = torch.as_tensor(yaw_stability, device=device, dtype=torch.float32)
 
-    # 局部最大值（按 yaw bins）
-    local_max = ys_np.max(axis=2, keepdims=True)  # (H, W, 1)
-    thr = local_max * float(fraction_of_local_max)
-    occupied = (ys_np >= thr) & (local_max > 0)   # bool (H, W, B)
+    # 检查形状为 (H, W, B)
+    if ys_t.ndim != 3:
+        raise ValueError("yaw_stability must have shape (H, W, B)")
 
-    # 推断或校验 valid_mask（地图有效区域）
-    if valid_mask is None:
-        # 警告：没有提供地图有效区域掩码时，我们不能区分“地图外部”与“内部的全零”。
-        # 为了避免把地图外框整圈错误识别成边界，这里采用较保守的策略：
-        # treat all XY as valid (避免大面积误判)。建议最好传入真实的 valid_mask。
-        valid_mask = np.ones((H, W), dtype=bool)
-        # 若你希望用 local_max>0 来作为 valid_mask，请显式传入 valid_mask=local_max[...,0]>0
-        # print("Warning: valid_mask not provided — using all-True fallback. For correct behavior provide valid_mask (H,W).")
-    else:
-        valid_mask = np.asarray(valid_mask, dtype=bool)
-        assert valid_mask.shape == (H, W), "valid_mask must have shape (H, W)"
+    H, W, B = ys_t.shape
+    res = 0.1
+    origin_x, origin_y, origin_yaw = -5.0, -5.0, -np.pi
 
-    # 标识地图内部但 yaw_stability 全零的 XY 单元
-    zero_inside_xy = (~(local_max.squeeze(axis=2) > 0)) & valid_mask  # (H, W)
+    # 计算连续索引
+    col_f = (Sx_t - origin_x) / res
+    row_f = (Sy_t - origin_y) / res
+    bin_f = (Syaw_t - origin_yaw) / (2.0 * np.pi / B)
 
-    # 连通域标记（3D，6-邻居）
-    from skimage.measure import label
-    labels = label(occupied, connectivity=1)  # 0 表示背景（未占据）
+    col = torch.floor(col_f).long()
+    row = torch.floor(row_f).long()
+    # yaw 周期化
+    bin_idx = (torch.floor(bin_f).long() % B)
 
-    # 在三维上 pad：pad 的值设为 -1 表示“外部（超出索引）”
-    p = np.pad(labels, ((1, 1), (1, 1), (1, 1)), mode='constant', constant_values=-1)
-    center = p[1:-1, 1:-1, :]  # (H, W, B)
+    # 有效范围掩码（只考虑 XY 在地图内的点）
+    valid_mask = (row >= 0) & (row < H) & (col >= 0) & (col < W)
 
-    # 6 个邻居（xy 四向直接从 pad 中取；yaw 用 roll 做循环邻居）
-    nb_up    = p[:-2,   1:-1, :]  # i-1, j
-    nb_down  = p[2:,    1:-1, :]  # i+1, j
-    nb_left  = p[1:-1, :-2,   :]  # i, j-1
-    nb_right = p[1:-1, 2:,    :]  # i, j+1
-    # yaw 前后用 roll（周期）
-    nb_yaw_prev = np.roll(center, 1, axis=2)
-    nb_yaw_next = np.roll(center, -1, axis=2)
+    if valid_mask.any().item() == 0:
+        return 0, []
 
-    neighbor_stack = np.stack([nb_up, nb_down, nb_left, nb_right, nb_yaw_prev, nb_yaw_next], axis=0)  # (6,H,W,B)
+    # 使用 view(-1) 保证一维索引（比 squeeze 更稳健）
+    valid_idx = torch.nonzero(valid_mask, as_tuple=False).view(-1)
+    r_sel = row[valid_idx]
+    c_sel = col[valid_idx]
+    b_sel = bin_idx[valid_idx]
 
-    # 基本差异：邻居标签 != 中心标签（包括 pad(-1) 与任何正标签比较）
-    neighbor_diff = (neighbor_stack != center)  # (6,H,W,B)
+    # 从 yaw_stability 中取值，使用阈值判断不稳定（与脚本其它位置保持一致）
+    vals = ys_t[r_sel, c_sel, b_sel]
+    interp_thresh = 0.5
+    unstable_mask = (vals < interp_thresh)
 
-    # 现在处理那些来源于 pad(-1) 的邻居（即超出边界的位置）
-    # 我们只在“该超出边界处对应的地图内侧正好是 yaw_stability==0（zero_inside）”时
-    # 把该 pad 视作有效的“零区邻居”，从而标记该接缝为边界；否则忽略 pad 差异以避免整圈误判。
-    # 为此，构造一个 (H,W,B) 的 zero_inside 布尔广播（在 yaw 维上复制）
-    zero_inside_3d = np.repeat(zero_inside_xy[:, :, None], B, axis=2)  # (H, W, B)
-    # 将 zero_inside 做 pad（在 xy 方向 pad False）
-    p_zero = np.pad(zero_inside_3d, ((1, 1), (1, 1), (1, 1)), mode='constant', constant_values=False)
-    # 使用显式索引以保证在小尺寸时也返回正确且一致的形状 (H, W, B)
-    nbz_up   = p_zero[0:H,     1:W+1, :]
-    nbz_down = p_zero[2:2+H,   1:W+1, :]
-    nbz_left = p_zero[1:1+H,   0:W,   :]
-    nbz_right= p_zero[1:1+H,   2:2+W, :]
-    # yaw 前后用 roll（周期）
-    nb_yaw_prev = np.roll(center, 1, axis=2)
-    nb_yaw_next = np.roll(center, -1, axis=2)
+    if unstable_mask.any().item() == 0:
+        return 0, []
 
-    # yaw 的邻居对应的 zero_inside 实际上就是 center 对应的 zero_inside（因为 zero_inside 没有 yaw 变化）
-    # 对于 out-of-bounds 的判断，我们只在四方向上需要检查 pad(-1) 的情况；yaw 的 pad 不产生 -1（因为我们 rolled center）
-    # 在堆叠前检查形状一致性，便于定位潜在问题
-    target_shape = center.shape
-    for arr, name in [(nbz_up, 'nbz_up'), (nbz_down, 'nbz_down'), (nbz_left, 'nbz_left'), (nbz_right, 'nbz_right')]:
-        if arr.shape != target_shape:
-            raise ValueError(f"{name} shape {arr.shape} does not match center shape {target_shape}")
+    unstable_idx = valid_idx[unstable_mask]
+    xs = Sx_t[unstable_idx].detach().cpu().numpy().tolist()
+    ys = Sy_t[unstable_idx].detach().cpu().numpy().tolist()
+    ysaws = Syaw_t[unstable_idx].detach().cpu().numpy().tolist()
 
-    neighbor_zero_stack = np.stack([nb_up, nb_down, nb_left, nb_right, nb_yaw_prev, nb_yaw_next], axis=0)  # (6,H,W,B)
+    capsize_points = list(zip(xs, ys, ysaws))
+    num_capsize = len(capsize_points)
 
-    # 现在对于那些 neighbor == -1 的位置，如果 neighbor_zero_stack 为 True -> 保留 neighbor_diff 为 True
-    # 否则把 neighbor_diff 对应位置设为 False（即把 pad 差异忽略）
-    pad_mask = (neighbor_stack == -1)  # (6,H,W,B)
-    # 如果 pad 且 neighbor_zero_stack == False -> 取消差异
-    neighbor_diff = np.where(pad_mask & (~neighbor_zero_stack), False, neighbor_diff)
-
-    # 最终：任一邻居差异则为表面 voxel（并且 center>0）
-    boundary_mask = (center > 0) & neighbor_diff.any(axis=0)
-
-    yaw_stability_edge = boundary_mask.astype(np.float32)
-    return yaw_stability_edge
-
+    return int(num_capsize), capsize_points
 
 if __name__ == "__main__":
     # stage = 1
@@ -133,10 +98,10 @@ if __name__ == "__main__":
     stage = 2
     epoch = 79
     envNum = np.random.randint(0, 99)  # 随机选择环境id
-    envList = ['env000012']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envList = ['env000009']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     dataset_path = 'data/terrain/train'
     save_path = 'predictions'
-    path_id = 24
+    path_id = 30
 
     modelFolder = 'data/uneven'
     # modelFolder = 'data/uneven_old'
@@ -168,8 +133,7 @@ if __name__ == "__main__":
     normal_z = map_tensor[:, :, 3]  # 法向量 z 分量 (H, W)
     
     yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # shape (H, W, B)
-    yaw_stability_edge = get_yaw_stability_edge(yaw_stability, fraction_of_local_max=0.5)
-    
+
     # 读取轨迹
     path_file = f'path_{path_id}.p'
     path_path = osp.join(env_path, path_file)
@@ -216,38 +180,54 @@ if __name__ == "__main__":
         pred_trajectory = torch.stack([Sx_p, Sy_p, Syaw_p], dim=1).cpu().numpy()
     # 将原始的预测轨迹转换为 numpy 数组
     predTraj = predTraj.cpu().numpy()
+    
+    # 传入轨迹 (Sx, Sy, Syaw) 以及 yaw_stability 地图
+    num_capsize, capsize_points = compute_unstable_pose(Sx_i, Sy_i, Syaw_i, yaw_stability)
+    print(f"Number of unstable poses in initial trajectory: {num_capsize}")
+
+    num_capsize_pred, capsize_points_pred = compute_unstable_pose(Sx_p, Sy_p, Syaw_p, yaw_stability)
+    print(f"Number of unstable poses in predicted trajectory: {num_capsize_pred}")
 
     # --- 替换原有散点图代码为等值面可视化 ---
+    interp_thresh_local = 0.5  # 局部阈值（与后面 interp_thresh 保持一致）
 
-    # 绘制等值面之前，需要将 yaw_stability_edge 转换为一个表示完整区域的体素
-    # 我们将 yaw_stability_edge 的值取反，得到一个“可达区域”的掩码
-    # 1 - yaw_stability_edge 得到的体素中，0 是边界/不可达，1 是可达
-    # reachable_mask = 1 - yaw_stability_edge
-    reachable_mask = yaw_stability
-    # 然后将孔洞（即不可达区域）填充起来
-    # binary_fill_holes 寻找值为 False 的连通区域（即 0），并将其内部的 True 区域填充为 False
-    # 这里我们是对 reachable_mask 进行操作，所以 1-reachable_mask 就是不可达区域
-    unreachable_volume = 1 - binary_fill_holes(reachable_mask)
-    
+    # 直接把不可达体素作为实心体（不填洞）
+    # 不可达定义：yaw_stability < interp_thresh_local
+    unreachable_mask = (yaw_stability < interp_thresh_local)
+
+    # unreachable_mask 可能为 torch.Tensor 或 numpy.ndarray，统一转为 numpy.float32
+    if isinstance(unreachable_mask, torch.Tensor):
+        unreachable_volume = unreachable_mask.cpu().numpy().astype(np.float32)
+    else:
+        unreachable_volume = np.asarray(unreachable_mask, dtype=np.float32)
+
     H, W, B = unreachable_volume.shape
     res = map_info['resolution']
     origin_x, origin_y, origin_yaw = map_info['origin']
 
-    # 创建坐标网格
+    # （可选）创建坐标网格（目前未直接使用）
     x_coords = origin_x + np.arange(W) * res
-    y_coords = origin_y + (H - 1 - np.arange(H)) * res
+    y_coords = origin_y + np.arange(H) * res
     yaw_coords = origin_yaw + np.arange(B) * (2.0 * np.pi / B)
     X_grid, Y_grid, Z_grid = np.meshgrid(x_coords, y_coords, yaw_coords, indexing='ij')
 
-    # 使用 marching_cubes 提取等值面
+    # 使用 marching_cubes 提取等值面（level=0.5），显式传入 float 数据
     try:
-        verts, faces, normals, values = measure.marching_cubes(unreachable_volume, level=0.5)
-        # 映射回世界坐标
-        verts[:, 0] = origin_x + verts[:, 0] * res
-        verts[:, 1] = origin_y + (H - 1 - verts[:, 1]) * res
-        verts[:, 2] = origin_yaw + verts[:, 2] * (2.0 * np.pi / B)
+        verts, faces, normals, values = measure.marching_cubes(unreachable_volume.astype(np.float32), level=0.5)
+        # marching_cubes 返回的 verts 顺序为 (row, col, slice) 对应 (r, c, b)
+        v_row = verts[:, 0].copy()
+        v_col = verts[:, 1].copy()
+        v_bin = verts[:, 2].copy()
+
+        # 映射回世界坐标以供绘图：x <- col, y <- row, yaw <- slice
+        verts[:, 0] = origin_x + v_col * res
+        verts[:, 1] = origin_y + v_row * res
+        verts[:, 2] = origin_yaw + v_bin * (2.0 * np.pi / B)
     except ValueError:
         print("Warning: No isosurface found. Skipping surface plot.")
+        verts, faces = None, None
+    except Exception as e:
+        print(f"Error running marching_cubes or mapping verts: {e}")
         verts, faces = None, None
 
     from mpl_toolkits.mplot3d import Axes3D
@@ -258,6 +238,9 @@ if __name__ == "__main__":
     dpi = 200
     font_family = "serif"
     base_fontsize = 10
+    voxel_center = False  # 体素中心对齐
+    flip_y = False    # y 轴是否翻转（与体素索引一致）
+    interp_thresh = 0.5  # 全局阈值（与前面 interp_thresh_local 保持一致）
     # 交点绘制参数（防止未定义错误）
     intersection_marker_size = 40
     intersection_marker_style = 'x'
@@ -319,7 +302,8 @@ if __name__ == "__main__":
     ax.set_title('Yaw Stability Isosurface & Trajectories', pad=10)
 
     # NOTE：视角
-    ax.view_init(elev=10, azim=20)
+    ax.view_init(elev=20, azim=40)
+    # ax.view_init(elev=26, azim=-7)
     
     # 手动设置坐标范围以确保等比例
     max_range = np.array([initial_trajectory[:, 0].max()-initial_trajectory[:, 0].min(),
@@ -348,32 +332,87 @@ if __name__ == "__main__":
     # plt.savefig(outname_svg, dpi=600, bbox_inches='tight')
     # plt.show()
 
+    def world_to_voxel_index(x, y, yaw):
+        """把世界坐标映射到体素整数索引 (r, c, b)。越界返回 None。"""
+        if voxel_center:
+            col_f = (x - origin_x) / res - 0.5
+            row_f = (y - origin_y) / res - 0.5
+        else:
+            col_f = (x - origin_x) / res
+            row_f = (y - origin_y) / res
+
+        if flip_y:
+            row_f = (H - 1) - row_f
+
+        bin_f = (yaw - origin_yaw) / (2.0 * np.pi / B)
+        r = int(np.floor(row_f))
+        c = int(np.floor(col_f))
+        b = int(np.floor(bin_f)) % B
+
+        if r < 0 or r >= H or c < 0 or c >= W:
+            return None
+        return r, c, b
+
+    def trilinear_sample(vol, row_f, col_f, bin_f):
+        """占位：不再使用。保留以防其它代码调用，但直接使用最近体素值（等同于最近邻 / 矩形判定）。"""
+        r = int(np.floor(row_f)); c = int(np.floor(col_f)); b = int(np.floor(bin_f)) % B
+        if r < 0 or c < 0 or r >= H or c >= W:
+            return 0.0
+        return float(vol[r, c, b])
+
     def is_inside(point):
-        """检查一个世界坐标点是否在不可达区域内 (近似)."""
-        x, y, yaw = point
-        # col 对应 x，row 对应 y（注意 y 轴在体素中被翻转）
-        col = int(np.round((x - origin_x) / res))
-        # world_y = origin_y + (H-1 - v_y) * res  =>  v_y = (H-1) - (world_y - origin_y)/res
-        row = int(np.round((H - 1) - (y - origin_y) / res))
-        bin_yaw = int(np.round((yaw - origin_yaw) / (2 * np.pi / B))) % B
-        if 0 <= row < H and 0 <= col < W and 0 <= bin_yaw < B:
-            return unreachable_volume[row, col, bin_yaw] > 0.5
-        return False
+        """基于矩形体素判断点是否落在不可达区域（返回 bool），不做插值。"""
+        idx = world_to_voxel_index(point[0], point[1], point[2])
+        if idx is None:
+            return False
+        r, c, b = idx
+        return float(unreachable_volume[r, c, b]) > interp_thresh
 
-    def find_intersections(trajectory):
-        """寻找轨迹与等值面的近似交点（返回世界坐标点列表）。"""
+    def locate_crossing_continuous(p1, p2, max_iters=30, tol=1e-4):
+        """在连续线段上用二分定位阈值交点，判断使用整数体素（无插值）。"""
+        a = np.array(p1, dtype=np.float64); b = np.array(p2, dtype=np.float64)
+        ia = world_to_voxel_index(a[0], a[1], a[2])
+        ib = world_to_voxel_index(b[0], b[1], b[2])
+        va = float(unreachable_volume[ia]) if ia is not None else 0.0
+        vb = float(unreachable_volume[ib]) if ib is not None else 0.0
+        fa = (va > interp_thresh); fb = (vb > interp_thresh)
+        if fa == fb:
+            return None
+        for _ in range(max_iters):
+            m = 0.5 * (a + b)
+            im = world_to_voxel_index(m[0], m[1], m[2])
+            vm = float(unreachable_volume[im]) if im is not None else 0.0
+            fm = (vm > interp_thresh)
+            if fm == fa:
+                a, ia, va, fa = m, im, vm, fm
+            else:
+                b, ib, vb, fb = m, im, vm, fm
+            if np.linalg.norm(b - a) < tol:
+                break
+        mid = 0.5 * (a + b)
+        return (float(mid[0]), float(mid[1]), float(mid[2]))
+
+    def find_intersections(trajectory, samples_per_segment=24):
+        """用离散体素采样判断段上是否穿越不可达区域并定位交点（不插值）。"""
         intersections = []
-        for i in range(len(trajectory) - 1):
-            p1 = trajectory[i]
-            p2 = trajectory[i + 1]
-
-            inside1 = is_inside(p1)
-            inside2 = is_inside(p2)
-
-            if inside1 != inside2:
-                # 简单取线段中点作为近似交点；也可改为细分插值定位
-                mid = 0.5 * (p1 + p2)
-                intersections.append((float(mid[0]), float(mid[1]), float(mid[2])))
+        traj = np.asarray(trajectory, dtype=np.float64)
+        for i in range(len(traj) - 1):
+            p1 = traj[i]; p2 = traj[i + 1]
+            ts = np.linspace(0.0, 1.0, samples_per_segment + 1)
+            samples = p1[None, :] * (1 - ts[:, None]) + p2[None, :] * (ts[:, None])
+            flags = []
+            for s in samples:
+                idx = world_to_voxel_index(s[0], s[1], s[2])
+                if idx is None:
+                    flags.append(False)
+                else:
+                    r, c, b = idx
+                    flags.append(bool(unreachable_volume[r, c, b] > interp_thresh))
+            for j in range(len(flags) - 1):
+                if flags[j] != flags[j + 1]:
+                    cross = locate_crossing_continuous(samples[j], samples[j + 1])
+                    if cross is not None:
+                        intersections.append(cross)
         return intersections
 
     # 寻找交点
@@ -383,21 +422,21 @@ if __name__ == "__main__":
     print(f"Initial Intersections: {len(initial_intersections)}")
     print(f"Predicted Intersections: {len(predicted_intersections)}")
 
-    # 绘制交点（注意空列表处理）
-    if len(initial_intersections) > 0:
-        ax.scatter(*zip(*initial_intersections),
-                   s=intersection_marker_size,
-                   marker=intersection_marker_style,
-                   color=initial_intersection_color,
-                   label=f'Initial Intersections ({len(initial_intersections)})',
-                   zorder=7)
-    if len(predicted_intersections) > 0:
-        ax.scatter(*zip(*predicted_intersections),
-                   s=intersection_marker_size,
-                   marker=intersection_marker_style,
-                   color=predicted_intersection_color,
-                   label=f'Predicted Intersections ({len(predicted_intersections)})',
-                   zorder=7)
+    # # 绘制交点（注意空列表处理）
+    # if len(initial_intersections) > 0:
+    #     ax.scatter(*zip(*initial_intersections),
+    #                s=intersection_marker_size,
+    #                marker=intersection_marker_style,
+    #                color=initial_intersection_color,
+    #                label=f'Initial Intersections ({len(initial_intersections)})',
+    #                zorder=7)
+    # if len(predicted_intersections) > 0:
+    #     ax.scatter(*zip(*predicted_intersections),
+    #                s=intersection_marker_size,
+    #                marker=intersection_marker_style,
+    #                color=predicted_intersection_color,
+    #                label=f'Predicted Intersections ({len(predicted_intersections)})',
+    #                zorder=7)
 
     # 显示图例（已在前面用 safe_handles 创建，避免 Poly3DCollection 导致的问题）
     # 注：删除重复的 ax.legend(...) 调用，避免 AttributeError
@@ -419,6 +458,34 @@ if __name__ == "__main__":
         unreach_patch = mpatches.Patch(color='red', alpha=0.3, label='Unreachable Region')
         safe_handles.insert(0, unreach_patch)
         safe_labels.insert(0, unreach_patch.get_label())
+        
+    # 绘制 unstable pose 的点
+    if num_capsize > 0:
+        xs, ys, ysaws = zip(*capsize_points)
+        ax.scatter(xs, ys, ysaws,
+                   s=intersection_marker_size,
+                   marker='o',
+                   color='lime',
+                #    edgecolor='black',
+                   linewidth=0.5,
+                   label=f'Initial Unstable Poses ({num_capsize})',
+                   alpha=1.0,
+                   zorder=9)
+        safe_handles.append(mpatches.Patch(color='lime', label=f'Initial Unstable Poses ({num_capsize})'))
+        safe_labels.append(f'Initial Unstable Poses ({num_capsize})')
+    if num_capsize_pred > 0:
+        xs, ys, ysaws = zip(*capsize_points_pred)
+        ax.scatter(xs, ys, ysaws,
+                   s=intersection_marker_size,
+                   marker='D',
+                   color='cyan',
+                #    edgecolor='black',
+                   linewidth=0.5,
+                   label=f'Predicted Unstable Poses ({num_capsize_pred})',
+                   alpha=1.0,
+                   zorder=9)
+        safe_handles.append(mpatches.Patch(color='cyan', label=f'Predicted Unstable Poses ({num_capsize_pred})'))
+        safe_labels.append(f'Predicted Unstable Poses ({num_capsize_pred})')
 
     ax.legend(handles=safe_handles, labels=safe_labels, loc='upper left', bbox_to_anchor=(0.02, 0.98))
 

@@ -943,10 +943,10 @@ if __name__ == "__main__":
 
     # --- 0. 加载地形数据 ---
     from dataLoader_uneven import UnevenPathDataLoader
-    env_list = ['env000001']
-    dataFolder = '/home/yrf/MPT/data/terrain_dataset/train'
+    env_list = ['env000012']
+    dataFolder = '/home/yrf/MPT/data/terrain/train'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
-    path_index = 41
+    path_index = 32    
     sample = dataset[path_index]
     if sample is None:
         raise ValueError(f"Sample at index {path_index} is invalid.")

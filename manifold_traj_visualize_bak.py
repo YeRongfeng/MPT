@@ -131,10 +131,10 @@ if __name__ == "__main__":
     stage = 2
     epoch = 79
     envNum = np.random.randint(0, 99)  # 随机选择环境id
-    envList = ['env000004']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envList = ['env000009']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     dataset_path = 'data/terrain/train'
     save_path = 'predictions'
-    path_id = 21
+    path_id = 18
 
     modelFolder = 'data/uneven'
     # modelFolder = 'data/uneven_old'
@@ -230,7 +230,7 @@ if __name__ == "__main__":
     # 注意：图像行索引通常从上到下（row=0 在上），而地图 origin 通常是左下角，
     # 所以 world_y = origin_y + (H - 1 - row) * res
     x_world = origin_x + cols * res
-    y_world = origin_y + (H - 1 - rows) * res
+    y_world = origin_y + rows * res
     # yaw: bins 映射到角度/弧度；origin_yaw 通常为 -pi
     yaw_world = origin_yaw + bins * (2.0 * np.pi / float(B))
     # 覆盖变量以便后续绘图直接使用 cols(rows)=x(y)
