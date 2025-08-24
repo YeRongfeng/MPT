@@ -1235,7 +1235,7 @@ class UnevenPathDataLoader(Dataset):
         cost_map = generate_cost_map_from_yaw_stability(
             yaw_stability, 
             voxel_size_xy=0.1, 
-            yaw_weight=0.2, 
+            yaw_weight=2.1, 
             d_safe=0.15, 
             kalpa=0.1, 
             return_esdf=False

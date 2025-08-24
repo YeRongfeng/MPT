@@ -178,9 +178,9 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         weighted_predTheta = weighted_predTheta * 2 * np.pi - np.pi  # 将范围从[0, 1]映射到[-pi, pi]
         
         # 计算最终预测位置和角度
-        final_x = weighted_x + weighted_offset_x.item()
-        final_y = weighted_y + weighted_offset_y.item()
-        
+        final_x = weighted_x + weighted_offset_x.item() * 0
+        final_y = weighted_y + weighted_offset_y.item() * 0
+
         # # 计算最终预测位置和角度
         # final_x = weighted_x
         # final_y = weighted_y

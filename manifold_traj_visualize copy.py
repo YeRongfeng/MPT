@@ -279,25 +279,27 @@ if __name__ == "__main__":
     ax.scatter(trajectory[1:-1, 0], trajectory[1:-1, 1], trajectory[1:-1, 2],
             s=36, marker='o', edgecolor='white', linewidth=0.6, zorder=4)
 
-    # ax.plot(pred_trajectory[:, 0], pred_trajectory[:, 1], pred_trajectory[:, 2],
-    #         linewidth=2.6, label='Predicted trajectory', zorder=5)
-    # ax.scatter(predTraj[1:-1, 0], predTraj[1:-1, 1], predTraj[1:-1, 2],
-    #         s=44, marker='D', edgecolor='white', linewidth=0.6, zorder=6)
+    ax.plot(pred_trajectory[:, 0], pred_trajectory[:, 1], pred_trajectory[:, 2],
+            linewidth=2.6, label='Predicted trajectory', zorder=5)
+    ax.scatter(predTraj[1:-1, 0], predTraj[1:-1, 1], predTraj[1:-1, 2],
+            s=44, marker='D', edgecolor='white', linewidth=0.6, zorder=6)
 
-    # 起点/终点（去掉 label，只保留 marker）
+    # 起点/终点
     ax.scatter(initial_trajectory[0, 0], initial_trajectory[0, 1], initial_trajectory[0, 2],
-            s=110, marker='^', zorder=8)
+            s=110, marker='^', label='Start', zorder=8)
     ax.scatter(initial_trajectory[-1, 0], initial_trajectory[-1, 1], initial_trajectory[-1, 2],
-            s=120, marker='*', zorder=8)
+            s=120, marker='*', label='Goal', zorder=8)
 
-    # 去掉起点/终点的文字注释（不显示 "Start"/"Goal" 文本）
-    #ax.text(initial_trajectory[0, 0], initial_trajectory[0, 1], initial_trajectory[0, 2] + 0.05,
-    #        "Start", fontsize=base_fontsize, va='bottom', ha='center', zorder=8)
-    #ax.text(initial_trajectory[-1, 0], initial_trajectory[-1, 1], initial_trajectory[-1, 2] + 0.05,
-    #        "Goal", fontsize=base_fontsize, va='bottom', ha='center', zorder=8)
+    ax.text(initial_trajectory[0, 0], initial_trajectory[0, 1], initial_trajectory[0, 2] + 0.05,
+            "Start", fontsize=base_fontsize, va='bottom', ha='center', zorder=8)
+    ax.text(initial_trajectory[-1, 0], initial_trajectory[-1, 1], initial_trajectory[-1, 2] + 0.05,
+            "Goal", fontsize=base_fontsize, va='bottom', ha='center', zorder=8)
 
     # 轴标签 / 标题
-    # （已移除坐标轴标签和标题，仅保留可视化）
+    ax.set_xlabel('X (m)', labelpad=6)
+    ax.set_ylabel('Y (m)', labelpad=6)
+    ax.set_zlabel('Yaw (rad)', labelpad=8)
+    ax.set_title('Yaw Stability Isosurface & Trajectories', pad=10)
 
     # NOTE：视角
     ax.view_init(elev=20, azim=40)
@@ -319,25 +321,9 @@ if __name__ == "__main__":
     ax.set_ylim(-5.0, 5.0)
     ax.set_zlim(-np.pi, np.pi)
 
-    # 关闭网格，优化面板边框显示（保留坐标轴，但隐藏刻度文字）
+    # 关闭网格，优化面板边框显示
     ax.grid(False)
     ax.xaxis.pane.set_edgecolor('k'); ax.yaxis.pane.set_edgecolor('k'); ax.zaxis.pane.set_edgecolor('k')
-
-    # 隐藏刻度文字但保留坐标轴和刻度线
-    try:
-        ax.set_xticklabels([])
-        ax.set_yticklabels([])
-        ax.set_zticklabels([])
-    except Exception:
-        # 备用方法：对每个 axis 的 tick label 设置不可见
-        for t in ax.xaxis.get_major_ticks():
-            t.label.set_visible(False)
-        for t in ax.yaxis.get_major_ticks():
-            t.label.set_visible(False)
-        for t in ax.zaxis.get_major_ticks():
-            t.label.set_visible(False)
-
-    # 不再调用 ax.set_axis_off()
 
     # plt.tight_layout()
     # outname_pdf = 'yaw_stability_isosurface_3d.pdf'
@@ -368,7 +354,7 @@ if __name__ == "__main__":
         return r, c, b
 
     def trilinear_sample(vol, row_f, col_f, bin_f):
-        """占位：不再使用。保留以防其它代码调用，但直接使用最近体素值（最近邻）。"""
+        """占位：不再使用。保留以防其它代码调用，但直接使用最近体素值（等同于最近邻 / 矩形判定）。"""
         r = int(np.floor(row_f)); c = int(np.floor(col_f)); b = int(np.floor(bin_f)) % B
         if r < 0 or c < 0 or r >= H or c >= W:
             return 0.0
@@ -383,7 +369,7 @@ if __name__ == "__main__":
         return float(unreachable_volume[r, c, b]) > interp_thresh
 
     def locate_crossing_continuous(p1, p2, max_iters=30, tol=1e-4):
-        """在连续线段上用二分定位阈值交点，使用整数体素判断。"""
+        """在连续线段上用二分定位阈值交点，判断使用整数体素（无插值）。"""
         a = np.array(p1, dtype=np.float64); b = np.array(p2, dtype=np.float64)
         ia = world_to_voxel_index(a[0], a[1], a[2])
         ib = world_to_voxel_index(b[0], b[1], b[2])
@@ -429,91 +415,80 @@ if __name__ == "__main__":
                         intersections.append(cross)
         return intersections
 
-    # # 寻找交点（单次计算、单次输出）
-    # initial_intersections = find_intersections(initial_trajectory)
-    # predicted_intersections = find_intersections(pred_trajectory)
+    # 寻找交点
+    initial_intersections = find_intersections(initial_trajectory)
+    predicted_intersections = find_intersections(pred_trajectory)
+    
+    print(f"Initial Intersections: {len(initial_intersections)}")
+    print(f"Predicted Intersections: {len(predicted_intersections)}")
 
-    # print(f"Initial Intersections: {len(initial_intersections)}")
-    # print(f"Predicted Intersections: {len(predicted_intersections)}")
-
-    # # 可选：绘制交点（如果需要显示）
+    # # 绘制交点（注意空列表处理）
     # if len(initial_intersections) > 0:
     #     ax.scatter(*zip(*initial_intersections),
     #                s=intersection_marker_size,
     #                marker=intersection_marker_style,
     #                color=initial_intersection_color,
+    #                label=f'Initial Intersections ({len(initial_intersections)})',
     #                zorder=7)
     # if len(predicted_intersections) > 0:
     #     ax.scatter(*zip(*predicted_intersections),
     #                s=intersection_marker_size,
     #                marker=intersection_marker_style,
     #                color=predicted_intersection_color,
+    #                label=f'Predicted Intersections ({len(predicted_intersections)})',
     #                zorder=7)
 
-    # 清理并只生成一次图例安全句柄（若需要图例，可取消下面注释）
+    # 显示图例（已在前面用 safe_handles 创建，避免 Poly3DCollection 导致的问题）
+    # 注：删除重复的 ax.legend(...) 调用，避免 AttributeError
+    # （之前在文件中已经使用 safe_handles/safe_labels 添加了不可达区域的 proxy patch）
+    # ax.legend(loc='upper left', bbox_to_anchor=(0.02, 0.98))
+    
+    # 图例：避免 Poly3DCollection 在 legend 时触发 AttributeError
     import matplotlib.patches as mpatches
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
     handles, labels = ax.get_legend_handles_labels()
+    # 过滤掉会导致问题的 Poly3DCollection（如 plot_trisurf 返回的对象）
     safe_pairs = [(h, l) for h, l in zip(handles, labels) if not isinstance(h, Poly3DCollection)]
     safe_handles = [h for h, _ in safe_pairs]
     safe_labels = [l for _, l in safe_pairs]
+
+    # 如果绘制了不可达面，使用 proxy patch 添加图例项
     if verts is not None:
         unreach_patch = mpatches.Patch(color='red', alpha=0.3, label='Unreachable Region')
         safe_handles.insert(0, unreach_patch)
         safe_labels.insert(0, unreach_patch.get_label())
-    # 如果要显示图例，取消下一行注释
-    # ax.legend(safe_handles, safe_labels, loc='upper left', bbox_to_anchor=(0.02, 0.98))
+        
+    # 绘制 unstable pose 的点
+    if num_capsize > 0:
+        xs, ys, ysaws = zip(*capsize_points)
+        ax.scatter(xs, ys, ysaws,
+                   s=intersection_marker_size,
+                   marker='o',
+                   color='lime',
+                #    edgecolor='black',
+                   linewidth=0.5,
+                   label=f'Initial Unstable Poses ({num_capsize})',
+                   alpha=1.0,
+                   zorder=9)
+        safe_handles.append(mpatches.Patch(color='lime', label=f'Initial Unstable Poses ({num_capsize})'))
+        safe_labels.append(f'Initial Unstable Poses ({num_capsize})')
+    if num_capsize_pred > 0:
+        xs, ys, ysaws = zip(*capsize_points_pred)
+        ax.scatter(xs, ys, ysaws,
+                   s=intersection_marker_size,
+                   marker='D',
+                   color='cyan',
+                #    edgecolor='black',
+                   linewidth=0.5,
+                   label=f'Predicted Unstable Poses ({num_capsize_pred})',
+                   alpha=1.0,
+                   zorder=9)
+        safe_handles.append(mpatches.Patch(color='cyan', label=f'Predicted Unstable Poses ({num_capsize_pred})'))
+        safe_labels.append(f'Predicted Unstable Poses ({num_capsize_pred})')
 
-    # # 绘制 unstable pose（仅一次）
-    # if num_capsize > 0:
-    #     xs, ys, ysaws = zip(*capsize_points)
-    #     ax.scatter(xs, ys, ysaws,
-    #                s=intersection_marker_size,
-    #                marker='o',
-    #                color='lime',
-    #                linewidth=0.5,
-    #                alpha=1.0,
-    #                zorder=9)
-    # if num_capsize_pred > 0:
-    #     xs, ys, ysaws = zip(*capsize_points_pred)
-    #     ax.scatter(xs, ys, ysaws,
-    #                s=intersection_marker_size,
-    #                marker='D',
-    #                color='cyan',
-    #                linewidth=0.5,
-    #                alpha=1.0,
-    #                zorder=9)
+    ax.legend(handles=safe_handles, labels=safe_labels, loc='upper left', bbox_to_anchor=(0.02, 0.98))
 
-    # # 保留坐标系背景面（pane），隐藏刻度文字但保留刻度线与面（仅设置一次）
-    # try:
-    #     ax.xaxis.pane.set_edgecolor('k')
-    #     ax.yaxis.pane.set_edgecolor('k')
-    #     ax.zaxis.pane.set_edgecolor('k')
-    #     ax.xaxis.pane.set_facecolor((1.0, 1.0, 1.0, 1.0))
-    #     ax.yaxis.pane.set_facecolor((1.0, 1.0, 1.0, 1.0))
-    #     ax.zaxis.pane.set_facecolor((1.0, 1.0, 1.0, 1.0))
-    #     ax.xaxis.pane.fill = True
-    #     ax.yaxis.pane.fill = True
-    #     ax.zaxis.pane.fill = True
-    # except Exception:
-    #     pass
-
-    # try:
-    #     ax.set_xticklabels([])
-    #     ax.set_yticklabels([])
-    #     ax.set_zticklabels([])
-    # except Exception:
-    #     for t in ax.xaxis.get_major_ticks():
-    #         t.label.set_visible(False)
-    #     for t in ax.yaxis.get_major_ticks():
-    #         t.label.set_visible(False)
-    #     for t in ax.zaxis.get_major_ticks():
-    #         t.label.set_visible(False)
-
-    # 关闭坐标轴
-    ax.axis('off')
-
-    # 最终显示
     plt.tight_layout()
     outname_pdf_intersections = 'yaw_stability_intersections_3d.pdf'
     outname_svg_intersections = 'yaw_stability_intersections_3d.svg'
