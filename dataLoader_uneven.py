@@ -1237,7 +1237,7 @@ class UnevenPathDataLoader(Dataset):
             voxel_size_xy=0.1, 
             yaw_weight=2.1, 
             d_safe=0.15, 
-            kalpa=0.1, 
+            kalpa=0.08, 
             return_esdf=False
         )
 

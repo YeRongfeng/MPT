@@ -252,8 +252,8 @@ class PoseWiseEncoderLayer(nn.Module):
         fused_feat = self.norm(map_feat * (1 + torch.tanh(gate)))  # 残差调制 + LN
 
         # 3) FFN
-        out = self.ffn(fused_feat)  # [B,N,D]
-        # out = self.ffn(fused_feat) + map_feat  # [B,N,D]
+        # out = self.ffn(fused_feat)  # [B,N,D]
+        out = fused_feat  # [B,N,D]
         
         return out
 

@@ -5,13 +5,14 @@ terrain_visualize.py - 绘制3d地形图的脚本
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3D
 from scipy.interpolate import griddata
 
 import os.path as osp
 import pickle
 
-def plot_terrain(elevation, nx, ny, nz):
+def plot_terrain(elevation, nx, ny, nz, pred_traj=None, true_traj=None,
+                 pred_color="#CD1F4D", true_color='#0072B2'):
     """
     绘制3D地形图
     :param terrain_data: 2D numpy array, 每个元素表示地形高度
@@ -64,7 +65,7 @@ def plot_terrain(elevation, nx, ny, nz):
 
         # 选择配色（保留原有自定义配色，并额外添加多组更深色调供挑选）
         # 把 palette_name 设为下列任意键（示例： 'deep_ocean' 或新增 'rust' 等）
-        palette_name = 'indigo_evening_r'
+        palette_name = 'deep_moss_r'
 
         from matplotlib.colors import LinearSegmentedColormap
 
@@ -86,6 +87,7 @@ def plot_terrain(elevation, nx, ny, nz):
 
             # 新增深色调（轻色不要接近纯白，保证印刷/背景对比）
             'deep_moss':    ['#d7e6d9', '#8fbf90', '#4a7a4c', '#183a1f'],
+            'deep_moss_r':    ["#385334", "#578c57", "#69ad5f", "#8ec18d"],
             'rust':         ['#f0d0c6', '#d38b71', '#a94f30', '#4f1b14'],
             'sandstone':    ['#eadccb', '#d0b187', '#a06f46', '#5a3a28'],
             'moody_teal':   ['#d9e9ea', '#79b3b6', '#2f7c7f', '#0f3f40'],
@@ -137,6 +139,11 @@ def plot_terrain(elevation, nx, ny, nz):
         # 增强边缘对比但仍保持细微（便于印刷与后续叠加）
         coll = Poly3DCollection(polys, facecolors=colors,
                                 edgecolors=(0.0, 0.0, 0.0, 0.12), linewidths=0.25)
+        # 将地形集合的 zorder 调低，优先显示轨迹
+        try:
+            coll.set_zorder(0)
+        except Exception:
+            pass
         ax.add_collection3d(coll)
         
     # 设置连接线颜色为黑色
@@ -191,6 +198,224 @@ def plot_terrain(elevation, nx, ny, nz):
     ax.grid(False)
     ax.view_init(elev=45, azim=-120)
 
+    # -------------------------
+    # Trajectory 绘制部分（可选）
+    # pred_traj / true_traj: array-like of shape (N,3) or (N,2) in (x,y[,theta]) 格式，坐标以栅格索引为单位
+    # pred_traj 将被绘制在 true_traj 之上，并且两者都将使用平滑插值
+    # -------------------------
+    def smooth_traj_xy(traj_xy, num=300):
+        """对 (N,2) 的轨迹做样条或线性插值并返回 (num,2) 点集和切向角theta"""
+        traj_xy = np.asarray(traj_xy, dtype=np.float64)
+        if traj_xy.ndim != 2 or traj_xy.shape[0] == 0:
+            return np.zeros((0, 3))
+        x = traj_xy[:, 0]
+        y = traj_xy[:, 1]
+        if len(x) < 2:
+            theta = np.zeros_like(x)
+            pts = np.stack([np.repeat(x, num), np.repeat(y, num), np.repeat(theta, num)], axis=1)
+            return pts
+        try:
+            from scipy import interpolate as si
+            k = min(3, len(x) - 1)
+            tck, u = si.splprep([x, y], s=0.0, k=k)
+            u_fine = np.linspace(0, 1, num)
+            x_fine, y_fine = si.splev(u_fine, tck)
+            dx, dy = si.splev(u_fine, tck, der=1)
+            theta_fine = np.arctan2(dy, dx)
+            return np.stack([x_fine, y_fine, theta_fine], axis=1)
+        except Exception:
+            # fallback: 累积弧长线性插值 + 简单平滑
+            dist = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2)
+            u = np.zeros(len(x))
+            if len(dist) > 0:
+                u[1:] = np.cumsum(dist)
+            if u[-1] == 0:
+                u = np.linspace(0, 1, len(x))
+            else:
+                u = u / u[-1]
+            u_fine = np.linspace(0, 1, num)
+            x_fine = np.interp(u_fine, u, x)
+            y_fine = np.interp(u_fine, u, y)
+            # 平滑
+            def smooth_arr(a, win=7):
+                if len(a) < win:
+                    return a
+                pad = win // 2
+                a_pad = np.pad(a, (pad, pad), mode='edge')
+                kernel = np.ones(win) / win
+                return np.convolve(a_pad, kernel, mode='valid')
+            x_s = smooth_arr(x_fine)
+            y_s = smooth_arr(y_fine)
+            dx = np.gradient(x_s)
+            dy = np.gradient(y_s)
+            theta_fine = np.arctan2(dy, dx)
+            return np.stack([x_s, y_s, theta_fine], axis=1)
+
+    def sample_elevation_at_xy(xy_pts):
+        """给定 (M,2) 的 (x,y)（对应列,行），用 griddata 从 elevation 中插值返回 z 值数组"""
+        if xy_pts is None or len(xy_pts) == 0:
+            return np.array([])
+        # grid points: X=j (cols), Y=i (rows)
+        h, w = elevation.shape
+        Xi, Yi = np.meshgrid(np.arange(w), np.arange(h))
+        points = np.stack([Xi.ravel(), Yi.ravel()], axis=1)
+        values = elevation.ravel()
+        pts = np.asarray(xy_pts)[:, :2]
+        try:
+            z = griddata(points, values, pts, method='linear')
+            # 对 NaN 使用最近邻填补
+            nan_mask = np.isnan(z)
+            if nan_mask.any():
+                z_nn = griddata(points, values, pts[nan_mask], method='nearest')
+                z[nan_mask] = z_nn
+            return z
+        except Exception:
+            # 简单边界裁切
+            pts_clipped = np.copy(pts)
+            pts_clipped[:, 0] = np.clip(pts_clipped[:, 0], 0, w - 1)
+            pts_clipped[:, 1] = np.clip(pts_clipped[:, 1], 0, h - 1)
+            z = []
+            for xx, yy in pts_clipped:
+                z.append(float(elevation[int(round(yy)), int(round(xx))]))
+            return np.array(z)
+
+    def world_to_grid_coords(xy_pts, h, w):
+        """自动检测并把世界坐标系(-5..5)转换为栅格索引(0..w-1,0..h-1)。
+        如果输入已经接近栅格索引范围则直接返回原值。
+        xy_pts: (N,2) array-like (x,y)
+        返回 (N,2) 的浮点数组，列(x)->[0,w-1], 行(y)->[0,h-1]
+        """
+        pts = np.asarray(xy_pts, dtype=np.float64)
+        if pts.size == 0:
+            return pts
+        # 记录原始范围
+        xmin, xmax = np.nanmin(pts[:, 0]), np.nanmax(pts[:, 0])
+        ymin, ymax = np.nanmin(pts[:, 1]), np.nanmax(pts[:, 1])
+
+        # 如果看起来像世界坐标（落在 -5..5 以内），则进行转换
+        if xmin >= -5.5 and xmax <= 5.5 and ymin >= -5.5 and ymax <= 5.5:
+            # world x in [-5,5] -> col = (x+5)/0.1 ; similarly for row
+            scale = 0.1
+            cols = (pts[:, 0] + 5.0) / scale
+            rows = (pts[:, 1] + 5.0) / scale
+            cols = np.clip(cols, 0, w - 1)
+            rows = np.clip(rows, 0, h - 1)
+            return np.stack([cols, rows], axis=1)
+
+        # 否则假定已经是栅格索引（x->col, y->row），但仍裁剪到边界
+        cols = np.clip(pts[:, 0], 0, w - 1)
+        rows = np.clip(pts[:, 1], 0, h - 1)
+        return np.stack([cols, rows], axis=1)
+
+    # 绘制轨迹（先绘制真实，再绘制预测，使预测在上方）
+    zmin = np.nanmin(elevation)
+    zmax = np.nanmax(elevation)
+    z_range = max((zmax - zmin), 1e-8)
+
+    # 真是轨迹
+    if true_traj is not None:
+        try:
+            tr = np.asarray(true_traj)
+            if tr.ndim == 1:
+                tr = tr.reshape(-1, tr.shape[0])
+            # 只取 x,y
+            tr_xy = tr[:, :2]
+            # 坐标转换：如果轨迹为 world 坐标 (-5..5)，将其转换为栅格索引
+            tr_xy_grid = world_to_grid_coords(tr_xy, h, w)
+            smooth = smooth_traj_xy(tr_xy_grid, num=300)
+            zs = sample_elevation_at_xy(smooth[:, :2])
+            if zs.size == 0:
+                # 当无法采样高度时，将轨迹放在地形顶部
+                zs = np.full(smooth.shape[0], zmax)
+            # 小幅悬空避免与面片精确重合：提高到相对于地形高度的可见偏移
+            # 将真实轨迹抬高为较小的正值，确保可见且不过于“漂浮”
+            offset = 0.012 * z_range
+            xs = smooth[:, 0]
+            ys = smooth[:, 1]
+            zs_plot = zs + offset
+            # 阴影底层线以增加对比
+            try:
+                line_shadow = Line3D(xs, ys, zs_plot, color=(0, 0, 0, 0.18), linewidth=6.0, solid_capstyle='round')
+                line_shadow.set_zorder(10)
+                ax.add_line(line_shadow)
+            except Exception:
+                ax.plot(xs, ys, zs_plot, color=(0, 0, 0, 0.18), linewidth=6.0, zorder=10)
+            # 主线
+            try:
+                line_main = Line3D(xs, ys, zs_plot, color=true_color, linewidth=3.0, linestyle='--', solid_capstyle='round')
+                line_main.set_zorder(20)
+                ax.add_line(line_main)
+            except Exception:
+                ax.plot(xs, ys, zs_plot, color=true_color, linewidth=3.0, linestyle='--', zorder=20)
+            # 起点/终点标记（带黑色边框）
+            if xs.size > 0:
+                ax.scatter(xs[0], ys[0], zs_plot[0], color=true_color, s=140, edgecolors='k', linewidths=0.8, zorder=5)
+                ax.scatter(xs[-1], ys[-1], zs_plot[-1], color=true_color, s=140, edgecolors='k', linewidths=0.8, zorder=5)
+        except Exception:
+            pass
+
+    # 预测轨迹（覆盖在上方，颜色不同）
+    if pred_traj is not None:
+        try:
+            pr = np.asarray(pred_traj)
+            if pr.ndim == 1:
+                pr = pr.reshape(-1, pr.shape[0])
+            pr_xy = pr[:, :2]
+            # 如果存在真实轨迹，从真实轨迹中取起点和终点并加入预测轨迹两端
+            if true_traj is not None:
+                try:
+                    tt = np.asarray(true_traj)
+                    if tt.ndim == 1:
+                        tt = tt.reshape(-1, tt.shape[0])
+                    start_pt = tt[0, :2].astype(np.float64)
+                    goal_pt = tt[-1, :2].astype(np.float64)
+                    # 若预测点已包含起点/终点则不重复（基于距离判断）
+                    def near(a, b, tol=1e-3):
+                        return np.linalg.norm(np.asarray(a) - np.asarray(b)) < tol
+                    # 如果第一个预测点非常接近 start，则不插入 start
+                    if pr_xy.shape[0] > 0 and near(pr_xy[0], start_pt):
+                        prefix = np.empty((0, 2))
+                    else:
+                        prefix = start_pt.reshape(1, 2)
+                    if pr_xy.shape[0] > 0 and near(pr_xy[-1], goal_pt):
+                        suffix = np.empty((0, 2))
+                    else:
+                        suffix = goal_pt.reshape(1, 2)
+                    pr_xy = np.vstack((prefix, pr_xy, suffix)) if pr_xy.size else np.vstack((prefix, suffix))
+                except Exception:
+                    # 若真实轨迹解析失败，继续使用原始预测点
+                    pass
+            pr_xy_grid = world_to_grid_coords(pr_xy, h, w)
+            smooth_p = smooth_traj_xy(pr_xy_grid, num=300)
+            zs_p = sample_elevation_at_xy(smooth_p[:, :2])
+            if zs_p.size == 0:
+                zs_p = np.full(smooth_p.shape[0], zmax)
+            # 将预测轨迹抬高以显示在上方（比真实轨迹更高以保证覆盖）
+            offset_p = 0.035 * z_range
+            xs_p = smooth_p[:, 0]
+            ys_p = smooth_p[:, 1]
+            zs_plot_p = zs_p + offset_p
+            # 预测轨迹底层柔和阴影
+            try:
+                line_shadow_p = Line3D(xs_p, ys_p, zs_plot_p, color=(0, 0, 0, 0.12), linewidth=8.0, solid_capstyle='round')
+                line_shadow_p.set_zorder(30)
+                ax.add_line(line_shadow_p)
+            except Exception:
+                ax.plot(xs_p, ys_p, zs_plot_p, color=(0, 0, 0, 0.12), linewidth=8.0, zorder=30)
+            # 主预测线（更粗以突出）
+            try:
+                line_main_p = Line3D(xs_p, ys_p, zs_plot_p, color=pred_color, linewidth=4.2, solid_capstyle='round')
+                line_main_p.set_zorder(40)
+                ax.add_line(line_main_p)
+            except Exception:
+                ax.plot(xs_p, ys_p, zs_plot_p, color=pred_color, linewidth=4.2, zorder=40)
+            # 起点/终点标记（菱形以示区别）
+            if xs_p.size > 0:
+                ax.scatter(xs_p[0], ys_p[0], zs_plot_p[0], color=pred_color, s=180, marker='D', edgecolors='k', linewidths=1.0, zorder=7)
+                ax.scatter(xs_p[-1], ys_p[-1], zs_plot_p[-1], color=pred_color, s=180, marker='D', edgecolors='k', linewidths=1.0, zorder=7)
+        except Exception:
+            pass
+
     # # 尝试全窗口显示（兼容不同后端）
     # try:
     #     mng = plt.get_current_fig_manager()
@@ -234,4 +459,60 @@ if __name__ == "__main__":
     normal_y = map_tensor[:, :, 2]  # 法向量 y 分量 (H, W)
     normal_z = map_tensor[:, :, 3]  # 法向量 z 分量 (H, W)
 
-    plot_terrain(elevation, normal_x, normal_y, normal_z)
+    # 尝试加载一条训练样本轨迹（path_*.p），若不存在则只绘制地形
+    true_traj = None
+    pred_traj = None
+    try:
+        # 选择一个示例路径编号（可修改为所需编号）
+        example_paths = [30, 47, 48, 49, 44, 45]
+        chosen = example_paths[0]
+        path_file = osp.join(env_path, f'path_{chosen}.p')
+        with open(path_file, 'rb') as pf:
+            path_data = pickle.load(pf)
+            true_traj = np.asarray(path_data.get('path', None))
+    except Exception:
+        # 若加载失败，保持 true_traj 为 None
+        true_traj = None
+
+    # 尝试使用已有的 eval_model_uneven.get_patch 来生成预测轨迹（若依赖缺失则跳过）
+    try:
+        import torch
+        import json
+        from eval_model_uneven import get_patch
+        from transformer import Models
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        modelFolder = 'data/uneven'
+        modelFile = osp.join(modelFolder, f'model_params.json')
+        if osp.exists(modelFile):
+            model_param = json.load(open(modelFile))
+            transformer = Models.UnevenTransformer(**model_param)
+            transformer = transformer.to(device)
+            # 尝试加载常见检查点文件（stage2 优先）
+            ckpt = None
+            for stage in (2, 1):
+                fname = osp.join(modelFolder, f'stage{stage}_model_epoch_79.pkl')
+                if osp.exists(fname):
+                    try:
+                        ckpt = torch.load(fname, map_location=device)
+                        break
+                    except Exception:
+                        ckpt = None
+            if ckpt is not None and 'state_dict' in ckpt:
+                transformer.load_state_dict(ckpt['state_dict'])
+                transformer.eval()
+                # 若有 true_traj，则用其起终点做一次推理，否则跳过
+                if true_traj is not None and len(true_traj) >= 2:
+                    start_pose = true_traj[0]
+                    goal_pose = true_traj[-1]
+                    try:
+                        _, _, pred = get_patch(transformer, start_pose, goal_pose, normal_x, normal_y, normal_z)
+                        # pred 可能是 list of tuples
+                        pred_traj = np.asarray(pred)
+                    except Exception:
+                        pred_traj = None
+    except Exception:
+        pred_traj = None
+
+    plot_terrain(elevation, normal_x, normal_y, normal_z, pred_traj=pred_traj, true_traj=true_traj)
