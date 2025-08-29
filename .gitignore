@@ -9,6 +9,8 @@ vit-pytorch/**
 pytorch-receptive-field/**
 torch_receptive_field/**
 ompl
+causal-conv1d/
+mamba-1p1p1/
 
 # data files
 data/**

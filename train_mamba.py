@@ -1,5 +1,5 @@
 """
-train_uneven.py - 训练不平坦地面路径预测模型
+train_mamba.py - 训练不平坦地面路径预测模型
 """
 
 import numpy as np
@@ -7,6 +7,9 @@ import pickle
 
 import torch
 import torch.optim as optim
+
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import json
 import argparse
@@ -17,7 +20,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from os import path as osp
 
-from transformer import Models, Optim
+from vision_mamba import Models, Optim
 from dataLoader_uneven import UnevenPathDataLoader, PaddedSequence
 from dataLoader_uneven import hashTable, receptive_field
 
@@ -62,11 +65,11 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
         loss_weights = {
             'classification': 1e-2,  # 第一阶段专注轨迹回归
             'regression': 3e-5,
-            'uniformity': 3e-5,
-            'angle': 3e-5,
+            'uniformity': 7e-5,
+            'angle': 8e-5,
             'smoothness': 1e-5,
             'capsize': 0e-2,
-            'curvature': 1e-6,
+            'curvature': 1e-5,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
     else:
@@ -872,15 +875,14 @@ if __name__ == "__main__":
     # )
     
     model_args = dict(        # 定义模型参数字典
-        n_layers=6,           # Transformer编码器层数：6层
-        n_heads=8,            # 多头注意力的头数：3->8个头
-        d_k=192,              # Key向量的维度：512->192
-        d_v=96,               # Value向量的维度：256->96
+        n_layers=12,          # Mamba编码器层数：12层
+        d_state=16,           # Mamba状态维度：16
+        dt_rank=32,           # 动态张量分解秩：32
         d_model=512,          # 模型的主要特征维度：512
-        d_inner=1024,         # 前馈网络的隐藏层维度：1024
         pad_idx=None,         # 填充标记的索引：无
         n_position=15*15,     # 支持的最大位置数：225(15×15)
         dropout=0.1,          # Dropout概率：0.1
+        drop_path=0.25,        # DropPath概率：0.3
         train_shape=[12, 12], # 训练时的地图形状：12×12
         output_dim=10,        # 输出维度：10
     )
@@ -966,8 +968,8 @@ if __name__ == "__main__":
         stage1_optimizer = Optim.ScheduledOptim(
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
-            # lr_mul = 0.1,
-            lr_mul = 1e-2,
+            lr_mul = 0.1,
+            # lr_mul = 3e-2,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200

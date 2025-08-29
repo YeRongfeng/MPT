@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from transformer.Layers import EncoderLayer, DecoderLayer, PoseWiseEncoderLayer
+from vision_mamba.Layers import EncoderLayer, DecoderLayer, PoseWiseEncoderLayer
 
 from einops.layers.torch import Rearrange
 from einops import rearrange
@@ -298,7 +298,7 @@ class PositionalEncoding(nn.Module):
         # 从完整的哈希索引表中切片出训练尺寸的矩形区域
         selectIndex = rearrange(
             self.hashIndex[:train_shape[0], :train_shape[1]],  # 从哈希表中切片选择训练尺寸的矩形区域：前train_shape[0]行，前train_shape[1]列
-            'h w -> (h w)'  # 将2D坐标索引展平为1D序列：使用einops将2D索引矩阵重排为1D向量
+            'h w -> (h w)'  # 将2D坐标索引展平为1D序列索引：使用einops将2D索引矩阵重排为1D向量
         )
         
         # 【步骤2】根据索引提取对应的位置编码
@@ -1009,7 +1009,7 @@ class Decoder(nn.Module):
                 for _ in range(n_layers)  # 重复n_layers次，构建深层解码器
             ]
         )
-        self.layer_norm  = nn.LayerNorm(d_model, eps=1e-6)  # 层归一化：标准化输入分布，稳定训练
+        self.norm_f  = nn.LayerNorm(d_model, eps=1e-6)  # 层归一化：标准化输入分布，稳定训练
         self.d_model = d_model  # 保存模型维度：用于后续计算和验证
 
     def forward(self, cur_patch, cur_patch_seq, enc_output):
@@ -1051,7 +1051,7 @@ class Decoder(nn.Module):
                     内容：当前patch对全局地图各位置的注意力分布
                     用途：可视化分析和模型解释
         
-        【技术实现】
+        【技术实现细节】
         1. 特征提取阶段：
            - 卷积网络提取patch的局部特征
            - 维度变换适配解码器输入格式
@@ -1078,7 +1078,7 @@ class Decoder(nn.Module):
 
         dec_output = self.dropout(dec_output)  # 应用Dropout：随机置零部分特征，防止过拟合
 
-        dec_output = self.layer_norm(dec_output)  # 层归一化：标准化特征分布，为后续解码器层提供稳定输入
+        dec_output = self.norm_f(dec_output)  # 层归一化：标准化特征分布，为后续解码器层提供稳定输入
         for dec_layer in self.layer_stack:  # 遍历所有解码器层
             dec_output, dec_enc_attn = dec_layer(dec_output, enc_output)  # 通过解码器层：应用自注意力和交叉注意力，返回解码输出和编码器-解码器注意力权重
         return dec_output,  # 返回解码器输出，逗号表示返回单元素元组
@@ -1150,10 +1150,11 @@ class Transformer(nn.Module):
             d_v (int): Value向量的维度
                 设置：通常与d_k相等
                 用途：决定注意力输出的特征维度
+                优化：可以与d_k不同以调节模型容量
             d_model (int): 模型的主要特征维度
-                范围：通常256, 512, 1024等2的幂次
+                范围：通常256, 512, 1024等
                 作用：决定模型的整体表达能力
-                注意：必须与分类头的输入维度匹配
+                约束：必须与编码器的d_model一致
             d_inner (int): 前馈网络的隐藏层维度
                 设置：通常为d_model的2-4倍
                 作用：在注意力层之间提供非线性变换
@@ -1165,7 +1166,7 @@ class Transformer(nn.Module):
             dropout (float): Dropout概率
                 范围：0.0-0.5，通常0.1-0.3
                 作用：防止过拟合，提升泛化能力
-                调优：根据数据量和模型复杂度调整
+                调优：可根据数据量和模型复杂度调整
             n_position (int): 支持的最大位置数
                 计算：max_height × max_width
                 限制：决定模型能处理的最大地图尺寸
@@ -1260,7 +1261,7 @@ class Transformer(nn.Module):
         2. 预测阶段：
            - 通过分类头将特征映射为类别概率
            - 使用1×1卷积实现高效的逐位置分类
-           - 维度变换适配输出格式要求
+           - 维度变换适配输出格式
         
         3. 格式整理：
            - 记录原始批量大小
@@ -1323,12 +1324,12 @@ class SE2Transformer(Transformer):
     """
     
     
-class UnevenTransformer(Transformer):
+class UnevenTransformer(nn.Module):
     """
     UnevenTransformer - 用于处理不平坦地面路径规划的Transformer变体
     """
     
-    def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, pad_idx, dropout, n_position, train_shape, output_dim=10):
+    def __init__(self, n_layers, d_state, dt_rank, d_model, pad_idx, dropout, drop_path, n_position, train_shape, output_dim=10):
         """
         初始化不平坦地面路径规划的Transformer模型
 
@@ -1354,7 +1355,8 @@ class UnevenTransformer(Transformer):
             train_shape (tuple): 训练时的地图形状
             output_dim (int): 分类头输出的类别数, 默认为10, 进行n步的预测 
         """
-        super().__init__(n_layers, n_heads, d_k, d_v, d_model, d_inner, pad_idx, dropout, n_position, train_shape)
+        super().__init__()
+        # super().__init__(n_layers, n_heads, d_k, d_v, d_model, d_inner, pad_idx, dropout, n_position, train_shape)
 
         # # 重新定义编码器的CNN特征提取部分，以适应不平坦地面的4通道输入
         # self.encoder.to_patch_embedding = nn.Sequential(
@@ -1399,37 +1401,30 @@ class UnevenTransformer(Transformer):
         # )
         
         # # 重新定义编码器的CNN特征提取部分
-        self.encoder = UnevenEncoder(  # 使用自定义的UnevenEncoder处理不平坦地面的输入
+        # self.encoder = UnevenEncoder(  # 使用自定义的UnevenEncoder处理不平坦地面的输入
+        #     n_layers=n_layers,  # 编码器层数：控制模型深度和表达能力
+        #     n_heads=n_heads,  # 多头注意力头数：并行处理不同类型的空间关系
+        #     d_k=d_k,  # Key向量维度：决定注意力计算精度
+        #     d_v=d_v,  # Value向量维度：决定注意力输出特征维度
+        #     d_model=d_model,  # 模型主维度：整体特征表示的维度
+        #     d_inner=d_inner,  # 前馈网络隐藏层维度：提供非线性变换能力
+        #     pad_idx=pad_idx,  # 填充索引：处理变长序列的填充标记
+        #     dropout=dropout,  # Dropout概率：防止过拟合的正则化参数
+        #     n_position=n_position,  # 最大位置数：支持的地图尺寸上限
+        #     train_shape=train_shape  # 训练形状：优化训练时的内存使用
+        # )
+        
+        self.encoder = VimEncoder(  # 使用自定义的VimEncoder处理不平坦地面的输入
             n_layers=n_layers,  # 编码器层数：控制模型深度和表达能力
-            n_heads=n_heads,  # 多头注意力头数：并行处理不同类型的空间关系
-            d_k=d_k,  # Key向量维度：决定注意力计算精度
-            d_v=d_v,  # Value向量维度：决定注意力输出特征维度
+            d_state=d_state,
+            dt_rank=dt_rank,
             d_model=d_model,  # 模型主维度：整体特征表示的维度
-            d_inner=d_inner,  # 前馈网络隐藏层维度：提供非线性变换能力
             pad_idx=pad_idx,  # 填充索引：处理变长序列的填充标记
             dropout=dropout,  # Dropout概率：防止过拟合的正则化参数
+            drop_path=drop_path,
             n_position=n_position,  # 最大位置数：支持的地图尺寸上限
             train_shape=train_shape  # 训练形状：优化训练时的内存使用
         )
-        
-        # self.encoder = SwinTransformer(
-        #     img_size=200,
-        #     patch_size=4,
-        #     in_chans=6,   # 输入通道数
-        #     embed_dim=d_model,
-        #     depths=[2, 2, 6, 2],  # 各阶段的层数
-        #     num_heads=n_heads,
-        #     window_size=7,
-        #     mlp_ratio=4.0,
-        #     qkv_bias=True,
-        #     drop_rate=dropout,
-        #     attn_drop_rate=dropout,
-        #     drop_path_rate=0.1,
-        #     norm_layer=nn.LayerNorm,
-        #     ape=False,
-        #     patch_norm=True,
-        #     use_checkpoint=False
-        # )
         
         # 输出层归一化
         # self.layer_norm = nn.LayerNorm(d_model)
@@ -1530,247 +1525,152 @@ class UnevenTransformer(Transformer):
         correction_reshaped = rearrange(correction_sigmoid, '(b c) (n d) -> b c n d', b=batch_size, n=3)
         # return seq_logit_softmax, correction_reshaped, yaw_logits_agg  # 返回分类预测结果和位置修正预测结果
         return seq_logit_softmax, correction_reshaped  # 返回分类预测结果和位置修正预测结果
-    
-    
-## -----------------------------------------------
-
-import torch
-from torch import nn, einsum
-import numpy as np
-from einops import rearrange, repeat
 
 
-class CyclicShift(nn.Module):
-    def __init__(self, displacement):
+# ----------------------------------------------- #
+from vim.models_mamba import create_block
+from timm.models.layers import DropPath
+
+class VimEncoder(nn.Module):
+    """    
+    基于 ViM / VisionMamba 思路的编码器：使用 model.py 中的 VisionEncoderMambaBlock（zeta.nn.SSM）
+    """
+    def __init__(self, n_layers, d_state, dt_rank, d_model, pad_idx, dropout, drop_path, n_position, train_shape):
         super().__init__()
-        self.displacement = displacement
-
-    def forward(self, x):
-        return torch.roll(x, shifts=(self.displacement, self.displacement), dims=(1, 2))
-
-
-class Residual(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) + x
-
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
-
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim),
+        
+        # CNN特征提取 (保持不变)
+        self.map_fe = nn.Sequential(
+            nn.Conv2d(6, d_model//8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//8),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            nn.Conv2d(d_model//8, d_model//4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//4),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            nn.Conv2d(d_model//4, d_model//2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model//2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            
+            nn.Conv2d(d_model//2, d_model, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model),
+            nn.ReLU(),
+            nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
+            nn.BatchNorm2d(d_model),
+            nn.ReLU(),
         )
+        
+        # c1, c2, c3 = d_model//8, d_model//4, d_model//2
+        # self.map_fe = nn.Sequential(
+        #     # 100->50
+        #     nn.Conv2d(6, c1, kernel_size=3, padding=1, stride=1),
+        #     nn.BatchNorm2d(c1), nn.ReLU(),
+        #     nn.MaxPool2d(2),
 
-    def forward(self, x):
-        return self.net(x)
+        #     # 50->25
+        #     nn.Conv2d(c1, c1, 3, padding=1, stride=1),
+        #     nn.BatchNorm2d(c1), nn.ReLU(),
+        #     nn.Conv2d(c1, c2, 3, padding=1, stride=2),
+        #     nn.BatchNorm2d(c2), nn.ReLU(),
 
+        #     # 25->12
+        #     nn.Conv2d(c2, c2, 3, padding=1, stride=1),
+        #     nn.BatchNorm2d(c2), nn.ReLU(),
+        #     nn.Conv2d(c2, c2, 3, padding=1, stride=1),
+        #     nn.BatchNorm2d(c2), nn.ReLU(),
+        #     nn.MaxPool2d(2),
+            
+        #     nn.Conv2d(c2, d_model, 1),  # project to d_model
+        #     nn.BatchNorm2d(d_model), nn.ReLU()
+        # )
 
-def create_mask(window_size, displacement, upper_lower, left_right):
-    mask = torch.zeros(window_size ** 2, window_size ** 2)
+        self.reorder_dims = Rearrange('b c h w -> b (h w) c')
 
-    if upper_lower:
-        mask[-displacement * window_size:, :-displacement * window_size] = float('-inf')
-        mask[:-displacement * window_size, -displacement * window_size:] = float('-inf')
+        # 位置编码 (保持不变)
+        self.position_enc = PositionalEncoding(d_model, n_position=n_position, train_shape=train_shape)
+        self.dropout = nn.Dropout(p=dropout)
+        
+        self.input_ln = nn.LayerNorm(d_model, eps=1e-6)
+        
+        # ViM 参数配置（使用 VisionEncoderMambaBlock）
+        # ssm_cfg = {'dt_rank': dt_rank}
+        ssm_cfg = None
+        dpr = [x.item() for x in torch.linspace(0, drop_path, n_layers)]  # drop path rate
+        inter_dpr = [0.0] + dpr
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    if left_right:
-        mask = rearrange(mask, '(h1 w1) (h2 w2) -> h1 w1 h2 w2', h1=window_size, h2=window_size)
-        mask[:, -displacement:, :, :-displacement] = float('-inf')
-        mask[:, :-displacement, :, -displacement:] = float('-inf')
-        mask = rearrange(mask, 'h1 w1 h2 w2 -> (h1 w1) (h2 w2)')
+        # 设置必要的参数
+        norm_epsilon = 1e-5
+        rms_norm = True
+        residual_in_fp32 = True
+        fused_add_norm = True
+        if_bimamba = True
+        bimamba_type = "v2"
+        if_divide_out = True
+        init_layer_scale = None
+        factory_kwargs = {"device": None, "dtype": None}
+        
+        # 使用 VisionEncoderMambaBlock 作为每一层的核心块
+        self.layers = nn.ModuleList([
+            create_block(
+                d_model=d_model,
+                d_state=d_state,
+                ssm_cfg=ssm_cfg,
+                norm_epsilon=norm_epsilon,
+                rms_norm=rms_norm,
+                residual_in_fp32=residual_in_fp32,
+                fused_add_norm=fused_add_norm,
+                layer_idx=i,
+                if_bimamba=if_bimamba,
+                bimamba_type=bimamba_type,
+                drop_path=inter_dpr[i],
+                if_divide_out=if_divide_out,
+                init_layer_scale=init_layer_scale,
+                **factory_kwargs,
+            )
+            for i in range(n_layers)
+        ])
+        
+        # 输出归一化
+        self.norm_f = nn.LayerNorm(d_model, eps=1e-5)
+        
+    def forward(self, input_map, returns_attns=False):
+        # CNN特征提取
+        map_feat = self.map_fe(input_map)  # [B, D, Hf, Wf]
+        conv_map_shape = map_feat.shape[-2:]
+        map_tokens = self.reorder_dims(map_feat)                 # [B, N_map, D]
+        
+        # 简单断言：确保 token 维度与 block 期望一致，若不一致在早期报错以便定位
+        if len(self.layers) > 0:
+            expected_dim = getattr(self.layers[0], "dim", None)
+            if expected_dim is not None and map_tokens.shape[-1] != expected_dim:
+                raise RuntimeError(f"Feature dim mismatch: map_tokens.dim={map_tokens.shape[-1]} but block.dim={expected_dim}. "
+                                   "请检查 d_model / block 配置。")
 
-    return mask
-
-
-def get_relative_distances(window_size):
-    indices = torch.tensor(np.array([[x, y] for x in range(window_size) for y in range(window_size)]))
-    distances = indices[None, :, :] - indices[:, None, :]
-    return distances
-
-
-class WindowAttention(nn.Module):
-    def __init__(self, dim, heads, head_dim, shifted, window_size, relative_pos_embedding):
-        super().__init__()
-        inner_dim = head_dim * heads
-
-        self.heads = heads
-        self.scale = head_dim ** -0.5
-        self.window_size = window_size
-        self.relative_pos_embedding = relative_pos_embedding
-        self.shifted = shifted
-
-        if self.shifted:
-            displacement = window_size // 2
-            self.cyclic_shift = CyclicShift(-displacement)
-            self.cyclic_back_shift = CyclicShift(displacement)
-            self.upper_lower_mask = nn.Parameter(create_mask(window_size=window_size, displacement=displacement,
-                                                             upper_lower=True, left_right=False), requires_grad=False)
-            self.left_right_mask = nn.Parameter(create_mask(window_size=window_size, displacement=displacement,
-                                                            upper_lower=False, left_right=True), requires_grad=False)
-
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
-
-        if self.relative_pos_embedding:
-            self.relative_indices = get_relative_distances(window_size) + window_size - 1
-            self.pos_embedding = nn.Parameter(torch.randn(2 * window_size - 1, 2 * window_size - 1))
-        else:
-            self.pos_embedding = nn.Parameter(torch.randn(window_size ** 2, window_size ** 2))
-
-        self.to_out = nn.Linear(inner_dim, dim)
-
-    def forward(self, x):
-        if self.shifted:
-            x = self.cyclic_shift(x)
-
-        b, n_h, n_w, _, h = *x.shape, self.heads
-
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        nw_h = n_h // self.window_size
-        nw_w = n_w // self.window_size
-
-        q, k, v = map(
-            lambda t: rearrange(t, 'b (nw_h w_h) (nw_w w_w) (h d) -> b h (nw_h nw_w) (w_h w_w) d',
-                                h=h, w_h=self.window_size, w_w=self.window_size), qkv)
-
-        dots = einsum('b h w i d, b h w j d -> b h w i j', q, k) * self.scale
-
-        if self.relative_pos_embedding:
-            dots += self.pos_embedding[self.relative_indices[:, :, 0], self.relative_indices[:, :, 1]]
-        else:
-            dots += self.pos_embedding
-
-        if self.shifted:
-            dots[:, :, -nw_w:] += self.upper_lower_mask
-            dots[:, :, nw_w - 1::nw_w] += self.left_right_mask
-
-        attn = dots.softmax(dim=-1)
-
-        out = einsum('b h w i j, b h w j d -> b h w i d', attn, v)
-        out = rearrange(out, 'b h (nw_h nw_w) (w_h w_w) d -> b (nw_h w_h) (nw_w w_w) (h d)',
-                        h=h, w_h=self.window_size, w_w=self.window_size, nw_h=nw_h, nw_w=nw_w)
-        out = self.to_out(out)
-
-        if self.shifted:
-            out = self.cyclic_back_shift(out)
-        return out
-
-
-class SwinBlock(nn.Module):
-    def __init__(self, dim, heads, head_dim, mlp_dim, shifted, window_size, relative_pos_embedding):
-        super().__init__()
-        self.attention_block = Residual(PreNorm(dim, WindowAttention(dim=dim,
-                                                                     heads=heads,
-                                                                     head_dim=head_dim,
-                                                                     shifted=shifted,
-                                                                     window_size=window_size,
-                                                                     relative_pos_embedding=relative_pos_embedding)))
-        self.mlp_block = Residual(PreNorm(dim, FeedForward(dim=dim, hidden_dim=mlp_dim)))
-
-    def forward(self, x):
-        x = self.attention_block(x)
-        x = self.mlp_block(x)
-        return x
-
-
-class PatchMerging(nn.Module):
-    def __init__(self, in_channels, out_channels, downscaling_factor):
-        super().__init__()
-        self.downscaling_factor = downscaling_factor
-        self.patch_merge = nn.Unfold(kernel_size=downscaling_factor, stride=downscaling_factor, padding=0)
-        self.linear = nn.Linear(in_channels * downscaling_factor ** 2, out_channels)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        new_h, new_w = h // self.downscaling_factor, w // self.downscaling_factor
-        x = self.patch_merge(x).view(b, -1, new_h, new_w).permute(0, 2, 3, 1)
-        x = self.linear(x)
-        return x
-
-
-class StageModule(nn.Module):
-    def __init__(self, in_channels, hidden_dimension, layers, downscaling_factor, num_heads, head_dim, window_size,
-                 relative_pos_embedding):
-        super().__init__()
-        assert layers % 2 == 0, 'Stage layers need to be divisible by 2 for regular and shifted block.'
-
-        self.patch_partition = PatchMerging(in_channels=in_channels, out_channels=hidden_dimension,
-                                            downscaling_factor=downscaling_factor)
-
-        self.layers = nn.ModuleList([])
-        for _ in range(layers // 2):
-            self.layers.append(nn.ModuleList([
-                SwinBlock(dim=hidden_dimension, heads=num_heads, head_dim=head_dim, mlp_dim=hidden_dimension * 4,
-                          shifted=False, window_size=window_size, relative_pos_embedding=relative_pos_embedding),
-                SwinBlock(dim=hidden_dimension, heads=num_heads, head_dim=head_dim, mlp_dim=hidden_dimension * 4,
-                          shifted=True, window_size=window_size, relative_pos_embedding=relative_pos_embedding),
-            ]))
-
-    def forward(self, x):
-        x = self.patch_partition(x)
-        for regular_block, shifted_block in self.layers:
-            x = regular_block(x)
-            x = shifted_block(x)
-        return x.permute(0, 3, 1, 2)
-
-
-class SwinTransformer(nn.Module):
-    def __init__(self, *, hidden_dim, layers, heads, channels=3, num_classes=1000, head_dim=32, window_size=7,
-                 downscaling_factors=(4, 2, 2, 2), relative_pos_embedding=True):
-        super().__init__()
-
-        self.stage1 = StageModule(in_channels=channels, hidden_dimension=hidden_dim, layers=layers[0],
-                                  downscaling_factor=downscaling_factors[0], num_heads=heads[0], head_dim=head_dim,
-                                  window_size=window_size, relative_pos_embedding=relative_pos_embedding)
-        self.stage2 = StageModule(in_channels=hidden_dim, hidden_dimension=hidden_dim * 2, layers=layers[1],
-                                  downscaling_factor=downscaling_factors[1], num_heads=heads[1], head_dim=head_dim,
-                                  window_size=window_size, relative_pos_embedding=relative_pos_embedding)
-        self.stage3 = StageModule(in_channels=hidden_dim * 2, hidden_dimension=hidden_dim * 4, layers=layers[2],
-                                  downscaling_factor=downscaling_factors[2], num_heads=heads[2], head_dim=head_dim,
-                                  window_size=window_size, relative_pos_embedding=relative_pos_embedding)
-        self.stage4 = StageModule(in_channels=hidden_dim * 4, hidden_dimension=hidden_dim * 8, layers=layers[3],
-                                  downscaling_factor=downscaling_factors[3], num_heads=heads[3], head_dim=head_dim,
-                                  window_size=window_size, relative_pos_embedding=relative_pos_embedding)
-
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 8),
-            nn.Linear(hidden_dim * 8, num_classes)
-        )
-
-    def forward(self, img):
-        x = self.stage1(img)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
-        x = x.mean(dim=[2, 3])
-        return self.mlp_head(x)
-
-
-def swin_t(hidden_dim=96, layers=(2, 2, 6, 2), heads=(3, 6, 12, 24), **kwargs):
-    return SwinTransformer(hidden_dim=hidden_dim, layers=layers, heads=heads, **kwargs)
-
-
-def swin_s(hidden_dim=96, layers=(2, 2, 18, 2), heads=(3, 6, 12, 24), **kwargs):
-    return SwinTransformer(hidden_dim=hidden_dim, layers=layers, heads=heads, **kwargs)
-
-
-def swin_b(hidden_dim=128, layers=(2, 2, 18, 2), heads=(4, 8, 16, 32), **kwargs):
-    return SwinTransformer(hidden_dim=hidden_dim, layers=layers, heads=heads, **kwargs)
-
-
-def swin_l(hidden_dim=192, layers=(2, 2, 18, 2), heads=(6, 12, 24, 48), **kwargs):
-    return SwinTransformer(hidden_dim=hidden_dim, layers=layers, heads=heads, **kwargs)
+        # 位置编码
+        map_tokens = self.position_enc(map_tokens, conv_shape=conv_map_shape if not self.training else None)
+        map_tokens = self.dropout(map_tokens)
+        
+        map_tokens = self.input_ln(map_tokens)
+        
+        # 使用 zeta.nn.SSM 的块逐层处理 (VisionEncoderMambaBlock 的 forward 已实现 SSM 两向处理)
+        # for layer in self.layers:
+        #     map_tokens = layer(map_tokens)
+        
+        for layer in self.layers:
+            out = layer(map_tokens)
+            # 兼容上游 layer 可能返回 (hidden_states, residual) 或类似 tuple
+            if isinstance(out, (tuple, list)):
+                if len(out) == 0:
+                    raise RuntimeError("Encoder layer returned empty tuple/list")
+                map_tokens = out[0]
+            else:
+                map_tokens = out
+        
+        # 最终归一化（保持与原来接口一致）
+        map_tokens = self.norm_f(map_tokens.to(dtype=self.norm_f.weight.dtype))
+            
+        return map_tokens

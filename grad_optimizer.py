@@ -352,10 +352,26 @@ class TrajectoryOptimizerSE2:
         
         # --- 成本项 ---
         
-        # a) 占据/碰撞成本
+        # a) 占据/碰撞成本（occupancy_map 现在保存的是带符号的 ESDF，单位：米）
         dense_traj_world = torch.stack([Sx, Sy, Syaw], dim=1)
-        grid_coords = self.world_to_grid_normalized(dense_traj_world)
-        occupancy_values = F.grid_sample(self.occupancy_map, grid_coords, mode='bilinear', padding_mode='border', align_corners=True)
+        grid_coords = self.world_to_grid_normalized(dense_traj_world)  # [1, K, 1, 1, 3]
+
+        # 先在连续坐标上对 ESDF 做插值，再把插值后的距离映射为 cost（sigmoid）
+        esdf_sample = F.grid_sample(
+            self.occupancy_map,    # shape [1,1,D,H,W], 内容为 signed ESDF (m)
+            grid_coords,           # [1, K, 1, 1, 3]
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True
+        )  # 输出形状类似 [1,1,K,1,1]
+
+        esdf_flat = esdf_sample.reshape(-1)   # (K,) —— 插值后的 ESDF 值（米）
+
+        d_safe = 0.15  # 安全距离阈值（米）
+        kalpa = 0.08   # 平滑参数（米）
+        z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
+        occupancy_values = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
+
         obstacle_cost = torch.mean(occupancy_values)
         
         # # --- a) 占据/碰撞成本（替换开始） ---
@@ -532,8 +548,8 @@ class TrajectoryOptimizerSE2:
         # --- 组合成本 ---
         weights = {
             'obstacle': 1e1,
-            'smoothness': 1e-4,
-            'curvature': 5e2,
+            'smoothness': 1e-2,
+            'curvature': 1e3,
             'yaw_per_meter': 0e2, # 惩罚原地大角度转动的权重
             'control': 1e-2,
             'angle_diff': 5e2, # 惩罚角度与切线方向不一致的权重
@@ -572,7 +588,18 @@ class TrajectoryOptimizerSE2:
         # occupancy / obstacle cost
         dense_traj_world = torch.stack([Sx, Sy, Syaw], dim=1)
         grid_coords = self.world_to_grid_normalized(dense_traj_world)
-        occupancy_values = F.grid_sample(self.occupancy_map, grid_coords, mode='bilinear', padding_mode='border', align_corners=True)
+        esdf_sample = F.grid_sample(
+            self.occupancy_map,
+            grid_coords,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True
+        )
+        esdf_flat = esdf_sample.reshape(-1)
+        d_safe = 0.15
+        kalpa = 0.08
+        z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
+        occupancy_values = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
         obstacle_cost = torch.mean(occupancy_values)
 
         # smoothness
@@ -646,16 +673,28 @@ class TrajectoryOptimizerSE2:
         #     'out_of_bounds': 1e8,
         # }
         
+        # weights = {
+        #     'obstacle': 1e1,
+        #     'smoothness': 1e-4,
+        #     'curvature': 5e2,
+        #     'yaw_per_meter': 1e2,
+        #     'control': 1e-2,
+        #     'angle_diff': 1e4,
+        #     'endpoints': 1e4,
+        #     'control_smoothness': 0e3,
+        #     'out_of_bounds': 1e8,
+        # }
+        
         weights = {
             'obstacle': 1e1,
-            'smoothness': 1e-4,
-            'curvature': 5e2,
-            'yaw_per_meter': 1e2,
+            'smoothness': 1e-2,
+            'curvature': 1e3,
+            'yaw_per_meter': 0e2, # 惩罚原地大角度转动的权重
             'control': 1e-2,
-            'angle_diff': 1e4,
-            'endpoints': 1e4,
-            'control_smoothness': 0e3,
-            'out_of_bounds': 1e8,
+            'angle_diff': 5e2, # 惩罚角度与切线方向不一致的权重
+            'endpoints': 1e4,    # 强力惩罚端点 yaw 对齐
+            'control_smoothness': 0e3,  # 控制点连线的光滑性损失
+            'out_of_bounds': 1e8,  # 超出地图范围的惩罚
         }
 
         total_cost = (
@@ -946,7 +985,7 @@ if __name__ == "__main__":
     env_list = ['env000012']
     dataFolder = '/home/yrf/MPT/data/terrain/train'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
-    path_index = 32    
+    path_index = 18
     sample = dataset[path_index]
     if sample is None:
         raise ValueError(f"Sample at index {path_index} is invalid.")
@@ -1307,4 +1346,11 @@ if __name__ == "__main__":
     ax4.grid(True); ax4.set_yscale('log')
 
     plt.tight_layout()
+    
+    # savefig
+    fig1.savefig(f'figure_1_trajectory_comparison_{path_index}.png', dpi=300)
+    fig2.savefig(f'figure_2_3d_manifold_{path_index}.png', dpi=300)
+    fig3.savefig(f'figure_3_resampled_vs_optimized_{path_index}.png', dpi=300)
+    fig4.savefig(f'figure_4_cost_convergence_{path_index}.png', dpi=300)
+    
     plt.show()

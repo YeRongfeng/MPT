@@ -167,7 +167,7 @@ def PaddedSequence(batch):
         'labels': torch.stack([batch_i['labels'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'length': torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch]),  # [B,] - 序列长度
         'trajectory': torch.stack([batch_i['trajectory'] for batch_i in valid_batch]),  # [B, N+2, 3]
-        'yaw_stability': torch.stack([batch_i['yaw_stability'] for batch_i in valid_batch]),  # [B, H, W, 36] - yaw分箱倾覆状态
+        # 'yaw_stability': torch.stack([batch_i['yaw_stability'] for batch_i in valid_batch]),  # [B, H, W, 36] - yaw分箱倾覆状态
         'cost_map': torch.stack([batch_i['cost_map'] for batch_i in valid_batch]),  # [B, H, W, yaw_bins] - 成本图
     }
     
@@ -805,6 +805,168 @@ def compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=18):
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
+def generate_sdf_from_yaw_stability(
+    yaw_stability,            # torch.Tensor or np.ndarray, shape (H,W,Y), 1 safe / 0 occupied
+    voxel_size_xy=0.1,
+    yaw_weight=0.2,
+    use_scipy=True,
+):
+    """
+    返回带符号的 ESDF（signed distance）：内部为负，边界为 0，外部为正。
+    与 generate_cost_map_from_yaw_stability 类似，但只返回 esdf（不做 sigmoid / cost 映射）。
+    支持 scipy 快速路径或 PyTorch 退回实现（分块最近邻）。
+    返回类型与输入一致（输入为 torch 则返回 torch.Tensor，否则返回 numpy.ndarray）。
+    """
+    input_is_torch = isinstance(yaw_stability, torch.Tensor)
+    if input_is_torch:
+        device = yaw_stability.device
+        ys = yaw_stability.detach().to('cpu').numpy()
+    else:
+        ys = np.asarray(yaw_stability)
+
+    H, W, Y = ys.shape
+    occupied = (ys <= 0.5)
+
+    if use_scipy:
+        try:
+            from scipy.ndimage import distance_transform_edt
+            delta_theta = 2.0 * math.pi / float(Y)
+            sampling = (voxel_size_xy, voxel_size_xy, yaw_weight * delta_theta)
+
+            # 三倍平铺处理周期性
+            occupied_tiled = np.concatenate([occupied, occupied, occupied], axis=2)  # (H,W,3Y)
+
+            inv = ~occupied_tiled
+            dist_to_occupied = distance_transform_edt(inv, sampling=sampling)
+            dist_to_free = distance_transform_edt(occupied_tiled, sampling=sampling)
+
+            signed_tiled = dist_to_occupied - dist_to_free  # 内部为负，外部为正
+            esdf = signed_tiled[:, :, Y:2*Y].astype(np.float32)  # 取中段
+
+            if input_is_torch:
+                return torch.from_numpy(esdf).to(device=device, dtype=torch.float32)
+            return esdf
+
+        except Exception as e:
+            # 退回到 PyTorch 实现
+            print("WARNING: scipy EDT failed or unavailable, falling back to PyTorch SDF. Error:", e)
+            use_scipy = False
+
+    # PyTorch 退回实现（分块最近邻）
+    if input_is_torch:
+        ys_t = yaw_stability.to(dtype=torch.float32)
+        device = ys_t.device
+    else:
+        ys_t = torch.from_numpy(ys.astype(np.float32))
+
+    occupied_mask = (ys_t <= 0.5)
+    occ_idx = torch.nonzero(occupied_mask, as_tuple=False)  # (M,3)
+    free_idx = torch.nonzero(~occupied_mask, as_tuple=False)  # (F,3)
+    M = occ_idx.shape[0]
+    F = free_idx.shape[0]
+    N = H * W * Y
+
+    # 特殊情况
+    max_xy = math.hypot(H * voxel_size_xy, W * voxel_size_xy)
+    max_yaw = math.pi * yaw_weight
+    max_dist = math.sqrt(max_xy**2 + max_yaw**2) + 1.0
+
+    if M == 0 and F == 0:
+        esdf_map = torch.zeros((H, W, Y), dtype=torch.float32)
+        if input_is_torch:
+            return esdf_map.to(device=device)
+        return esdf_map.cpu().numpy()
+
+    if M == 0:
+        esdf_map = torch.ones((H, W, Y), dtype=torch.float32) * float(max_dist)
+        if input_is_torch:
+            return esdf_map.to(device=device)
+        return esdf_map.cpu().numpy()
+
+    if F == 0:
+        esdf_map = torch.ones((H, W, Y), dtype=torch.float32) * float(-max_dist)
+        if input_is_torch:
+            return esdf_map.to(device=device)
+        return esdf_map.cpu().numpy()
+
+    # 预计算 yaw 投影（与 cost 函数一致）
+    ks = torch.arange(Y, dtype=torch.float32)
+    theta_k = (ks + 0.5) * (2.0 * math.pi / float(Y))
+    yaw_cos = torch.cos(theta_k) * yaw_weight
+    yaw_sin = torch.sin(theta_k) * yaw_weight
+
+    # 构建占据点与空闲点坐标 (x, y, yaw_x, yaw_y)
+    occ_i = occ_idx[:,0].to(dtype=torch.float32)
+    occ_j = occ_idx[:,1].to(dtype=torch.float32)
+    occ_k = occ_idx[:,2].to(dtype=torch.long)
+    occ_x = occ_i * voxel_size_xy
+    occ_y = occ_j * voxel_size_xy
+    occ_yaw_x = yaw_cos[occ_k]
+    occ_yaw_y = yaw_sin[occ_k]
+    occ_coords = torch.stack([occ_x, occ_y, occ_yaw_x, occ_yaw_y], dim=1).to(dtype=torch.float32)
+
+    free_i = free_idx[:,0].to(dtype=torch.float32)
+    free_j = free_idx[:,1].to(dtype=torch.float32)
+    free_k = free_idx[:,2].to(dtype=torch.long)
+    free_x = free_i * voxel_size_xy
+    free_y = free_j * voxel_size_xy
+    free_yaw_x = yaw_cos[free_k]
+    free_yaw_y = yaw_sin[free_k]
+    free_coords = torch.stack([free_x, free_y, free_yaw_x, free_yaw_y], dim=1).to(dtype=torch.float32)
+
+    # 分块计算最小距离
+    chunk_size = 200_000
+    min_dists_occ = torch.empty(N, dtype=torch.float32)
+    min_dists_free = torch.empty(N, dtype=torch.float32)
+    device_coords = occ_coords.device
+
+    if torch.cuda.is_available():
+        occ_coords = occ_coords.cuda()
+        free_coords = free_coords.cuda()
+        device_coords = occ_coords.device
+
+    def idx_to_coords_block(start, end):
+        idxs = torch.arange(start, end, device=device_coords, dtype=torch.long)
+        i = (idxs // (W * Y)).to(torch.float32)
+        rem = idxs % (W * Y)
+        j = (rem // Y).to(torch.float32)
+        k = (rem % Y).to(torch.long)
+        x = i * voxel_size_xy
+        y = j * voxel_size_xy
+        yaw_x = yaw_cos[k].to(device=device_coords)
+        yaw_y = yaw_sin[k].to(device=device_coords)
+        coords_block = torch.stack([x, y, yaw_x, yaw_y], dim=1)
+        return coords_block
+
+    start = 0
+    while start < N:
+        end = min(N, start + chunk_size)
+        coords_block = idx_to_coords_block(start, end)
+
+        if coords_block.device != occ_coords.device:
+            coords_block = coords_block.to(device=occ_coords.device)
+        dists_occ = torch.cdist(coords_block, occ_coords)  # (B, M)
+        min_block_occ, _ = torch.min(dists_occ, dim=1)
+        min_dists_occ[start:end] = min_block_occ.cpu()
+
+        if coords_block.device != free_coords.device:
+            coords_block = coords_block.to(device=free_coords.device)
+        dists_free = torch.cdist(coords_block, free_coords)  # (B, F)
+        min_block_free, _ = torch.min(dists_free, dim=1)
+        min_dists_free[start:end] = min_block_free.cpu()
+
+        start = end
+
+    dist_occ_map = min_dists_occ.view(H, W, Y).to(dtype=torch.float32)
+    dist_free_map = min_dists_free.view(H, W, Y).to(dtype=torch.float32)
+
+    esdf_map = (dist_occ_map - dist_free_map).to(dtype=torch.float32)  # signed ESDF
+
+    if input_is_torch:
+        return esdf_map.to(device=device)
+    else:
+        return esdf_map.cpu().numpy()
+
 def generate_cost_map_from_yaw_stability(
     yaw_stability,            # torch.Tensor or np.ndarray, shape (H,W,Y), 1 safe / 0 occupied
     voxel_size_xy=0.1,
@@ -816,6 +978,7 @@ def generate_cost_map_from_yaw_stability(
 ):
     """
     快速版本：优先使用 scipy.ndimage.distance_transform_edt（C 实现）。
+    结果为带符号距离：内部为负，边界为0，外部为正。
     对 yaw 周期性做三倍平铺处理以正确计算环绕距离。
     """
     # --- 标准化输入 ---
@@ -839,16 +1002,20 @@ def generate_cost_map_from_yaw_stability(
 
             # 三倍平铺以考虑周期性
             occupied_tiled = np.concatenate([occupied, occupied, occupied], axis=2)  # (H,W,3Y)
-            # distance_transform_edt 计算的是到 False (0) 的距离，如果我们要距离到占据点：
-            # 将 occupied_tiled (True占据) 转成 inverted map (False 为占据), 然后 edt gives distance to nearest True in inverted => distance to nearest occupied
-            # 更直接：distance_transform_edt(~occupied_tiled, sampling=...)
+
+            # 计算到占据点的距离（外部距离）和到空闲点的距离（内部距离）
+            # 注意：distance_transform_edt 的输入布尔数组的语义：
+            # distance_transform_edt(input) 计算到 False(0) 的距离。因此：
+            # - inv = ~occupied_tiled -> False 在占据点，distance_transform_edt(inv) 得到到占据点的距离
+            # - distance_transform_edt(occupied_tiled) 得到到空闲点的距离
             inv = ~occupied_tiled
-            dist_tiled = distance_transform_edt(inv, sampling=sampling)  # (H,W,3Y)   dtype: float64
+            dist_to_occupied = distance_transform_edt(inv, sampling=sampling)   # 到占据点（外部为正）
+            dist_to_free = distance_transform_edt(occupied_tiled, sampling=sampling)  # 到空闲（内部为正）
 
-            # 取中间段 (Y : 2Y)
-            esdf = dist_tiled[:, :, Y:2*Y].astype(np.float32)  # (H,W,Y)
+            signed_tiled = dist_to_occupied - dist_to_free  # 内部为负，外部为正
+            esdf = signed_tiled[:, :, Y:2*Y].astype(np.float32)  # (H,W,Y)
 
-            # 计算 cost
+            # 计算 cost（保留原有变换）
             z = (-(esdf - d_safe) / (kalpa + 1e-12))
             z = np.clip(z, -50.0, 50.0)
             costs = 1.0 / (1.0 + np.exp(-z))  # sigmoid
@@ -870,7 +1037,6 @@ def generate_cost_map_from_yaw_stability(
             use_scipy = False
 
     # --- 退回：改良的 PyTorch 分块最近邻（慢但健壮） ---
-    # 此实现是你原来方法的优化版：尽量减少 Python loop, 仍使用 torch.cdist 分块
     if input_is_torch:
         ys_t = yaw_stability.to(dtype=torch.float32)
         device = ys_t.device
@@ -879,15 +1045,49 @@ def generate_cost_map_from_yaw_stability(
 
     occupied_mask = (ys_t <= 0.5)
     occ_idx = torch.nonzero(occupied_mask, as_tuple=False)  # (M,3)
+    free_idx = torch.nonzero(~occupied_mask, as_tuple=False)  # (F,3)
     M = occ_idx.shape[0]
+    F = free_idx.shape[0]
     N = H * W * Y
 
+    # 特殊情况处理：全无占据或全被占据
+    max_xy = math.hypot(H * voxel_size_xy, W * voxel_size_xy)
+    max_yaw = math.pi * yaw_weight
+    max_dist = math.sqrt(max_xy**2 + max_yaw**2) + 1.0
+
+    if M == 0 and F == 0:
+        # 极端不可用情况，返回零地图
+        esdf_map = torch.zeros((H, W, Y), dtype=torch.float32)
+        z = (-(esdf_map - d_safe) / (kalpa + 1e-12))
+        costs = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
+        if input_is_torch:
+            if return_esdf:
+                return costs, esdf_map
+            return costs
+        else:
+            c_np = costs.cpu().numpy()
+            if return_esdf:
+                return c_np, esdf_map.cpu().numpy()
+            return c_np
+
     if M == 0:
-        # 没有占据点 -> 大距离
-        max_xy = math.hypot(H * voxel_size_xy, W * voxel_size_xy)
-        max_yaw = math.pi * yaw_weight
-        max_dist = math.sqrt(max_xy**2 + max_yaw**2) + 1.0
+        # 没有占据点 -> 所有点到占据的距离为大值，到空闲距离为0 => 带符号为 +max_dist
         esdf_map = torch.ones((H, W, Y), dtype=torch.float32) * float(max_dist)
+        z = (-(esdf_map - d_safe) / (kalpa + 1e-12))
+        costs = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
+        if input_is_torch:
+            if return_esdf:
+                return costs, esdf_map
+            return costs
+        else:
+            c_np = costs.cpu().numpy()
+            if return_esdf:
+                return c_np, esdf_map.cpu().numpy()
+            return c_np
+
+    if F == 0:
+        # 全部被占据 -> 到空闲距离为大值，到占据距离为0 => 带符号为 -max_dist
+        esdf_map = torch.ones((H, W, Y), dtype=torch.float32) * float(-max_dist)
         z = (-(esdf_map - d_safe) / (kalpa + 1e-12))
         costs = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
         if input_is_torch:
@@ -906,6 +1106,7 @@ def generate_cost_map_from_yaw_stability(
     yaw_cos = torch.cos(theta_k) * yaw_weight
     yaw_sin = torch.sin(theta_k) * yaw_weight
 
+    # 构建占据点和空闲点的坐标（x, y, yaw_x, yaw_y）
     occ_i = occ_idx[:,0].to(dtype=torch.float32)
     occ_j = occ_idx[:,1].to(dtype=torch.float32)
     occ_k = occ_idx[:,2].to(dtype=torch.long)
@@ -915,13 +1116,24 @@ def generate_cost_map_from_yaw_stability(
     occ_yaw_y = yaw_sin[occ_k]
     occ_coords = torch.stack([occ_x, occ_y, occ_yaw_x, occ_yaw_y], dim=1).to(dtype=torch.float32)
 
-    # 分块遍历所有 N 点，按 chunk_size 控制显存
+    free_i = free_idx[:,0].to(dtype=torch.float32)
+    free_j = free_idx[:,1].to(dtype=torch.float32)
+    free_k = free_idx[:,2].to(dtype=torch.long)
+    free_x = free_i * voxel_size_xy
+    free_y = free_j * voxel_size_xy
+    free_yaw_x = yaw_cos[free_k]
+    free_yaw_y = yaw_sin[free_k]
+    free_coords = torch.stack([free_x, free_y, free_yaw_x, free_yaw_y], dim=1).to(dtype=torch.float32)
+
+    # 分块遍历所有 N 点，按 chunk_size 控制显存，分别计算到占据/到空闲的最小距离
     chunk_size = 200_000  # 可调整
-    min_dists = torch.empty(N, dtype=torch.float32)
+    min_dists_occ = torch.empty(N, dtype=torch.float32)
+    min_dists_free = torch.empty(N, dtype=torch.float32)
     device = occ_coords.device
-    # 如果在GPU上，把 occ_coords 放GPU加速
+    # 如果在GPU上，把 occ_coords/free_coords 放GPU加速
     if torch.cuda.is_available():
         occ_coords = occ_coords.cuda()
+        free_coords = free_coords.cuda()
         device = occ_coords.device
 
     def idx_to_coords_block(start, end):
@@ -941,16 +1153,27 @@ def generate_cost_map_from_yaw_stability(
     while start < N:
         end = min(N, start + chunk_size)
         coords_block = idx_to_coords_block(start, end)
-        # 把 coords_block 与 occ_coords 放在同设备
+        # 把 coords_block 与 occ_coords/free_coords 放在同设备
         if coords_block.device != occ_coords.device:
             coords_block = coords_block.to(device=occ_coords.device)
-        # 计算 cdist 并取最小
-        dists = torch.cdist(coords_block, occ_coords)  # (B, M)
-        min_block, _ = torch.min(dists, dim=1)
-        min_dists[start:end] = min_block.cpu()
+        # 计算到占据点距离并取最小
+        dists_occ = torch.cdist(coords_block, occ_coords)  # (B, M)
+        min_block_occ, _ = torch.min(dists_occ, dim=1)
+        min_dists_occ[start:end] = min_block_occ.cpu()
+
+        # 计算到空闲点距离并取最小
+        if coords_block.device != free_coords.device:
+            coords_block = coords_block.to(device=free_coords.device)
+        dists_free = torch.cdist(coords_block, free_coords)  # (B, F)
+        min_block_free, _ = torch.min(dists_free, dim=1)
+        min_dists_free[start:end] = min_block_free.cpu()
+
         start = end
 
-    esdf_map = min_dists.view(H, W, Y).to(dtype=torch.float32)
+    dist_occ_map = min_dists_occ.view(H, W, Y).to(dtype=torch.float32)
+    dist_free_map = min_dists_free.view(H, W, Y).to(dtype=torch.float32)
+
+    esdf_map = (dist_occ_map - dist_free_map).to(dtype=torch.float32)  # 带符号 ESDF：内部为负，外部为正
     z = (-(esdf_map - d_safe) / (kalpa + 1e-12))
     costs_t = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
 
@@ -1232,13 +1455,18 @@ class UnevenPathDataLoader(Dataset):
         
         # # 5. 计算yaw_bins倾覆状态
         yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
-        cost_map = generate_cost_map_from_yaw_stability(
+        # cost_map = generate_cost_map_from_yaw_stability(
+        #     yaw_stability, 
+        #     voxel_size_xy=0.1, 
+        #     yaw_weight=2.1, 
+        #     d_safe=0.15, 
+        #     kalpa=0.08, 
+        #     return_esdf=False
+        # )
+        sdf_map = generate_sdf_from_yaw_stability(
             yaw_stability, 
             voxel_size_xy=0.1, 
-            yaw_weight=2.1, 
-            d_safe=0.15, 
-            kalpa=0.08, 
-            return_esdf=False
+            yaw_weight=2.1
         )
 
         # 转换为PyTorch张量
@@ -1250,6 +1478,7 @@ class UnevenPathDataLoader(Dataset):
             'labels': labels,  # 锚点标签：(N, M)
             'trajectory': torch.as_tensor(trajectory, dtype=torch.float),  # 轨迹点：[N, 3]
             'yaw_stability': torch.as_tensor(yaw_stability, dtype=torch.float),  # yaw分箱倾覆状态：[H, W, 36]
-            'cost_map': torch.as_tensor(cost_map, dtype=torch.float),  # 成本图：[H, W, yaw_bins]
+            'cost_map': torch.as_tensor(sdf_map, dtype=torch.float),  # 成本图：[H, W, yaw_bins]
+            # 'cost_map': torch.as_tensor(cost_map, dtype=torch.float),  # 成本图：[H, W, yaw_bins]
             'elevation': torch.as_tensor(elevation, dtype=torch.float),  # 高程图：[H, W]
         }
