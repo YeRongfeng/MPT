@@ -345,7 +345,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
 
 if __name__ == "__main__":
     stage = 1
-    epoch = 34
+    epoch = 19
     # stage = 2
     # epoch = 79
     # envType_list = ['desert']

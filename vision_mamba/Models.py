@@ -1531,6 +1531,94 @@ class UnevenTransformer(nn.Module):
 from vim.models_mamba import create_block
 from timm.models.layers import DropPath
 
+class VisionMambaLayer(nn.Module):
+    """
+    单个论文编码单元：x -> (forward conv1d -> forward SSM) & (backward conv1d -> backward SSM) + z path
+    返回 (out, residual) 以兼容现有 Block 接口。
+    """
+    def __init__(self, d_model, d_state, layer_idx, drop_path, ssm_cfg, factory_kwargs, rms_norm, residual_in_fp32, fused_add_norm, if_bimamba, bimamba_type, if_divide_out, init_layer_scale):
+        super().__init__()
+        # pointwise projections (可视作 Conv1d kernel_size=1)
+        self.x_proj_f = nn.Linear(d_model, d_model, bias=False)
+        self.x_proj_b = nn.Linear(d_model, d_model, bias=False)
+        self.z_proj   = nn.Linear(d_model, 1)
+        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(d_model, eps=1e-6)
+        
+        # 映射 fusion -> y（论文图中紫色投影）
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+        # 两个 SSM block（复用 create_block）
+        self.forward_block = create_block(
+            d_model=d_model,
+            d_state=d_state,
+            ssm_cfg=ssm_cfg,
+            norm_epsilon=1e-5,
+            rms_norm=rms_norm,
+            residual_in_fp32=residual_in_fp32,
+            fused_add_norm=fused_add_norm,
+            layer_idx=layer_idx,
+            if_bimamba=if_bimamba,
+            bimamba_type=bimamba_type,
+            drop_path=drop_path,
+            if_divide_out=if_divide_out,
+            init_layer_scale=init_layer_scale,
+            **factory_kwargs,
+        )
+        self.backward_block = create_block(
+            d_model=d_model,
+            d_state=d_state,
+            ssm_cfg=ssm_cfg,
+            norm_epsilon=1e-5,
+            rms_norm=rms_norm,
+            residual_in_fp32=residual_in_fp32,
+            fused_add_norm=fused_add_norm,
+            layer_idx=layer_idx,
+            if_bimamba=if_bimamba,
+            bimamba_type=bimamba_type,
+            drop_path=drop_path,
+            if_divide_out=if_divide_out,
+            init_layer_scale=init_layer_scale,
+            **factory_kwargs,
+        )
+
+    def forward(self, x, residual=None):
+        # x: [B, N, D]
+        x_norm = self.norm(x)
+        xf = self.x_proj_f(x_norm)         # forward path
+        xb = self.x_proj_b(x_norm)         # backward path
+        z_act = self.act(self.z_proj(x_norm))   # [B, N, 1]
+        gate = torch.sigmoid(z_act)              # [B, N, 1]
+
+        # forward SSM
+        out_f, res_f = self.forward_block(xf, residual)
+
+        # backward: run SSM on reversed seq and flip back
+        xb_rev = xb.flip(1)
+        res_rev = None if residual is None else residual.flip(1)
+        out_b_rev, res_b_rev = self.backward_block(xb_rev, res_rev)
+        out_b = out_b_rev.flip(1)
+
+        # 用 gate 对 forward/backward 输出做加权混合（z 作为门控）
+        fusion = gate * out_f + (1.0 - gate) * out_b   # fusion: [B,N,D]
+        
+        # --- 论文关键点：fusion -> 映射 -> 与输入残差相加（y 映射 + skip） ---
+        y = self.out_proj(fusion)       # 映射回到特征维度（紫色块）
+        out = x + y                      # 残差连接：out = x + y
+
+        # # 合并残差（按 gate 加权，若某侧无 residual 则保留另一侧）
+        # if res_f is None and res_b_rev is None:
+        #     res = None
+        # elif res_f is None:
+        #     res = (1.0 - gate) * res_b_rev.flip(1)
+        # elif res_b_rev is None:
+        #     res = gate * res_f
+        # else:
+        #     res = gate * res_f + (1.0 - gate) * res_b_rev.flip(1)
+
+        # return out, res
+        return out
+
 class VimEncoder(nn.Module):
     """    
     基于 ViM / VisionMamba 思路的编码器：使用 model.py 中的 VisionEncoderMambaBlock（zeta.nn.SSM）
@@ -1596,7 +1684,6 @@ class VimEncoder(nn.Module):
         self.input_ln = nn.LayerNorm(d_model, eps=1e-6)
         
         # ViM 参数配置（使用 VisionEncoderMambaBlock）
-        # ssm_cfg = {'dt_rank': dt_rank}
         ssm_cfg = None
         dpr = [x.item() for x in torch.linspace(0, drop_path, n_layers)]  # drop path rate
         inter_dpr = [0.0] + dpr
@@ -1613,29 +1700,54 @@ class VimEncoder(nn.Module):
         init_layer_scale = None
         factory_kwargs = {"device": None, "dtype": None}
         
-        # 使用 VisionEncoderMambaBlock 作为每一层的核心块
-        self.layers = nn.ModuleList([
-            create_block(
-                d_model=d_model,
-                d_state=d_state,
-                ssm_cfg=ssm_cfg,
-                norm_epsilon=norm_epsilon,
-                rms_norm=rms_norm,
-                residual_in_fp32=residual_in_fp32,
-                fused_add_norm=fused_add_norm,
-                layer_idx=i,
-                if_bimamba=if_bimamba,
-                bimamba_type=bimamba_type,
-                drop_path=inter_dpr[i],
-                if_divide_out=if_divide_out,
-                init_layer_scale=init_layer_scale,
-                **factory_kwargs,
-            )
-            for i in range(n_layers)
-        ])
+        # # 使用 VisionEncoderMambaBlock 作为每一层的核心块
+        # self.layers = nn.ModuleList([
+        #     create_block(
+        #         d_model=d_model,
+        #         d_state=d_state,
+        #         ssm_cfg=ssm_cfg,
+        #         norm_epsilon=norm_epsilon,
+        #         rms_norm=rms_norm,
+        #         residual_in_fp32=residual_in_fp32,
+        #         fused_add_norm=fused_add_norm,
+        #         layer_idx=i,
+        #         if_bimamba=if_bimamba,
+        #         bimamba_type=bimamba_type,
+        #         drop_path=inter_dpr[i],
+        #         if_divide_out=if_divide_out,
+        #         init_layer_scale=init_layer_scale,
+        #         **factory_kwargs,
+        #     )
+        #     for i in range(n_layers)
+        # ])
+        
+        # 每层使用论文编码单元封装（forward/backward SSM + activation path）
+        self.layers = nn.ModuleList(
+            [
+                VisionMambaLayer(
+                    d_model=d_model,
+                    d_state=d_state,
+                    layer_idx=i,
+                    drop_path=inter_dpr[i],
+                    ssm_cfg=ssm_cfg,
+                    factory_kwargs=factory_kwargs,
+                    rms_norm=rms_norm,
+                    residual_in_fp32=residual_in_fp32,
+                    fused_add_norm=fused_add_norm,
+                    if_bimamba=if_bimamba,
+                    bimamba_type=bimamba_type,
+                    if_divide_out=if_divide_out,
+                    init_layer_scale=init_layer_scale,
+                )
+                for i in range(n_layers)
+            ]
+        )
         
         # 输出归一化
         self.norm_f = nn.LayerNorm(d_model, eps=1e-5)
+        
+        # 添加双向扫描标志
+        self.if_bidirectional = True  # 控制是否启用双向扫描
         
     def forward(self, input_map, returns_attns=False):
         # CNN特征提取
@@ -1660,17 +1772,88 @@ class VimEncoder(nn.Module):
         # for layer in self.layers:
         #     map_tokens = layer(map_tokens)
         
+        # for layer in self.layers:
+        #     out = layer(map_tokens)
+        #     # 兼容上游 layer 可能返回 (hidden_states, residual) 或类似 tuple
+        #     if isinstance(out, (tuple, list)):
+        #         if len(out) == 0:
+        #             raise RuntimeError("Encoder layer returned empty tuple/list")
+        #         map_tokens = out[0]
+        #     else:
+        #         map_tokens = out
+        
+        # # 最终归一化（保持与原来接口一致）
+        # map_tokens = self.norm_f(map_tokens.to(dtype=self.norm_f.weight.dtype))
+        
+        # 初始化残差
+        residual = None
+        
+        # # 双向扫描实现
+        # if not self.if_bidirectional:
+        #     # 单向扫描处理
+        #     for layer in self.layers:
+        #         # 处理每个层
+        #         out = layer(map_tokens, residual)
+        #         # 兼容上游 layer 可能返回 (hidden_states, residual) 或类似 tuple
+        #         if isinstance(out, (tuple, list)):
+        #             if len(out) == 0:
+        #                 raise RuntimeError("Encoder layer returned empty tuple/list")
+        #             map_tokens, residual = out
+        #         else:
+        #             map_tokens = out
+        #             residual = None  # 重置残差
+        # else:
+        #     # 双向扫描处理 - 需要成对的层
+        #     if len(self.layers) % 2 != 0:
+        #         raise ValueError("For bidirectional scanning, the number of layers must be even")
+            
+        #     for i in range(len(self.layers) // 2):
+        #         # 前向扫描
+        #         forward_layer = self.layers[i * 2]
+        #         out_forward = forward_layer(map_tokens, residual)
+                
+        #         if isinstance(out_forward, (tuple, list)):
+        #             map_tokens_f, residual_f = out_forward
+        #         else:
+        #             map_tokens_f = out_forward
+        #             residual_f = None
+                
+        #         # 后向扫描（翻转序列）
+        #         map_tokens_flipped = map_tokens.flip(1)
+        #         residual_flipped = None if residual is None else residual.flip(1)
+                
+        #         backward_layer = self.layers[i * 2 + 1]
+        #         out_backward = backward_layer(map_tokens_flipped, residual_flipped)
+                
+        #         if isinstance(out_backward, (tuple, list)):
+        #             map_tokens_b, residual_b = out_backward
+        #         else:
+        #             map_tokens_b = out_backward
+        #             residual_b = None
+                
+        #         # 融合结果
+        #         map_tokens = map_tokens_f + map_tokens_b.flip(1)
+        #         if residual_f is not None and residual_b is not None:
+        #             residual = residual_f + residual_b.flip(1)
+        #         else:
+        #             residual = None
+        
+        # 逐层调用：注意 VisionMambaLayer 内部已经实现了 forward/backward SSM + z 合并
         for layer in self.layers:
-            out = layer(map_tokens)
-            # 兼容上游 layer 可能返回 (hidden_states, residual) 或类似 tuple
+            out = layer(map_tokens, residual)
             if isinstance(out, (tuple, list)):
                 if len(out) == 0:
                     raise RuntimeError("Encoder layer returned empty tuple/list")
                 map_tokens = out[0]
+                residual = out[1] if len(out) > 1 else residual
             else:
                 map_tokens = out
         
-        # 最终归一化（保持与原来接口一致）
-        map_tokens = self.norm_f(map_tokens.to(dtype=self.norm_f.weight.dtype))
+        # 最终归一化
+        if residual is not None:
+            # 如果有残差，应用最终归一化
+            map_tokens = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+        else:
+            map_tokens = self.norm_f(map_tokens.to(dtype=self.norm_f.weight.dtype))
             
         return map_tokens

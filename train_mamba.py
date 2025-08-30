@@ -875,7 +875,7 @@ if __name__ == "__main__":
     # )
     
     model_args = dict(        # 定义模型参数字典
-        n_layers=12,          # Mamba编码器层数：12层
+        n_layers=3,          # Mamba编码器层数：12层
         d_state=16,           # Mamba状态维度：16
         dt_rank=32,           # 动态张量分解秩：32
         d_model=512,          # 模型的主要特征维度：512
