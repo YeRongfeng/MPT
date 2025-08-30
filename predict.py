@@ -345,7 +345,7 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
 
 if __name__ == "__main__":
     stage = 1
-    epoch = 19
+    epoch = 64
     # stage = 2
     # epoch = 79
     # envType_list = ['desert']
@@ -356,8 +356,8 @@ if __name__ == "__main__":
     # envType_list = ['hill']
     save_path = 'predictions'
 
-    modelFolder = 'data/uneven'
-    # modelFolder = 'data/mamba'
+    # modelFolder = 'data/uneven'
+    modelFolder = 'data/mamba'
     # modelFolder = 'data/uneven_old'
     modelFile = osp.join(modelFolder, f'model_params.json')
     model_param = json.load(open(modelFile))

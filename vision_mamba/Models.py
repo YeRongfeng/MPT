@@ -370,28 +370,71 @@ class PositionalEncoding(nn.Module):
         训练时：pos_enc(features)  # 随机位置采样
         推理时：pos_enc(features, (32, 32))  # 固定32x32尺寸
         """
-        if conv_shape is None:  # 判断是否为训练模式：conv_shape为None表示训练模式
-            # 【训练模式】随机位置采样策略
-            # 
-            # 在支持的最大地图范围内随机选择一个train_shape大小的区域
-            # 这种随机性有助于模型学习位置不变的特征表示
-            startH, startW = torch.randint(0, self.n_pos_sqrt-self.train_shape[0], (2,))  # 随机生成起始坐标：在有效范围内随机选择左上角位置，确保采样区域不越界
+        # if conv_shape is None:  # 判断是否为训练模式：conv_shape为None表示训练模式
+        #     # 【训练模式】随机位置采样策略
+        #     # 
+        #     # 在支持的最大地图范围内随机选择一个train_shape大小的区域
+        #     # 这种随机性有助于模型学习位置不变的特征表示
+        #     startH, startW = torch.randint(0, self.n_pos_sqrt-self.train_shape[0], (2,))  # 随机生成起始坐标：在有效范围内随机选择左上角位置，确保采样区域不越界
             
-            # 根据随机起始位置选择对应的位置编码区域
-            selectIndex = rearrange(
-                self.hashIndex[startH:startH+self.train_shape[0], startW:startW+self.train_shape[1]],  # 从哈希表中切片选择随机位置开始的训练尺寸区域
-                'h w -> (h w)'  # 将2D区域索引转换为1D序列索引：使用einops展平2D索引为1D向量
-                )
+        #     # 根据随机起始位置选择对应的位置编码区域
+        #     selectIndex = rearrange(
+        #         self.hashIndex[startH:startH+self.train_shape[0], startW:startW+self.train_shape[1]],  # 从哈希表中切片选择随机位置开始的训练尺寸区域
+        #         'h w -> (h w)'  # 将2D区域索引转换为1D序列索引：使用einops展平2D索引为1D向量
+        #         )
             
-            # 添加位置编码，使用detach()防止位置编码参与梯度更新
-            return x + torch.index_select(self.pos_table, dim=1, index=selectIndex).clone().detach()  # 残差连接：将选中的位置编码加到输入特征上，clone().detach()确保位置编码不参与反向传播
+        #     # 添加位置编码，使用detach()防止位置编码参与梯度更新
+        #     return x + torch.index_select(self.pos_table, dim=1, index=selectIndex).clone().detach()  # 残差连接：将选中的位置编码加到输入特征上，clone().detach()确保位置编码不参与反向传播
+        
+        # Ensure all internal buffers on same device as input to avoid implicit transfers/syncs
+        device = x.device
+        if getattr(self, "pos_table", None) is not None and self.pos_table.device != device:
+            # move once (will be cheap after first call); avoid moving every batch unnecessarily
+            self.pos_table = self.pos_table.to(device)
+        if getattr(self, "pos_table_train", None) is not None and self.pos_table_train.device != device:
+            self.pos_table_train = self.pos_table_train.to(device)
+        if getattr(self, "hashIndex", None) is not None and self.hashIndex.device != device:
+            self.hashIndex = self.hashIndex.to(device)
 
-        # 【推理模式】精确位置映射
-        # 
-        # 根据实际输入尺寸选择对应的位置编码
-        # assert x.shape[0]==1, "仅支持单样本推理"  # 原注释：批量推理的限制
-        selectIndex = rearrange(self.hashIndex[:conv_shape[0], :conv_shape[1]], 'h w -> (h w)')  # 根据卷积输出形状选择对应的位置编码索引：从左上角开始选择conv_shape大小的区域并展平
-        return x + torch.index_select(self.pos_table, dim=1, index=selectIndex)  # 残差连接：将精确选择的位置编码加到输入特征上
+        if conv_shape is None:
+            # training mode: sample a random top-left offset
+            # generate small Python ints to slice hashIndex (cheap)
+            max_start = self.n_pos_sqrt - self.train_shape[0]
+            if max_start <= 0:
+                startH = 0
+                startW = 0
+            else:
+                # use CPU RNG to get python ints (no heavy GPU sync)
+                r = torch.randint(0, max_start, (2,))
+                startH = int(r[0].item())
+                startW = int(r[1].item())
+
+            # slice (hashIndex already on correct device) and flatten indices
+            selectIndex = rearrange(
+                self.hashIndex[startH:startH + self.train_shape[0], startW:startW + self.train_shape[1]],
+                'h w -> (h w)'
+            )
+            # make sure index is long and on same device
+            if selectIndex.dtype != torch.long:
+                selectIndex = selectIndex.long()
+            if selectIndex.device != device:
+                selectIndex = selectIndex.to(device)
+
+            return x + torch.index_select(self.pos_table, dim=1, index=selectIndex).clone().detach()
+
+        # # 【推理模式】精确位置映射
+        # # 
+        # # 根据实际输入尺寸选择对应的位置编码
+        # # assert x.shape[0]==1, "仅支持单样本推理"  # 原注释：批量推理的限制
+        # selectIndex = rearrange(self.hashIndex[:conv_shape[0], :conv_shape[1]], 'h w -> (h w)')  # 根据卷积输出形状选择对应的位置编码索引：从左上角开始选择conv_shape大小的区域并展平
+        # return x + torch.index_select(self.pos_table, dim=1, index=selectIndex)  # 残差连接：将精确选择的位置编码加到输入特征上
+        # inference mode: deterministic selection from top-left
+        selectIndex = rearrange(self.hashIndex[:conv_shape[0], :conv_shape[1]], 'h w -> (h w)')
+        if selectIndex.dtype != torch.long:
+            selectIndex = selectIndex.long()
+        if selectIndex.device != device:
+            selectIndex = selectIndex.to(device)
+        return x + torch.index_select(self.pos_table, dim=1, index=selectIndex)
 
 
 class Encoder(nn.Module):
@@ -1325,16 +1368,17 @@ class SE2Transformer(Transformer):
     
     
 class UnevenTransformer(nn.Module):
+# class UnevenMamba(nn.Module):
     """
-    UnevenTransformer - 用于处理不平坦地面路径规划的Transformer变体
+    UnevenMamba - 用于处理不平坦地面路径规划的Mamba变体
     """
     
     def __init__(self, n_layers, d_state, dt_rank, d_model, pad_idx, dropout, drop_path, n_position, train_shape, output_dim=10):
         """
-        初始化不平坦地面路径规划的Transformer模型
+        初始化不平坦地面路径规划的Mamba模型
 
         【核心功能】
-        构建适用于不平坦地面的Transformer架构，支持变长输入和动态位置编码。
+        构建适用于不平坦地面的Mamba架构，支持变长输入和动态位置编码。
         该模型能够处理不同形状和尺寸的地图输入，适应性强，适用于复杂环境下的路径规划任务。
         
         【设计理念】
