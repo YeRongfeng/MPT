@@ -87,6 +87,8 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
     # 从模型输出获取维度信息
     batch_size, num_tokens, output_dim = predVal.shape
     
+    # print("output dim:", output_dim)
+    
     # predVal已经经过softmax，直接使用
     predProb_list = []
     patch_maps = []
@@ -150,8 +152,10 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         weighted_y = sum(pos[1] * predProb[idx].item() for idx, pos in enumerate(hashTable))
 
         # 映射回到实际坐标系
-        weighted_x = -5 + weighted_x * 0.1  # 列对应x坐标
-        weighted_y = -5 + weighted_y * 0.1  # 行对应y坐标
+        # weighted_x = -5 + weighted_x * 0.1  # 列对应x坐标
+        # weighted_y = -5 + weighted_y * 0.1  # 行对应y坐标
+        weighted_x = -20 + weighted_x * 0.4  # 列对应x坐标
+        weighted_y = -20 + weighted_y * 0.4  # 行对应y坐标
         
         # 将加权结果添加到粗略轨迹中
         roughTraj.append((weighted_x, weighted_y))
@@ -178,8 +182,8 @@ def get_patch(model, start_pos, goal_pos, normal_x, normal_y, normal_z):
         weighted_predTheta = weighted_predTheta * 2 * np.pi - np.pi  # 将范围从[0, 1]映射到[-pi, pi]
         
         # 计算最终预测位置和角度
-        final_x = weighted_x + weighted_offset_x.item() * 0
-        final_y = weighted_y + weighted_offset_y.item() * 0
+        final_x = weighted_x + weighted_offset_x.item()
+        final_y = weighted_y + weighted_offset_y.item()
 
         # # 计算最终预测位置和角度
         # final_x = weighted_x

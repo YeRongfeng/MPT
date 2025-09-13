@@ -14,14 +14,15 @@ def test_yaw_stability_computation():
     print("测试yaw稳定性计算功能...")
     
     # 从数据加载器获取真实地图数据
-    data_folder = '/home/yrf/MPT/data/terrain/train'
+    data_folder = '/home/yrf/MPT/data/sim_dataset/train'
+    # data_folder = '/home/yrf/MPT/data/terrain/train'
     if not os.path.exists(data_folder):
         print("数据文件夹不存在，跳过测试")
         return False
     
     # 查找可用的环境
     env_list = []
-    for env_name in ['env000009']:
+    for env_name in ['env000000']:
         env_path = os.path.join(data_folder, env_name)
         if os.path.exists(env_path):
             env_list.append(env_name)
@@ -122,14 +123,15 @@ def test_dataloader_integration():
     print("\n测试数据加载器集成...")
     
     # 检查数据目录是否存在
-    data_folder = '/home/yrf/MPT/data/terrain_test/val'
+    # data_folder = '/home/yrf/MPT/data/terrain_test/val'
+    data_folder = '/home/yrf/MPT/data/sim_dataset/val'
     if not os.path.exists(data_folder):
         print("数据文件夹不存在，跳过数据加载器测试")
         return False
     
     # 查找可用的环境
     env_list = []
-    for env_name in ['env000001']:
+    for env_name in ['env000000']:
         env_path = os.path.join(data_folder, env_name)
         if os.path.exists(env_path):
             env_list.append(env_name)

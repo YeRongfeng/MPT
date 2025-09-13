@@ -16,12 +16,13 @@ import torch.nn.functional as F
 import json
 
 from transformer import Models
+# from vision_mamba import Models
 from dataLoader_uneven import get_encoder_input, receptive_field
 from eval_model_uneven import getHashTable, get_patch
 import torch
 
-# dataset_path = 'data/terrain_dataset/val'
-dataset_path = 'data/terrain/train'
+# dataset_path = 'data/sim_dataset/val'
+dataset_path = 'data/sim_dataset/train'
 
 def generate_ground_truth_labels(trajectory, hashTable, output_dim):
     """
@@ -76,7 +77,8 @@ device='cuda' if torch.cuda.is_available() else 'cpu'
 def plot_single_trajectory(ax, elevation_masked, trajectory, predTraj=None, output_dim=None, is_pred=False):
     """绘制单个轨迹子图的辅助函数"""
     # 显示地形图
-    ax.imshow(elevation_masked, extent=[-5, 5, -5, 5],
+    # ax.imshow(elevation_masked, extent=[-5, 5, -5, 5],
+    ax.imshow(elevation_masked, extent=[-20, 20, -20, 20],
               origin='lower', cmap='terrain', aspect='equal')
     ax.grid(True, alpha=0.3)
     
@@ -302,7 +304,8 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
         
         # 左侧子图 - 预测概率分布
         ax_pred = fig.add_subplot(gs[step, 0])
-        im_pred = ax_pred.imshow(pred_prob_map, extent=[-5, 5, -5, 5],
+        # im_pred = ax_pred.imshow(pred_prob_map, extent=[-5, 5, -5, 5],
+        im_pred = ax_pred.imshow(pred_prob_map, extent=[-20, 20, -20, 20],
                                 origin='lower', cmap='viridis', aspect='equal')
         ax_pred.set_title(f'Predicted Probability - Step {step}', fontsize=12, pad=8)
         ax_pred.axis('off')
@@ -314,7 +317,8 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
         
         # 右侧子图 - Ground Truth标签分布
         ax_gt = fig.add_subplot(gs[step, 1])
-        im_gt = ax_gt.imshow(gt_labels_map, extent=[-5, 5, -5, 5],
+        # im_gt = ax_gt.imshow(gt_labels_map, extent=[-5, 5, -5, 5],
+        im_gt = ax_gt.imshow(gt_labels_map, extent=[-20, 20, -20, 20],
                             origin='lower', cmap='Reds', aspect='equal', vmin=0, vmax=1)
         ax_gt.set_title(f'Ground Truth Labels - Step {step}', fontsize=12, pad=8)
         ax_gt.axis('off')
@@ -343,19 +347,23 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
     plt.close()  # 关闭图像以释放内存
 
 if __name__ == "__main__":
-    # stage = 1
-    # epoch = 99
-    stage = 2
-    epoch = 79
+    best = True
+    # best = False
+    stage = 1
+    # epoch = 39
+    # stage = 2
+    epoch = 24
     # envType_list = ['desert']
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000009']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000000']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     # envType_list = ['desert','map1','map3','map4']
     # envType_list = ['hill']
     save_path = 'predictions'
 
-    modelFolder = 'data/uneven'
+    # modelFolder = 'data/uneven'
+    # modelFolder = 'data/mamba'
+    modelFolder = 'data/sim'
     # modelFolder = 'data/uneven_old'
     modelFile = osp.join(modelFolder, f'model_params.json')
     model_param = json.load(open(modelFile))
@@ -365,9 +373,15 @@ if __name__ == "__main__":
 
     # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
     if stage == 1:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
     else:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
     transformer.load_state_dict(checkpoint['state_dict'])
 
     _ = transformer.eval()
@@ -377,8 +391,8 @@ if __name__ == "__main__":
     # path_index = np.random.choice(range(500), size=1)[0]
     # path_index_list = list(np.random.choice(range(500), size=6, replace=False))
     # path_index_list = list([163, 119, 340, 416, 148, 260])
-    # path_index_list = list([11, 22, 33, 44, 55, 66])
-    # path_index_list = list([0, 6, 13, 22, 34, 46])
+    # path_index_list = list([0, 1, 2, 3, 4, 5])
+    path_index_list = list([2, 3, 7, 17, 23, 25])
     # path_index_list = list([0, 1, 2, 3, 4, 4])  # 测试前5条路径
     # path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
     # path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
@@ -387,7 +401,7 @@ if __name__ == "__main__":
     # path_index_list = list([28, 29, 30, 31, 32, 33])  # 测试前5条路径
     # path_index_list = list([34, 35, 36, 37, 38, 39])  # 测试前5条路径
     # path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
-    path_index_list = list([46, 47, 48, 49, 44, 45])  # 测试前5条路径
+    # path_index_list = list([46, 47, 48, 49, 44, 45])  # 测试前5条路径
     # print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 
@@ -397,6 +411,8 @@ if __name__ == "__main__":
         
     # # 绘制多组轨迹对比图
     # plot_elevation_map(path_index_list, envType_random, save_path)
+    
+    # plot_predProb_map(0, envType_list[0], save_path)
     
     for env in envType_list:
         print(f"Evaluating environment: {env}")

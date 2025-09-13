@@ -49,26 +49,26 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
     
     # 根据训练阶段设置损失权重
     if stage == 1:
-        # loss_weights = {
-        #     'classification': 1e-3,  # 第一阶段专注轨迹回归
-        #     'regression': 3e-4,
-        #     'uniformity': 3e-4,
-        #     'angle': 3e-4,
-        #     'smoothness': 1e-4,
-        #     'capsize': 0e0,
-        #     'curvature': 1e-5,
-        #     'stability': 1e-3,  # 轨迹点稳定性结果预测
-        # }
         loss_weights = {
             'classification': 1e-2,  # 第一阶段专注轨迹回归
-            'regression': 3e-5,
-            'uniformity': 3e-5,
-            'angle': 3e-5,
-            'smoothness': 1e-5,
+            'regression': 1e-4,
+            'uniformity': 0e-4,
+            'angle': 1e-3,
+            'smoothness': 1e-4,
             'capsize': 0e-2,
-            'curvature': 1e-6,
+            'curvature': 0e-5,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
+        # loss_weights = {
+        #     'classification': 0e-1,  # 第一阶段专注轨迹回归
+        #     'regression': 1e-3,
+        #     'uniformity': 0e-4,
+        #     'angle': 0e-3,
+        #     'smoothness': 0e-4,
+        #     'capsize': 0e-2,
+        #     'curvature': 0e-5,
+        #     'stability': 0e-3,  # 轨迹点稳定性结果预测
+        # }
     else:
         # loss_weights = {
         #     'classification': 1e-3,  # 第二阶段专注安全性优化
@@ -446,8 +446,8 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             ], dim=1).to(dtype=torch.float32, device=predVals.device)
             
             map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
-            resolution = 0.1
-            origin = (-5.0, -5.0, -np.pi) # x, y, yaw
+            resolution = 0.4
+            origin = (-20.0, -20.0, -np.pi) # x, y, yaw
             map_info = {
                 'resolution': resolution,
                 'origin': origin,
@@ -659,7 +659,8 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
             predVal, 
             correctionVal,  # 添加correctionVal参数
             normals,  # 添加法线信息
-            batch['yaw_stability'].to(device),  # 添加yaw_stability参数
+            # batch['yaw_stability'].to(device),  # 添加yaw_stability参数
+            None,
             batch['cost_map'].to(device),  # 添加cost_map参数
             batch['anchor'].to(device),
             batch['labels'].to(device),
@@ -677,7 +678,7 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         # 梯度裁剪：防止梯度爆炸 - 平衡稳定性和学习效率
         max_grad_norm = 5.0  # 适度控制，平衡稳定性和学习速度
         if stage == 2:
-            max_grad_norm = 0.5  # 第二阶段更严格的梯度裁剪
+            max_grad_norm = 1.0  # 第二阶段更严格的梯度裁剪
         
         # 进行梯度裁剪，返回的是裁剪前的原始梯度范数
         original_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, norm_type=2)
@@ -738,7 +739,8 @@ def eval_epoch(model, validationData, device, stage=1):
                 predVal, 
                 correctionVal,  # 添加correctionVal参数
                 normals,  # 添加法线信息
-                batch['yaw_stability'].to(device),  # 添加yaw_stability参数
+                # batch['yaw_stability'].to(device),  # 添加yaw_stability参数
+                None,
                 batch['cost_map'].to(device),  # 添加cost_map参数
                 batch['anchor'].to(device),
                 batch['labels'].to(device),
@@ -821,6 +823,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataFolder', help="Directory with training and validation data for Maze", default=None)  # 添加数据文件夹参数
     parser.add_argument('--fileDir', help="Directory to save training Data")  # 添加训练数据保存目录参数
     parser.add_argument('--load_stage1_model', help="Path to stage1 model checkpoint to load and start stage2 training", default=None)  # 加载第一阶段的模型参数，直接开始第二阶段训练
+    parser.add_argument('--resume_stage1_model', help="Path to resume stage1 training (continue from checkpoint)", default=None)  # 恢复阶段1训练
     args = parser.parse_args()  # 解析命令行参数
 
     map_load = False  # 是否加载地图数据
@@ -831,7 +834,7 @@ if __name__ == "__main__":
     # assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
     # env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
 
-    env_num = 40
+    env_num = 2
     env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
     # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
 
@@ -880,7 +883,7 @@ if __name__ == "__main__":
         n_position=15*15,     # 支持的最大位置数：225(15×15)
         dropout=0.1,          # Dropout概率：0.1
         train_shape=[12, 12], # 训练时的地图形状：12×12
-        output_dim=10,        # 输出维度：10
+        output_dim=20,        # 输出维度：20
     )
 
     transformer = Models.UnevenTransformer(**model_args)  # 使用参数字典初始化Transformer模型
@@ -941,13 +944,34 @@ if __name__ == "__main__":
     # 检查是否需要加载第一阶段的模型并直接开始第二阶段训练
     start_stage = 1
     checkpoint = None  # 初始化 checkpoint 变量
+    resume_stage1 = False
+    resume_start_epoch = 0
     
+    # 记录各阶段最优验证损失，用于保存best model
+    best_val_loss_stage1 = float('inf')
+    best_val_loss_stage2 = float('inf')
+    best_stage1_path = osp.join(trainDataFolder, 'best_stage1_model.pkl')
+    best_stage2_path = osp.join(trainDataFolder, 'best_stage2_model.pkl')
+    
+    # 优先处理直接跳过到stage2的加载选项；否则检查是否需要从stage1检查点恢复训练
     if args.load_stage1_model:
         # 加载第一阶段的检查点并直接开始第二阶段训练
         print(f"Loading stage 1 checkpoint: {args.load_stage1_model}")
         checkpoint = load_stage1_checkpoint(transformer, args.load_stage1_model, device)
         start_stage = 2  # 直接开始第二阶段训练
         print("Will skip stage 1 and directly start stage 2 training")
+    elif args.resume_stage1_model:
+        # 从stage1检查点恢复训练（继续stage1）
+        print(f"Resuming stage 1 training from checkpoint: {args.resume_stage1_model}")
+        checkpoint = load_stage1_checkpoint(transformer, args.resume_stage1_model, device)
+        resume_stage1 = True
+        resume_start_epoch = checkpoint.get('epoch', -1) + 1
+        # 从checkpoint中恢复已保存的最佳验证loss（如果有）
+        try:
+            best_val_loss_stage1 = float(checkpoint.get('val_loss', best_val_loss_stage1))
+        except:
+            pass
+        print(f"Will resume Stage 1 from epoch {resume_start_epoch}")
     
     # 第一阶段：冻结correctionPred，训练其他参数
     if start_stage == 1:
@@ -964,19 +988,46 @@ if __name__ == "__main__":
         stage1_optimizer = Optim.ScheduledOptim(
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
-            # lr_mul = 0.1,
-            lr_mul = 3e-2,
+            # lr_mul = 0.3,
+            lr_mul = 1e-0,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200
         )
+        # 如果是从checkpoint恢复stage1训练，并且checkpoint中有optimizer状态，则恢复优化器
+        if resume_stage1 and checkpoint is not None and 'optimizer' in checkpoint:
+            try:
+                stage1_optimizer._optimizer.load_state_dict(checkpoint['optimizer'])
+                print("Loaded stage1 optimizer state from checkpoint")
+            except Exception as e:
+                print(f"Warning: Failed to load stage1 optimizer state: {e}")
         
         # 第一阶段训练
-        for n in range(stage1_epochs):
+        start_epoch = resume_start_epoch if resume_stage1 else 0
+        for n in range(start_epoch, stage1_epochs):
             train_total_loss, train_n_correct, train_samples, train_stats = train_epoch(
                 transformer, trainingData, stage1_optimizer, device, epoch=n, stage=1
             )
             val_total_loss, val_n_correct, val_samples, val_stats = eval_epoch(transformer, validationData, device, stage=1)
+            
+            # 保存 stage1 的 best model（按验证损失）
+            try:
+                if val_total_loss < best_val_loss_stage1:
+                    best_val_loss_stage1 = val_total_loss
+                    if isinstance(transformer, nn.DataParallel):
+                        state_dict = transformer.module.state_dict()
+                    else:
+                        state_dict = transformer.state_dict()
+                    torch.save({
+                        'state_dict': state_dict,
+                        'torch_seed': torch_seed,
+                        'stage': 1,
+                        'epoch': n,
+                        'val_loss': val_total_loss
+                    }, best_stage1_path)
+                    print(f"Saved new best Stage1 model to {best_stage1_path} (val_loss={val_total_loss:.4f})")
+            except Exception as e:
+                print(f"Warning: Failed to save best stage1 model: {e}")
             
             # 计算训练和验证准确率
             train_accuracy = train_n_correct / train_samples if train_samples > 0 else 0.0
@@ -1067,6 +1118,25 @@ if __name__ == "__main__":
             transformer, trainingData, stage2_optimizer, device, epoch=n, stage=2
         )
         val_total_loss, val_n_correct, val_samples, val_stats = eval_epoch(transformer, validationData, device, stage=2)
+        
+        # 保存 stage2 的 best model（按验证损失）
+        try:
+            if val_total_loss < best_val_loss_stage2:
+                best_val_loss_stage2 = val_total_loss
+                if isinstance(transformer, nn.DataParallel):
+                    state_dict = transformer.module.state_dict()
+                else:
+                    state_dict = transformer.state_dict()
+                torch.save({
+                    'state_dict': state_dict,
+                    'torch_seed': torch_seed,
+                    'stage': 2,
+                    'epoch': n,
+                    'val_loss': val_total_loss
+                }, best_stage2_path)
+                print(f"Saved new best Stage2 model to {best_stage2_path} (val_loss={val_total_loss:.4f})")
+        except Exception as e:
+            print(f"Warning: Failed to save best stage2 model: {e}")
         
         # 计算训练和验证准确率
         train_accuracy = train_n_correct / train_samples if train_samples > 0 else 0.0

@@ -23,13 +23,14 @@ if __name__ == '__main__':
     # 测试加载数据集
     # env_list = ['desert']
     # env_list = ['map4']
-    env_list = ['env000020']
+    env_list = ['env000000']
     # env_list = ['hill']
-    dataFolder = '/home/yrf/MPT/data/terrain/train'
+    # dataFolder = '/home/yrf/MPT/data/terrain/train'
+    dataFolder = '/home/yrf/MPT/data/sim_dataset/val'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
     
     # 测试数据集idx=0的返回值
-    path_index = 2
+    path_index = 1
     sample = dataset[path_index]
     print(sample['map'].shape)
     print(sample['anchor'].shape)
@@ -404,11 +405,14 @@ if __name__ == '__main__':
             hash_col, hash_row = hashTable[anchor_idx]
             
             # 将像素坐标转换为实际坐标
-            cx = -5 + hash_col * 0.1   # 列对应x坐标
-            cy = -5 + hash_row * 0.1   # 行对应y坐标
+            # cx = -5 + hash_col * 0.1   # 列对应x坐标
+            # cy = -5 + hash_row * 0.1   # 行对应y坐标
+            cx = -20 + hash_col * 0.4   # 列对应x坐标
+            cy = -20 + hash_row * 0.4   # 行对应y坐标
             
             # 计算感受野范围（实际尺寸）
-            rf_size = receptive_field * 0.1  # 感受野实际尺寸（米）
+            # rf_size = receptive_field * 0.1  # 感受野实际尺寸（米）
+            rf_size = receptive_field * 0.4  # 感受野实际尺寸（米）
             rect_x = cx - rf_size / 2
             rect_y = cy - rf_size / 2
             rect_width = rf_size
@@ -457,8 +461,8 @@ if __name__ == '__main__':
                     head_width=0.1, head_length=0.08, 
                     fc='white', ec='white', alpha=0.6, zorder=15, linewidth=1.5)
 
-    ax[1, 1].set_xlim([-5, 5])
-    ax[1, 1].set_ylim([-5, 5])
+    ax[1, 1].set_xlim([-20, 20])
+    ax[1, 1].set_ylim([-20, 20])
     ax[1, 1].set_title(f'Anchor Points ({num_trajectory_points}+2 trajectory points)')
     ax[1, 1].grid(True, alpha=0.3)
     

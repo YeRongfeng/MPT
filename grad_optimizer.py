@@ -76,7 +76,7 @@ class TrajectoryOptimizerSE2:
         self.t_points = torch.tensor(t, device=self.device, dtype=torch.float32).detach()
 
         # --- 4. 预计算参考轨迹 (用于 follow_cost) ---
-        self.K_cost = 200
+        self.K_cost = 400
         self.t_dense = torch.linspace(0, 1, self.K_cost, device=self.device, dtype=torch.float32)
         with torch.no_grad():
             self.Sx_ref, self.Sy_ref, self.Syaw_ref, *_ = self._evaluate_spline_se2(self.initial_poses, self.t_dense)
@@ -158,30 +158,727 @@ class TrajectoryOptimizerSE2:
         
         return S, S_dot, S_ddot
 
-    def _evaluate_spline_se2(self, control_poses, t_eval):
-        """对 SE(2) 控制点 (x, y, yaw) 进行样条插值，**把 yaw 视为普通标量**（不做周期/unwrap 处理）。
-        关键修正：在插值前根据当前 control_poses 重新计算 t_ctrl，使参数化与控制点一致，避免因 t 固定而在控制点改变时造成不平滑。"""
-        # control_poses: (N, 3)
-        x_ctrl, y_ctrl, yaw_ctrl = control_poses.T
+    # def _evaluate_spline_se2(self, control_poses, t_eval):
+    #     """对 SE(2) 控制点 (x, y, yaw) 进行样条插值，**把 yaw 视为普通标量**（不做周期/unwrap 处理）。
+    #     关键修正：在插值前根据当前 control_poses 重新计算 t_ctrl，使参数化与控制点一致，避免因 t 固定而在控制点改变时造成不平滑。"""
+    #     # control_poses: (N, 3)
+    #     x_ctrl, y_ctrl, yaw_ctrl = control_poses.T
 
-        # 根据当前 control_poses 重新计算 t_ctrl（默认仍使用 rot_scale=0，若需将 yaw 计入可手动调整）
-        rot_scale = 0.0
+    #     # 根据当前 control_poses 重新计算 t_ctrl（默认仍使用 rot_scale=0，若需将 yaw 计入可手动调整）
+    #     rot_scale = 0.0
+    #     xy = control_poses[:, :2]
+    #     diffs_xy = xy[1:] - xy[:-1]
+    #     trans_dists = torch.norm(diffs_xy, dim=1)
+    #     yaw_diffs = (yaw_ctrl[1:] - yaw_ctrl[:-1]).abs()
+    #     total_dists = torch.sqrt(trans_dists**2 + (rot_scale * yaw_diffs)**2) + 1e-8
+    #     t_local = torch.cat([torch.tensor([0.0], device=self.device), torch.cumsum(total_dists, dim=0)])
+    #     t_local = (t_local / (t_local[-1] if t_local[-1] > 0 else 1.0)).to(device=self.device, dtype=torch.float32)
+
+    #     # 对 x, y 直接插值（传入局部 t_ctrl）
+    #     Sx, Sx_dot, Sx_ddot = self._evaluate_scalar_spline(x_ctrl, t_eval, t_ctrl=t_local)
+    #     Sy, Sy_dot, Sy_ddot = self._evaluate_scalar_spline(y_ctrl, t_eval, t_ctrl=t_local)
+
+    #     # 对 yaw：直接作为普通标量插值（无 unwrap），也使用局部 t_ctrl
+    #     Syaw, Syaw_dot, Syaw_ddot = self._evaluate_scalar_spline(yaw_ctrl, t_eval, t_ctrl=t_local)
+
+    #     return Sx, Sy, Syaw, Sx_dot, Sy_dot, Syaw_dot, Sx_ddot, Sy_ddot, Syaw_ddot
+    
+    def _evaluate_spline_se2(self, control_poses, t_eval):
+        """分段SE(2)插值，严格保证控制点处的位置和朝向一致"""
+        N = len(control_poses)
+        device = control_poses.device
+        
+        # 重新参数化
         xy = control_poses[:, :2]
         diffs_xy = xy[1:] - xy[:-1]
         trans_dists = torch.norm(diffs_xy, dim=1)
-        yaw_diffs = (yaw_ctrl[1:] - yaw_ctrl[:-1]).abs()
+        
+        yaw_diffs = torch.abs(control_poses[1:, 2] - control_poses[:-1, 2])
+        yaw_diffs = torch.minimum(yaw_diffs, 2*np.pi - yaw_diffs)
+        
+        rot_scale = 0.1
         total_dists = torch.sqrt(trans_dists**2 + (rot_scale * yaw_diffs)**2) + 1e-8
-        t_local = torch.cat([torch.tensor([0.0], device=self.device), torch.cumsum(total_dists, dim=0)])
-        t_local = (t_local / (t_local[-1] if t_local[-1] > 0 else 1.0)).to(device=self.device, dtype=torch.float32)
+        
+        t_local = torch.cat([torch.tensor([0.0], device=device), torch.cumsum(total_dists, dim=0)])
+        t_local = t_local / (t_local[-1] if t_local[-1] > 0 else 1.0)
+        
+        # 使用分段SE(2)插值，严格保证控制点约束
+        poses, velocities, accelerations = self._piecewise_se2_interpolation(
+            control_poses, t_local, t_eval
+        )
+        
+        return poses[:, 0], poses[:, 1], poses[:, 2], \
+            velocities[:, 0], velocities[:, 1], velocities[:, 2], \
+            accelerations[:, 0], accelerations[:, 1], accelerations[:, 2]
+            
+    def _piecewise_se2_interpolation(self, control_poses, t_ctrl, t_eval):
+        """基于约束求解的分段SE(2)插值"""
+        N = len(control_poses)
+        K = len(t_eval)
+        device = control_poses.device
+        
+        # 找到每个评估点对应的区间索引
+        indices = torch.searchsorted(t_ctrl, t_eval, right=False)
+        indices = torch.clamp(indices - 1, 0, N - 2)
+        
+        # 边界处理
+        mask_before = t_eval <= t_ctrl[0]
+        mask_after = t_eval >= t_ctrl[-1]
+        
+        # 检查是否正好在控制点上
+        mask_at_control = torch.zeros(K, dtype=torch.bool, device=device)
+        for i in range(N):
+            mask_at_control |= torch.abs(t_eval - t_ctrl[i]) < 1e-6
+        
+        mask_interior = ~(mask_before | mask_after | mask_at_control)
+        
+        # 初始化结果
+        result_poses = torch.zeros((K, 3), device=device)
+        result_velocities = torch.zeros((K, 3), device=device)
+        result_accelerations = torch.zeros((K, 3), device=device)
+        
+        # 处理边界点
+        if mask_before.any():
+            result_poses[mask_before] = control_poses[0]
+        if mask_after.any():
+            result_poses[mask_after] = control_poses[-1]
+        
+        # 处理正好在控制点上的点
+        if mask_at_control.any():
+            for i in range(N):
+                mask_i = torch.abs(t_eval - t_ctrl[i]) < 1e-6
+                if mask_i.any():
+                    result_poses[mask_i] = control_poses[i]
+        
+        # 处理内部点 - 基于约束求解的分段插值
+        if mask_interior.any():
+            t_eval_interior = t_eval[mask_interior]
+            indices_interior = indices[mask_interior]
+            
+            # 提取段的端点
+            t0 = t_ctrl[indices_interior]      # (K_interior,)
+            t1 = t_ctrl[indices_interior + 1]  # (K_interior,)
+            p0 = control_poses[indices_interior]      # (K_interior, 3)
+            p1 = control_poses[indices_interior + 1]  # (K_interior, 3)
+            
+            # 归一化参数 s ∈ [0, 1]
+            h = t1 - t0  # (K_interior,)
+            s = (t_eval_interior - t0) / h  # (K_interior,)
+            
+            # 核心：基于约束求解每段的插值
+            poses_interior, velocities_interior, accelerations_interior = self._solve_constrained_segment_interpolation(
+                p0, p1, s, h
+            )
+            
+            # 填入结果
+            result_poses[mask_interior] = poses_interior
+            result_velocities[mask_interior] = velocities_interior
+            result_accelerations[mask_interior] = accelerations_interior
+        
+        return result_poses, result_velocities, result_accelerations
 
-        # 对 x, y 直接插值（传入局部 t_ctrl）
-        Sx, Sx_dot, Sx_ddot = self._evaluate_scalar_spline(x_ctrl, t_eval, t_ctrl=t_local)
-        Sy, Sy_dot, Sy_ddot = self._evaluate_scalar_spline(y_ctrl, t_eval, t_ctrl=t_local)
+    def _solve_constrained_segment_interpolation(self, p0, p1, s, h):
+        """
+        改进的基于约束求解的段插值：
+        强制前进方向，避免倒车现象
+        """
+        device = p0.device
+        K = p0.shape[0]
+        
+        # 1. 提取端点信息
+        x0, y0, yaw0 = p0[:, 0], p0[:, 1], p0[:, 2]  # (K,)
+        x1, y1, yaw1 = p1[:, 0], p1[:, 1], p1[:, 2]  # (K,)
+        
+        # 2. 计算位移向量和方向
+        dx = x1 - x0  # (K,)
+        dy = y1 - y0  # (K,)
+        disp_mag = torch.sqrt(dx*dx + dy*dy + 1e-8)
+        displacement_angle = torch.atan2(dy, dx)  # 位移方向
+        
+        # 3. 计算朝向单位向量
+        cos_yaw0 = torch.cos(yaw0)
+        sin_yaw0 = torch.sin(yaw0)
+        cos_yaw1 = torch.cos(yaw1)
+        sin_yaw1 = torch.sin(yaw1)
+        
+        # 4. 强制前进策略 - 不再进行智能选择，直接使用前进方向
+        # 所有段都强制使用前进方向
+        forward0 = torch.ones_like(yaw0, dtype=torch.bool)  # 强制所有起点前进
+        forward1 = torch.ones_like(yaw1, dtype=torch.bool)  # 强制所有终点前进
+        
+        # 5. 计算修正后的端点切线向量
+        # 起点切线方向（强制前进）
+        v0x = cos_yaw0  # 始终使用前进方向
+        v0y = sin_yaw0  # 始终使用前进方向
+        
+        # 终点切线方向（强制前进）
+        v1x = cos_yaw1  # 始终使用前进方向
+        v1y = sin_yaw1  # 始终使用前进方向
+        
+        # 6. 计算朝向与位移方向的一致性，用于调整速度
+        disp_dot_heading0 = dx * cos_yaw0 + dy * sin_yaw0  # 起点朝向与位移的点积
+        disp_dot_heading1 = dx * cos_yaw1 + dy * sin_yaw1  # 终点朝向与位移的点积
+        
+        # 一致性度量：值越大表示朝向与位移方向越一致
+        consistency0 = disp_dot_heading0 / (disp_mag + 1e-8)  # 归一化的一致性 [-1, 1]
+        consistency1 = disp_dot_heading1 / (disp_mag + 1e-8)
+        
+        # 7. 智能速度缩放 - 根据一致性调整速度
+        base_speed_scale = 1.5
+        
+        # 当一致性较低时（朝向与位移方向冲突），减小速度以减少插值扭曲
+        # 但确保速度始终为正（前进）
+        scale_factor0 = torch.clamp(0.3 + 0.7 * torch.relu(consistency0), min=0.3, max=1.5)
+        scale_factor1 = torch.clamp(0.3 + 0.7 * torch.relu(consistency1), min=0.3, max=1.5)
+        
+        # 8. 特殊处理：避免极端的小半径转弯
+        min_displacement = 1.0  # 最小位移阈值
+        max_angle_change = np.pi / 12  # 最大允许角度变化（30度）
+        
+        small_displacement = disp_mag < min_displacement
+        angle_change = torch.abs(torch.atan2(torch.sin(yaw1 - yaw0), torch.cos(yaw1 - yaw0)))
+        large_angle_change = angle_change > max_angle_change
+        
+        problematic_segments = small_displacement & large_angle_change
+        
+        # 对于问题段，进一步降低速度以减少插值扭曲
+        conservative_factor = torch.where(problematic_segments, 0.2, 1.0)
+        scale_factor0 *= conservative_factor
+        scale_factor1 *= conservative_factor
+        
+        speed0 = base_speed_scale * scale_factor0 * disp_mag / h
+        speed1 = base_speed_scale * scale_factor1 * disp_mag / h
+        
+        # 9. 构造端点切线向量
+        v0 = torch.stack([speed0 * v0x, speed0 * v0y, torch.zeros_like(speed0)], dim=1)
+        v1 = torch.stack([speed1 * v1x, speed1 * v1y, torch.zeros_like(speed1)], dim=1)
+        
+        # 10. 处理yaw插值
+        dyaw = yaw1 - yaw0
+        dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))  # 处理周期性
+        
+        # 添加yaw平滑度约束
+        yaw_curvature_penalty = torch.abs(dyaw) / (h + 1e-8)
+        # 当角度变化过大时，减小angular velocity
+        angular_scale = torch.clamp(1.0 - 0.5 * yaw_curvature_penalty, min=0.1, max=1.0)
+        
+        vyaw0 = angular_scale * dyaw / h
+        vyaw1 = angular_scale * dyaw / h
+        
+        # vyaw0 = dyaw / h
+        # vyaw1 = dyaw / h
+        
+        v0[:, 2] = vyaw0
+        v1[:, 2] = vyaw1
+        
+        # 11. 诊断信息（可选）
+        if hasattr(self, '_debug_interpolation') and self._debug_interpolation:
+            n_problematic = torch.sum(problematic_segments).item()
+            avg_consistency = (torch.mean(consistency0) + torch.mean(consistency1)) / 2
+            print(f"Forward-only interpolation: {n_problematic} problematic segments, avg consistency: {avg_consistency.item():.3f}")
+        
+        # 12. 使用Hermite插值
+        poses, velocities, accelerations = self._hermite_interpolate_constrained(
+            p0, p1, v0, v1, s, h
+        )
+        
+        return poses, velocities, accelerations
 
-        # 对 yaw：直接作为普通标量插值（无 unwrap），也使用局部 t_ctrl
-        Syaw, Syaw_dot, Syaw_ddot = self._evaluate_scalar_spline(yaw_ctrl, t_eval, t_ctrl=t_local)
+    # def _solve_constrained_segment_interpolation(self, p0, p1, s, h):
+    #     """
+    #     基于约束求解的段插值：
+    #     对每段求解满足端点位置、朝向约束的三次插值曲线
+    #     保留一致性检查，但强制前进方向
+    #     """
+    #     # p0, p1: (K, 3) - 段的起点和终点SE(2)姿态
+    #     # s: (K,) - 归一化参数 [0,1]
+    #     # h: (K,) - 时间间隔
+        
+    #     device = p0.device
+    #     K = p0.shape[0]
+        
+    #     # 1. 提取端点信息
+    #     x0, y0, yaw0 = p0[:, 0], p0[:, 1], p0[:, 2]  # (K,)
+    #     x1, y1, yaw1 = p1[:, 0], p1[:, 1], p1[:, 2]  # (K,)
+        
+    #     # 2. 计算端点的朝向单位向量
+    #     cos_yaw0 = torch.cos(yaw0)  # (K,)
+    #     sin_yaw0 = torch.sin(yaw0)  # (K,)
+    #     cos_yaw1 = torch.cos(yaw1)  # (K,)
+    #     sin_yaw1 = torch.sin(yaw1)  # (K,)
+        
+    #     # 3. 计算位移向量
+    #     dx = x1 - x0  # (K,)
+    #     dy = y1 - y0  # (K,)
+        
+    #     # 4. 初步判断每个端点的方向偏好
+    #     disp_dot_heading0 = dx * cos_yaw0 + dy * sin_yaw0  # (K,)
+    #     disp_dot_heading1 = dx * cos_yaw1 + dy * sin_yaw1  # (K,)
+        
+    #     # 5. 关键：一致性检查和修正（保留原有逻辑）
+    #     # 检查是否出现"两端都指向内部"或"两端都指向外部"的情况
+        
+    #     # 初始方向判断
+    #     prefer_forward0 = disp_dot_heading0 >= 0
+    #     prefer_forward1 = disp_dot_heading1 >= 0
+        
+    #     # 检测异常情况
+    #     both_inward = (~prefer_forward0) & prefer_forward1   # 起点后退，终点前进 → 内凹
+    #     both_outward = prefer_forward0 & (~prefer_forward1)  # 起点前进，终点后退 → 外凸
+        
+    #     # 对于异常情况，使用一致性修正策略
+    #     forward0 = prefer_forward0.clone()
+    #     forward1 = prefer_forward1.clone()
+        
+    #     # 策略1：对于内凹情况，优先保持起点方向，调整终点
+    #     if both_inward.any():
+    #         # 内凹：起点想后退，终点想前进
+    #         # 选择总体位移大的方向作为主导方向
+    #         abs_proj0 = torch.abs(disp_dot_heading0)
+    #         abs_proj1 = torch.abs(disp_dot_heading1)
+            
+    #         # 修改：对于内凹情况，强制选择前进方向
+    #         # 如果起点的投影更大，本来应该统一为后退，但现在强制为前进
+    #         dominant_backward = (abs_proj0 >= abs_proj1) & both_inward
+    #         forward0[dominant_backward] = True  # 强制前进
+    #         forward1[dominant_backward] = True  # 强制前进
+            
+    #         # 如果终点的投影更大，则统一为前进（保持不变）
+    #         dominant_forward = (abs_proj0 < abs_proj1) & both_inward
+    #         forward0[dominant_forward] = True
+    #         forward1[dominant_forward] = True
+        
+    #     # 策略2：对于外凸情况，同样强制前进
+    #     if both_outward.any():
+    #         # 外凸：起点想前进，终点想后退
+    #         abs_proj0 = torch.abs(disp_dot_heading0)
+    #         abs_proj1 = torch.abs(disp_dot_heading1)
+            
+    #         # 修改：对于外凸情况，强制选择前进方向
+    #         # 如果起点的投影更大，则统一为前进（保持不变）
+    #         dominant_forward = (abs_proj0 >= abs_proj1) & both_outward
+    #         forward0[dominant_forward] = True
+    #         forward1[dominant_forward] = True
+            
+    #         # 如果终点的投影更大，本来应该统一为后退，但现在强制为前进
+    #         dominant_backward = (abs_proj0 < abs_proj1) & both_outward
+    #         forward0[dominant_backward] = True  # 强制前进
+    #         forward1[dominant_backward] = True  # 强制前进
+        
+    #     # 6. 附加检查：避免极端的反向情况，但强制前进
+    #     # 如果某个端点的朝向与位移方向夹角大于135度，强制调整为前进
+    #     cos_angle0 = disp_dot_heading0 / (torch.sqrt(dx*dx + dy*dy + 1e-8))
+    #     cos_angle1 = disp_dot_heading1 / (torch.sqrt(dx*dx + dy*dy + 1e-8))
+        
+    #     # cos(135°) ≈ -0.707
+    #     extreme_angle_threshold = -0.707
+        
+    #     # 修改：如果角度过于极端，强制设为前进而不是保持一致
+    #     extreme0 = cos_angle0 < extreme_angle_threshold
+    #     if extreme0.any():
+    #         forward0[extreme0] = True  # 强制前进
+        
+    #     extreme1 = cos_angle1 < extreme_angle_threshold
+    #     if extreme1.any():
+    #         forward1[extreme1] = True  # 强制前进
+        
+    #     # 7. 最终强制：确保所有段都是前进方向
+    #     # 这是额外的安全检查，确保没有遗漏的后退情况
+    #     forward0 = torch.ones_like(forward0, dtype=torch.bool)  # 强制所有起点前进
+    #     forward1 = torch.ones_like(forward1, dtype=torch.bool)  # 强制所有终点前进
+        
+    #     # 8. 计算修正后的端点切线向量
+    #     # 起点切线方向（强制前进）
+    #     v0x = cos_yaw0  # 强制前进方向
+    #     v0y = sin_yaw0  # 强制前进方向
+        
+    #     # 终点切线方向（强制前进）
+    #     v1x = cos_yaw1  # 强制前进方向
+    #     v1y = sin_yaw1  # 强制前进方向
+        
+    #     # 9. 计算切线速度的大小，考虑一致性问题
+    #     disp_mag = torch.sqrt(dx*dx + dy*dy + 1e-8)  # (K,)
+        
+    #     # 检查位移方向与端点朝向的一致性
+    #     consistency0 = disp_dot_heading0 / (disp_mag + 1e-8)  # 归一化的一致性 [-1, 1]
+    #     consistency1 = disp_dot_heading1 / (disp_mag + 1e-8)
+        
+    #     # 基于一致性调整速度缩放
+    #     base_speed_scale = 1.5
+        
+    #     # 当一致性较低时（朝向与位移方向冲突），减小速度以减少插值扭曲
+    #     scale_factor0 = torch.clamp(consistency0 * 0.3 + 0.7, min=0.2, max=1.0)  # [0.2, 1.0]
+    #     scale_factor1 = torch.clamp(consistency1 * 0.3 + 0.7, min=0.2, max=1.0)  # [0.2, 1.0]
+        
+    #     speed0 = base_speed_scale * scale_factor0 * disp_mag / h  # (K,)
+    #     speed1 = base_speed_scale * scale_factor1 * disp_mag / h  # (K,)
+        
+    #     # 10. 构造端点切线向量（带大小）
+    #     v0 = torch.stack([speed0 * v0x, speed0 * v0y, torch.zeros_like(speed0)], dim=1)  # (K, 3)
+    #     v1 = torch.stack([speed1 * v1x, speed1 * v1y, torch.zeros_like(speed1)], dim=1)  # (K, 3)
+        
+    #     # 11. 对yaw进行单独处理
+    #     dyaw = yaw1 - yaw0  # (K,)
+    #     dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))  # 处理周期性
+        
+    #     vyaw0 = dyaw / h  # (K,)
+    #     vyaw1 = dyaw / h  # (K,)
+        
+    #     v0[:, 2] = vyaw0
+    #     v1[:, 2] = vyaw1
+        
+    #     # # 12. 诊断信息（可选）
+    #     # if torch.any(both_inward) or torch.any(both_outward):
+    #     #     n_inward = torch.sum(both_inward).item()
+    #     #     n_outward = torch.sum(both_outward).item()
+    #     #     print(f"Trajectory consistency correction: {n_inward} inward, {n_outward} outward segments - all forced to forward")
+        
+    #     # 13. 使用Hermite插值
+    #     poses, velocities, accelerations = self._hermite_interpolate_constrained(
+    #         p0, p1, v0, v1, s, h
+    #     )
+        
+    #     return poses, velocities, accelerations
 
-        return Sx, Sy, Syaw, Sx_dot, Sy_dot, Syaw_dot, Sx_ddot, Sy_ddot, Syaw_ddot
+    # def _solve_constrained_segment_interpolation(self, p0, p1, s, h):
+    #     """
+    #     基于约束求解的段插值：
+    #     对每段求解满足端点位置、朝向约束的三次插值曲线
+    #     增加朝向连续性检查
+    #     """
+    #     # p0, p1: (K, 3) - 段的起点和终点SE(2)姿态
+    #     # s: (K,) - 归一化参数 [0,1]
+    #     # h: (K,) - 时间间隔
+        
+    #     device = p0.device
+    #     K = p0.shape[0]
+        
+    #     # 1. 提取端点信息
+    #     x0, y0, yaw0 = p0[:, 0], p0[:, 1], p0[:, 2]  # (K,)
+    #     x1, y1, yaw1 = p1[:, 0], p1[:, 1], p1[:, 2]  # (K,)
+        
+    #     # 2. 计算端点的朝向单位向量
+    #     cos_yaw0 = torch.cos(yaw0)  # (K,)
+    #     sin_yaw0 = torch.sin(yaw0)  # (K,)
+    #     cos_yaw1 = torch.cos(yaw1)  # (K,)
+    #     sin_yaw1 = torch.sin(yaw1)  # (K,)
+        
+    #     # 3. 计算位移向量
+    #     dx = x1 - x0  # (K,)
+    #     dy = y1 - y0  # (K,)
+        
+    #     # 4. 初步判断每个端点的方向偏好
+    #     disp_dot_heading0 = dx * cos_yaw0 + dy * sin_yaw0  # (K,)
+    #     disp_dot_heading1 = dx * cos_yaw1 + dy * sin_yaw1  # (K,)
+        
+    #     # 5. 关键：一致性检查和修正
+    #     # 检查是否出现"两端都指向内部"或"两端都指向外部"的情况
+        
+    #     # 初始方向判断
+    #     prefer_forward0 = disp_dot_heading0 >= 0
+    #     prefer_forward1 = disp_dot_heading1 >= 0
+        
+    #     # 检测异常情况
+    #     both_inward = (~prefer_forward0) & prefer_forward1   # 起点后退，终点前进 → 内凹
+    #     both_outward = prefer_forward0 & (~prefer_forward1)  # 起点前进，终点后退 → 外凸
+        
+    #     # 对于异常情况，使用一致性修正策略
+    #     forward0 = prefer_forward0.clone()
+    #     forward1 = prefer_forward1.clone()
+        
+    #     # 策略1：对于内凹情况，优先保持起点方向，调整终点
+    #     if both_inward.any():
+    #         # 内凹：起点想后退，终点想前进
+    #         # 选择总体位移大的方向作为主导方向
+    #         abs_proj0 = torch.abs(disp_dot_heading0)
+    #         abs_proj1 = torch.abs(disp_dot_heading1)
+            
+    #         # 如果起点的投影更大，则统一为后退
+    #         dominant_backward = (abs_proj0 >= abs_proj1) & both_inward
+    #         forward0[dominant_backward] = False
+    #         forward1[dominant_backward] = False
+            
+    #         # 如果终点的投影更大，则统一为前进
+    #         dominant_forward = (abs_proj0 < abs_proj1) & both_inward
+    #         forward0[dominant_forward] = True
+    #         forward1[dominant_forward] = True
+        
+    #     # 策略2：对于外凸情况，同样基于投影大小统一方向
+    #     if both_outward.any():
+    #         # 外凸：起点想前进，终点想后退
+    #         abs_proj0 = torch.abs(disp_dot_heading0)
+    #         abs_proj1 = torch.abs(disp_dot_heading1)
+            
+    #         # 如果起点的投影更大，则统一为前进
+    #         dominant_forward = (abs_proj0 >= abs_proj1) & both_outward
+    #         forward0[dominant_forward] = True
+    #         forward1[dominant_forward] = True
+            
+    #         # 如果终点的投影更大，则统一为后退
+    #         dominant_backward = (abs_proj0 < abs_proj1) & both_outward
+    #         forward0[dominant_backward] = False
+    #         forward1[dominant_backward] = False
+        
+    #     # 6. 附加检查：避免极端的反向情况
+    #     # 如果某个端点的朝向与位移方向夹角大于135度，强制调整
+    #     cos_angle0 = disp_dot_heading0 / (torch.sqrt(dx*dx + dy*dy + 1e-8))
+    #     cos_angle1 = disp_dot_heading1 / (torch.sqrt(dx*dx + dy*dy + 1e-8))
+        
+    #     # cos(135°) ≈ -0.707
+    #     extreme_angle_threshold = -0.707
+        
+    #     # 如果起点角度过于极端，强制与终点保持一致
+    #     extreme0 = cos_angle0 < extreme_angle_threshold
+    #     if extreme0.any():
+    #         forward0[extreme0] = forward1[extreme0]
+        
+    #     # 如果终点角度过于极端，强制与起点保持一致
+    #     extreme1 = cos_angle1 < extreme_angle_threshold
+    #     if extreme1.any():
+    #         forward1[extreme1] = forward0[extreme1]
+        
+    #     # 7. 计算修正后的端点切线向量
+    #     # 起点切线方向
+    #     v0x = torch.where(forward0, cos_yaw0, -cos_yaw0)  # (K,)
+    #     v0y = torch.where(forward0, sin_yaw0, -sin_yaw0)  # (K,)
+        
+    #     # 终点切线方向
+    #     v1x = torch.where(forward1, cos_yaw1, -cos_yaw1)  # (K,)
+    #     v1y = torch.where(forward1, sin_yaw1, -sin_yaw1)  # (K,)
+        
+    #     # 8. 计算切线速度的大小（保持原有逻辑）
+    #     disp_mag = torch.sqrt(dx*dx + dy*dy + 1e-8)  # (K,)
+    #     speed_scale = 1.5  # 可调参数
+        
+    #     speed0 = speed_scale * disp_mag / h  # (K,)
+    #     speed1 = speed_scale * disp_mag / h  # (K,)
+        
+    #     # 9. 构造端点切线向量（带大小）
+    #     v0 = torch.stack([speed0 * v0x, speed0 * v0y, torch.zeros_like(speed0)], dim=1)  # (K, 3)
+    #     v1 = torch.stack([speed1 * v1x, speed1 * v1y, torch.zeros_like(speed1)], dim=1)  # (K, 3)
+        
+    #     # 10. 对yaw进行单独处理（保持原有逻辑）
+    #     dyaw = yaw1 - yaw0  # (K,)
+    #     dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))  # 处理周期性
+        
+    #     vyaw0 = dyaw / h  # (K,)
+    #     vyaw1 = dyaw / h  # (K,)
+        
+    #     v0[:, 2] = vyaw0
+    #     v1[:, 2] = vyaw1
+        
+    #     # # 11. 诊断信息（可选）
+    #     # if torch.any(both_inward) or torch.any(both_outward):
+    #     #     n_inward = torch.sum(both_inward).item()
+    #     #     n_outward = torch.sum(both_outward).item()
+    #     #     print(f"Trajectory consistency correction: {n_inward} inward, {n_outward} outward segments corrected")
+        
+    #     # 12. 使用Hermite插值
+    #     poses, velocities, accelerations = self._hermite_interpolate_constrained(
+    #         p0, p1, v0, v1, s, h
+    #     )
+        
+    #     return poses, velocities, accelerations
+
+    def _hermite_interpolate_constrained(self, p0, p1, v0, v1, s, h):
+        """
+        约束版本的Hermite插值
+        这里的v0, v1已经是根据约束求解得到的端点切线向量
+        """
+        # 标准Hermite基函数
+        s2 = s * s
+        s3 = s2 * s
+        
+        h00 = 2*s3 - 3*s2 + 1        # H₀(s)
+        h10 = s3 - 2*s2 + s          # H₁(s)
+        h01 = -2*s3 + 3*s2           # H₂(s)
+        h11 = s3 - s2                # H₃(s)
+        
+        # 一阶导数
+        h00_dot = 6*s2 - 6*s         # H₀'(s)
+        h10_dot = 3*s2 - 4*s + 1     # H₁'(s)
+        h01_dot = -6*s2 + 6*s        # H₂'(s)
+        h11_dot = 3*s2 - 2*s         # H₃'(s)
+        
+        # 二阶导数
+        h00_ddot = 12*s - 6          # H₀''(s)
+        h10_ddot = 6*s - 4           # H₁''(s)
+        h01_ddot = -12*s + 6         # H₂''(s)
+        h11_ddot = 6*s - 2           # H₃''(s)
+        
+        # 扩展维度
+        h00 = h00.unsqueeze(1)       # (K, 1)
+        h10 = h10.unsqueeze(1)
+        h01 = h01.unsqueeze(1)
+        h11 = h11.unsqueeze(1)
+        h_exp = h.unsqueeze(1)       # (K, 1)
+        
+        h00_dot = h00_dot.unsqueeze(1)
+        h10_dot = h10_dot.unsqueeze(1)
+        h01_dot = h01_dot.unsqueeze(1)
+        h11_dot = h11_dot.unsqueeze(1)
+        
+        h00_ddot = h00_ddot.unsqueeze(1)
+        h10_ddot = h10_ddot.unsqueeze(1)
+        h01_ddot = h01_ddot.unsqueeze(1)
+        h11_ddot = h11_ddot.unsqueeze(1)
+        
+        # Hermite插值公式
+        poses = (h00 * p0 + h10 * h_exp * v0 + 
+                h01 * p1 + h11 * h_exp * v1)
+        
+        # 处理yaw的周期性
+        yaw_interp = poses[:, 2]
+        yaw_normalized = torch.atan2(torch.sin(yaw_interp), torch.cos(yaw_interp))
+        poses = torch.cat([
+            poses[:, :2],  # x, y保持不变
+            yaw_normalized.unsqueeze(1)  # 替换规范化后的yaw
+        ], dim=1)
+        
+        # 速度：dp/dt = (dp/ds) * (ds/dt) = (dp/ds) / h
+        dp_ds = (h00_dot * p0 + h10_dot * h_exp * v0 + 
+                h01_dot * p1 + h11_dot * h_exp * v1)
+        velocities = dp_ds / h_exp
+        
+        # 加速度：d²p/dt² = (d²p/ds²) / h²
+        d2p_ds2 = (h00_ddot * p0 + h10_ddot * h_exp * v0 + 
+                h01_ddot * p1 + h11_ddot * h_exp * v1)
+        accelerations = d2p_ds2 / (h_exp * h_exp)
+        
+        return poses, velocities, accelerations
+
+    def _compute_optimal_tangent_magnitudes(self, p0, p1, v0_dir, v1_dir, h):
+        """
+        给定端点位置和切线方向，求解最优的切线速度大小
+        使插值曲线最优地连接两点
+        """
+        # p0, p1: (K, 3) - 端点位置
+        # v0_dir, v1_dir: (K, 2) - 端点切线方向（单位向量）
+        # h: (K,) - 时间间隔
+        
+        K = p0.shape[0]
+        device = p0.device
+        
+        # 位移向量
+        dx = p1[:, 0] - p0[:, 0]  # (K,)
+        dy = p1[:, 1] - p0[:, 1]  # (K,)
+        
+        # 设置线性方程组求解切线速度大小
+        # Hermite插值的约束：p(1) = p0 + v0*h/3 + p1 - v1*h/3
+        # 重新整理：v0*h/3 - v1*h/3 = p1 - p0
+        # 即：v0_mag * v0_dir * h/3 - v1_mag * v1_dir * h/3 = [dx, dy]
+        
+        # 构造线性方程组 A * [v0_mag, v1_mag]^T = b
+        # 对于x分量：v0_mag * v0_dir[0] * h/3 - v1_mag * v1_dir[0] * h/3 = dx
+        # 对于y分量：v0_mag * v0_dir[1] * h/3 - v1_mag * v1_dir[1] * h/3 = dy
+        
+        # 简化系数
+        scale = h / 3.0  # (K,)
+        
+        # 构造系数矩阵 A: (K, 2, 2)
+        A = torch.zeros((K, 2, 2), device=device)
+        A[:, 0, 0] = v0_dir[:, 0] * scale  # v0_mag的x分量系数
+        A[:, 0, 1] = -v1_dir[:, 0] * scale  # v1_mag的x分量系数
+        A[:, 1, 0] = v0_dir[:, 1] * scale  # v0_mag的y分量系数
+        A[:, 1, 1] = -v1_dir[:, 1] * scale  # v1_mag的y分量系数
+        
+        # 构造右端项 b: (K, 2)
+        b = torch.stack([dx, dy], dim=1)  # (K, 2)
+        
+        # 求解线性方程组
+        try:
+            # 使用torch.linalg.solve求解
+            speeds = torch.linalg.solve(A, b)  # (K, 2)
+            v0_mag = speeds[:, 0]  # (K,)
+            v1_mag = speeds[:, 1]  # (K,)
+        except:
+            # 如果求解失败，使用启发式方法
+            disp_mag = torch.sqrt(dx*dx + dy*dy + 1e-8)
+            v0_mag = disp_mag / h
+            v1_mag = disp_mag / h
+        
+        return v0_mag, v1_mag
+            
+    # def _piecewise_se2_interpolation(self, control_poses, t_ctrl, t_eval):
+    #     """完全张量化的分段SE(2)插值"""
+    #     N = len(control_poses)
+    #     K = len(t_eval)
+    #     device = control_poses.device
+        
+    #     # 找到每个评估点对应的区间索引
+    #     indices = torch.searchsorted(t_ctrl, t_eval, right=False)
+    #     indices = torch.clamp(indices - 1, 0, N - 2)
+        
+    #     # 边界处理
+    #     mask_before = t_eval <= t_ctrl[0]
+    #     mask_after = t_eval >= t_ctrl[-1]
+        
+    #     # 检查是否正好在控制点上
+    #     mask_at_control = torch.zeros(K, dtype=torch.bool, device=device)
+    #     for i in range(N):
+    #         mask_at_control |= torch.abs(t_eval - t_ctrl[i]) < 1e-6
+        
+    #     mask_interior = ~(mask_before | mask_after | mask_at_control)
+        
+    #     # 初始化结果
+    #     result_poses = torch.zeros((K, 3), device=device)
+    #     result_velocities = torch.zeros((K, 3), device=device)
+    #     result_accelerations = torch.zeros((K, 3), device=device)
+        
+    #     # 处理边界点
+    #     if mask_before.any():
+    #         result_poses[mask_before] = control_poses[0]
+    #     if mask_after.any():
+    #         result_poses[mask_after] = control_poses[-1]
+        
+    #     # 处理正好在控制点上的点
+    #     if mask_at_control.any():
+    #         for i in range(N):
+    #             mask_i = torch.abs(t_eval - t_ctrl[i]) < 1e-6
+    #             if mask_i.any():
+    #                 result_poses[mask_i] = control_poses[i]
+        
+    #     # 处理内部点 - 张量化版本
+    #     if mask_interior.any():
+    #         t_eval_interior = t_eval[mask_interior]
+    #         indices_interior = indices[mask_interior]
+            
+    #         # 提取段的端点
+    #         t0 = t_ctrl[indices_interior]      # (K_interior,)
+    #         t1 = t_ctrl[indices_interior + 1]  # (K_interior,)
+    #         p0 = control_poses[indices_interior]      # (K_interior, 3)
+    #         p1 = control_poses[indices_interior + 1]  # (K_interior, 3)
+            
+    #         # 计算插值参数
+    #         s = (t_eval_interior - t0) / (t1 - t0)  # (K_interior,)
+            
+    #         # 位置线性插值
+    #         x_interp = (1 - s) * p0[:, 0] + s * p1[:, 0]  # (K_interior,)
+    #         y_interp = (1 - s) * p0[:, 1] + s * p1[:, 1]  # (K_interior,)
+            
+    #         # 角度插值（考虑周期性）
+    #         yaw0 = p0[:, 2]  # (K_interior,)
+    #         yaw1 = p1[:, 2]  # (K_interior,)
+    #         dyaw = yaw1 - yaw0
+    #         dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))  # 最短角度差
+    #         yaw_interp = yaw0 + s * dyaw
+    #         yaw_interp = torch.atan2(torch.sin(yaw_interp), torch.cos(yaw_interp))
+            
+    #         # 速度计算
+    #         dt = t1 - t0  # (K_interior,)
+    #         vx = (p1[:, 0] - p0[:, 0]) / dt
+    #         vy = (p1[:, 1] - p0[:, 1]) / dt  
+    #         vyaw = dyaw / dt
+            
+    #         # 填入结果
+    #         poses_interior = torch.stack([x_interp, y_interp, yaw_interp], dim=1)
+    #         velocities_interior = torch.stack([vx, vy, vyaw], dim=1)
+            
+    #         result_poses[mask_interior] = poses_interior
+    #         result_velocities[mask_interior] = velocities_interior
+    #         result_accelerations[mask_interior] = 0.0
+        
+    #     return result_poses, result_velocities, result_accelerations
 
     def world_to_grid_normalized(self, points_world):
         """
@@ -352,10 +1049,26 @@ class TrajectoryOptimizerSE2:
         
         # --- 成本项 ---
         
-        # a) 占据/碰撞成本
+        # a) 占据/碰撞成本（occupancy_map 现在保存的是带符号的 ESDF，单位：米）
         dense_traj_world = torch.stack([Sx, Sy, Syaw], dim=1)
-        grid_coords = self.world_to_grid_normalized(dense_traj_world)
-        occupancy_values = F.grid_sample(self.occupancy_map, grid_coords, mode='bilinear', padding_mode='border', align_corners=True)
+        grid_coords = self.world_to_grid_normalized(dense_traj_world)  # [1, K, 1, 1, 3]
+
+        # 先在连续坐标上对 ESDF 做插值，再把插值后的距离映射为 cost（sigmoid）
+        esdf_sample = F.grid_sample(
+            self.occupancy_map,    # shape [1,1,D,H,W], 内容为 signed ESDF (m)
+            grid_coords,           # [1, K, 1, 1, 3]
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True
+        )  # 输出形状类似 [1,1,K,1,1]
+
+        esdf_flat = esdf_sample.reshape(-1)   # (K,) —— 插值后的 ESDF 值（米）
+
+        d_safe = 0.15  # 安全距离阈值（米）
+        kalpa = 0.08   # 平滑参数（米）
+        z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
+        occupancy_values = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
+
         obstacle_cost = torch.mean(occupancy_values)
         
         # # --- a) 占据/碰撞成本（替换开始） ---
@@ -417,35 +1130,33 @@ class TrajectoryOptimizerSE2:
 
         # b) 平滑度成本 (对整个线进行评价，避免中间出现频繁抖动的曲线）
         # 使用二阶导数的平方和作为平滑度成本
-        smoothness_cost = torch.mean(Sx_ddot**2 + Sy_ddot**2 + Syaw_ddot**2)
+        smoothness_cost = torch.mean(1e-0*Sx_ddot**2 + 1e-0*Sy_ddot**2 + 2e-0*Syaw_ddot**2)
 
-        # c) 几何曲率 + 低速门控（弱化低速曲率惩罚，以允许倒车）
-        eps = 1e-9
+        # c) 几何曲率
+        eps = 1e-6
         speed = torch.sqrt(Sx_dot**2 + Sy_dot**2 + eps)
         geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-9)
-        geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-9)
-
-        # 低速下逐渐弱化曲率惩罚
         v_thresh = 0.08
         gate_k = 80.0
         gate = torch.sigmoid((speed - v_thresh) * gate_k)
-        # gate = torch.tensor(1.0, device=self.device)  # 直接使用 gate=1.0，表示不做门控（允许低速曲率）
-        curvature_limit = 2.1
+        curvature_limit = 1.4
         curvature_violation = torch.relu(geom_curvature - curvature_limit)
-        curvature_cost = torch.mean(gate * curvature_violation)
+        curvature_cost = torch.mean(gate * curvature_violation**1)*1e3
+        # curvature_cost = torch.mean(curvature_violation**1)*1e3
 
         # d) 禁止原地大角度转动（yaw per meter）
         # 衡量每米的朝向变化量：yaw_per_meter = |yaw_rate| / (speed + v_eps)
         v_eps = 1e-3
         yaw_per_meter = torch.abs(Syaw_dot) / (speed + v_eps)
-        # 允许一定的角度/米（例如 2 rad/m），超过则惩罚；使用平滑平方惩罚
-        yaw_per_meter_limit = 2.0
+        # yaw_per_meter = torch.abs(Syaw_dot)
+        # 允许一定的角度/米（例如 1 rad/m），超过则惩罚；使用平滑平方惩罚
+        yaw_per_meter_limit = 0.4
         yaw_per_meter_violation = torch.relu(yaw_per_meter - yaw_per_meter_limit)
-        yaw_per_meter_cost = torch.mean(yaw_per_meter_violation**2)
+        yaw_per_meter_cost = torch.mean(yaw_per_meter_violation**2)*1e1
         
         # e) 控制量最小化成本 (惩罚过大的速度)
-        w_angular_vel = 0.1
-        control_cost = torch.mean(Sx_dot**2 + Sy_dot**2) + w_angular_vel * torch.mean(Syaw_dot**2)
+        w_angular_vel = 1e-1
+        control_cost = 0*torch.mean(Sx_dot**2 + Sy_dot**2) + w_angular_vel * torch.mean(Syaw_dot**2)
         
         # # ---------- 替换 control_cost：惩罚横向加速度，弱惩切向加速度 ----------
         # # 目的：允许短时沿向(切向)加速（比如倒车起步/制动）而惩罚横向剧烈加速度（不稳定）
@@ -488,19 +1199,39 @@ class TrajectoryOptimizerSE2:
         # 因此既允许前向也允许倒车行驶。
         x_dot = Sx_dot
         y_dot = Sy_dot
+        
+        # 计算朝向的前进方向向量
+        forward_x = torch.cos(Syaw)  # (K,)
+        forward_y = torch.sin(Syaw)  # (K,)
+        
+        # 计算速度在朝向方向的投影（前进分量）
+        speed_projection = x_dot * forward_x + y_dot * forward_y  # (K,)
+        
+        # 方法1：直接惩罚负投影（倒车）
+        backward_penalty = torch.relu(-speed_projection)  # 只惩罚负值（倒车）
+        backward_cost = torch.mean(backward_penalty**2)
+        
         tangent_angle = torch.atan2(y_dot, x_dot)
         angle_diff = tangent_angle - Syaw
         angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))  # 规范到 [-pi, pi]
-        angle_diff_cost = torch.mean(torch.sin(angle_diff)**2)
+        # angle_diff_cost = torch.mean(torch.sin(angle_diff)**2)
+        # angle_diff_cost = torch.mean(angle_diff**2)*0 + backward_cost  # 结合倒车惩罚
+        angle_diff_cost = torch.mean(angle_diff**2)
         
         # g) 端点 yaw 对齐成本
         start_yaw_opt = ctrl_poses[0, 2]
         end_yaw_opt = ctrl_poses[-1, 2]
+        start_yaw_interp = Syaw[0]   # 插值轨迹的起点 yaw
+        end_yaw_interp = Syaw[-1]    # 插值轨迹的终点 yaw
         yaw0 = self.start_pose[2]
         yawn = self.end_pose[2]
-        yaw_diff_start = torch.atan2(torch.sin(start_yaw_opt - yaw0), torch.cos(start_yaw_opt - yaw0))
-        yaw_diff_end = torch.atan2(torch.sin(end_yaw_opt - yawn), torch.cos(end_yaw_opt - yawn))
-        yaw_endpoint_cost = torch.mean(torch.abs(yaw_diff_start)) + torch.mean(torch.abs(yaw_diff_end))
+        # 确保插值轨迹的端点 yaw 与固定端点 yaw 一致
+        yaw_diff_start = torch.atan2(torch.sin(start_yaw_interp - yaw0), torch.cos(start_yaw_interp - yaw0))
+        yaw_diff_end = torch.atan2(torch.sin(end_yaw_interp - yawn), torch.cos(end_yaw_interp - yawn))
+        yaw_endpoint_cost = torch.mean(yaw_diff_start**2) + torch.mean(yaw_diff_end**2)
+        # yaw_diff_start = torch.atan2(torch.sin(start_yaw_opt - yaw0), torch.cos(start_yaw_opt - yaw0))
+        # yaw_diff_end = torch.atan2(torch.sin(end_yaw_opt - yawn), torch.cos(end_yaw_opt - yawn))
+        # yaw_endpoint_cost = torch.mean(torch.abs(yaw_diff_start)) + torch.mean(torch.abs(yaw_diff_end))
         
         # h) 控制点连线轨迹光滑性损失
         # 计算控制点的xy连线的二阶导数
@@ -517,30 +1248,195 @@ class TrajectoryOptimizerSE2:
             ctrl_yaw_ddot = ctrl_yaw_dot[1:] - ctrl_yaw_dot[:-1]
             
             # 计算控制点连线的二阶导数平方和作为光滑性损失
-            ctrl_smoothness_cost = torch.mean(ctrl_x_ddot**2 + ctrl_y_ddot**2 \
-                                    # + ctrl_yaw_ddot**2 \
-                                    )
+            ctrl_smoothness_cost = torch.mean(1*ctrl_x_ddot**2 + 1*ctrl_y_ddot**2
+                                            + 1e2 * ctrl_yaw_ddot**2)
             
-        # i) 超出地图范围的惩罚（修正：判断是否在 [-map_limit, map_limit] 外）
-        map_limit = 5.0
+        # i) 重新设计：基于累积弧长的均匀性损失
+        N = ctrl_poses.shape[0]  # 控制点数量
+        K = len(self.t_dense)   # 密集采样点数量
+        
+        if N >= 2 and K >= 3:
+            # 1. 计算密集轨迹的累积弧长
+            dx_dense = Sx[1:] - Sx[:-1]  # (K-1,)
+            dy_dense = Sy[1:] - Sy[:-1]  # (K-1,)
+            segment_distances = torch.sqrt(dx_dense**2 + dy_dense**2 + eps)  # (K-1,)
+            
+            # 累积弧长：s[0]=0, s[i] = sum(segment_distances[0:i])
+            cumulative_arclength = torch.cat([
+                torch.zeros(1, device=self.device),
+                torch.cumsum(segment_distances, dim=0)
+            ])  # (K,)
+            
+            total_length = cumulative_arclength[-1]
+            
+            if total_length > 1e-8:
+                # 2. 计算理想的均匀分布弧长位置
+                ideal_positions = torch.linspace(0, total_length.cpu().item(), N, device=self.device)  # (N,)
+                
+                # 3. 找到每个控制点对应的实际弧长位置
+                # 控制点在参数空间的位置
+                t_ctrl = torch.linspace(0, 1, N, device=self.device)
+                
+                # 通过插值找到控制点对应的累积弧长
+                actual_positions = torch.zeros(N, device=self.device)
+                for i in range(N):
+                    t_val = t_ctrl[i]
+                    # 在 t_dense 中找到对应的索引（线性插值）
+                    if t_val <= 0:
+                        actual_positions[i] = 0
+                    elif t_val >= 1:
+                        actual_positions[i] = total_length
+                    else:
+                        # 线性插值
+                        idx_float = t_val * (K - 1)
+                        idx_low = int(torch.floor(idx_float))
+                        idx_high = min(idx_low + 1, K - 1)
+                        alpha = idx_float - idx_low
+                        
+                        if idx_low == idx_high:
+                            actual_positions[i] = cumulative_arclength[idx_low]
+                        else:
+                            actual_positions[i] = ((1 - alpha) * cumulative_arclength[idx_low] + 
+                                                alpha * cumulative_arclength[idx_high])
+                
+                # 4. 计算均匀性损失：实际位置与理想均匀位置的差异
+                position_errors = actual_positions - ideal_positions  # (N,)
+                
+                # 方法1：均方误差
+                uniformity_cost_mse = torch.mean(position_errors**2) / (total_length**2 + 1e-8)
+                
+                # 方法2：相对误差的平方和
+                relative_errors = position_errors / (total_length / (N - 1) + 1e-8)
+                uniformity_cost_rel = torch.mean(relative_errors**2)
+                
+                # 方法3：最大绝对误差的平方（关注最坏情况）
+                max_abs_error = torch.max(torch.abs(position_errors))
+                uniformity_cost_max = (max_abs_error / (total_length / (N - 1) + 1e-8))**2
+                
+                # 方法4：相邻段长度差异的平方和
+                segment_lengths = actual_positions[1:] - actual_positions[:-1]  # (N-1,)
+                ideal_segment_length = total_length / (N - 1)
+                length_deviations = segment_lengths - ideal_segment_length
+                uniformity_cost_dev = torch.mean(length_deviations**2) / (ideal_segment_length**2 + 1e-8)
+                
+                # 组合多种损失，提供更稳定的梯度
+                uniformity_cost = (0. * uniformity_cost_mse + 
+                                0. * uniformity_cost_rel + 
+                                0.1 * uniformity_cost_max + 
+                                0. * uniformity_cost_dev)
+                
+                # 调试信息
+                # print(f"Total length: {total_length.item():.4f}")
+                # print(f"Ideal positions: {ideal_positions.detach().cpu().numpy()}")
+                # print(f"Actual positions: {actual_positions.detach().cpu().numpy()}")
+                # print(f"Position errors: {position_errors.detach().cpu().numpy()}")
+                # print(f"Uniformity costs: MSE={uniformity_cost_mse.item():.6f}, "
+                #     f"REL={uniformity_cost_rel.item():.6f}, "
+                #     f"MAX={uniformity_cost_max.item():.6f}, "
+                #     f"DEV={uniformity_cost_dev.item():.6f}")
+            else:
+                uniformity_cost = torch.tensor(0.0, device=self.device)
+        else:
+            uniformity_cost = torch.tensor(0.0, device=self.device)
+            
+        # j) 超出地图范围的惩罚（修正：判断是否在 [-map_limit, map_limit] 外）
+        map_limit = 20.0
         overflow_x = torch.relu(torch.abs(Sx) - map_limit)
         overflow_y = torch.relu(torch.abs(Sy) - map_limit)
         out_of_bounds_cost = torch.mean(overflow_x + overflow_y)
         
+        # # j) 超出地图范围的惩罚（最终推荐版本）
+        # """改进的边界惩罚函数 - 更激进的惩罚"""
+        # map_limit = 20.0
         
+        # # 计算超出距离
+        # exceed_x = torch.abs(Sx) - map_limit
+        # exceed_y = torch.abs(Sy) - map_limit
+        
+        # # 只对超出边界的点计算惩罚
+        # violation_x = torch.relu(exceed_x)
+        # violation_y = torch.relu(exceed_y)
+        
+        # # 总违反量
+        # total_violation = violation_x + violation_y
+        
+        # # 多层惩罚策略
+        # # 1. 线性惩罚（远距离仍有梯度）
+        # linear_penalty = torch.sum(total_violation) * 1e6
+        
+        # # 2. 平方惩罚（中等距离快速增长）
+        # square_penalty = torch.sum(total_violation**2) * 1e7
+        
+        # # 3. 指数惩罚（近距离陡峭惩罚）
+        # exp_penalty = torch.sum(torch.exp(torch.clamp(total_violation, max=10.0)) - 1.0) * 1e5
+        
+        # # 4. 违反点数惩罚（每个超界点都有基础惩罚）
+        # num_violations = torch.sum((violation_x > 0) | (violation_y > 0)).float()
+        # count_penalty = num_violations * 1e8
+
+        # out_of_bounds_cost = linear_penalty + square_penalty + exp_penalty + count_penalty
+
+        # k) 轨迹总时间损失
+        # 计算轨迹的总弧长作为时间的代理
+        eps = 1e-6
+        dx_dense = Sx[1:] - Sx[:-1]  # (K-1,)
+        dy_dense = Sy[1:] - Sy[:-1]  # (K-1,)
+        segment_distances = torch.sqrt(dx_dense**2 + dy_dense**2 + eps)  # (K-1,)
+        
+        # 使用梯形法则
+        # 这里直接用速度的倒数乘以距离，等价于 ∫(1/v)ds
+        speed_dense = torch.sqrt(Sx_dot**2 + Sy_dot**2 + eps)  # (K,)
+        min_speed = 0.1  # 最小速度 (m/s)
+        speed_dense_safe = torch.clamp(speed_dense, min=min_speed)
+
+        # 梯形积分: ∫(1/v)ds ≈ Σ[(1/v_i + 1/v_{i+1})/2 * ds_i]
+        inv_speed_start = 1.0 / speed_dense_safe[:-1]  # (K-1,)
+        inv_speed_end = 1.0 / speed_dense_safe[1:]     # (K-1,)
+        inv_speed_avg = (inv_speed_start + inv_speed_end) / 2  # (K-1,)
+        total_time_trapezoid = torch.sum(inv_speed_avg * segment_distances)
+
+        time_cost_dynamic = total_time_trapezoid
+
+        time_cost = time_cost_dynamic  # 目前只使用基于动态模型的时间估计
+        
+        # l) 小速度惩罚损失
+        eps = 1e-6
+        speed = torch.sqrt(Sx_dot**2 + Sy_dot**2 + eps)
+        # 当速度接近0时，惩罚快速增长
+        speed_threshold = 2  # 开始惩罚的速度阈值
+        decay_rate = 5.0  # 衰减率，越大惩罚增长越快
+        exponential_penalty = torch.mean(torch.exp(-decay_rate * torch.clamp(speed - speed_threshold, min=0.0)))
+        slow_speed_cost = exponential_penalty
 
         # --- 组合成本 ---
         weights = {
-            'obstacle': 1e1,
-            'smoothness': 1e-4,
-            'curvature': 5e2,
-            'yaw_per_meter': 0e2, # 惩罚原地大角度转动的权重
-            'control': 1e-2,
-            'angle_diff': 5e2, # 惩罚角度与切线方向不一致的权重
-            'endpoints': 1e4,    # 强力惩罚端点 yaw 对齐
-            'control_smoothness': 0e3,  # 控制点连线的光滑性损失
-            'out_of_bounds': 1e8,  # 超出地图范围的惩罚
+            'obstacle': 3e-3,
+            'smoothness': 1e-7,
+            'curvature': 1e-2,
+            'yaw_per_meter': 0e-1, # 惩罚原地大角度转动的权重
+            'control': 1e-7,
+            'angle_diff': 0e-5, # 惩罚角度与切线方向不一致的权重
+            'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
+            'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
+            'uniformity': 1e1,  # 轨迹段长度均匀性损失
+            'out_of_bounds': 1e22,  # 超出地图范围的惩罚
+            'time': 0e100000,  # 时间损失
+            'slow_speed': 0e10,  # 小速度惩罚
         }
+        # weights = {
+        #     'obstacle': 0e-3,
+        #     'smoothness': 1e-7,
+        #     'curvature': 1e-3,
+        #     'yaw_per_meter': 1e0, # 惩罚原地大角度转动的权重
+        #     'control': 0e-8,
+        #     'angle_diff': 0e-5, # 惩罚角度与切线方向不一致的权重
+        #     'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
+        #     'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
+        #     'uniformity': 0e5,  # 轨迹段长度均匀性损失
+        #     'out_of_bounds': 1e90,  # 超出地图范围的惩罚
+        #     'time': 0e100000,  # 时间损失
+        #     'slow_speed': 0e10,  # 小速度惩罚
+        # }
          
         total_cost = (
             weights['obstacle'] * obstacle_cost +
@@ -551,8 +1447,11 @@ class TrajectoryOptimizerSE2:
             weights['angle_diff'] * angle_diff_cost +
             weights['endpoints'] * yaw_endpoint_cost +
             weights['control_smoothness'] * ctrl_smoothness_cost if self.variable_poses is not None else 0.0 +
-            weights['out_of_bounds'] * out_of_bounds_cost
-        )
+            weights['uniformity'] * uniformity_cost +
+            weights['out_of_bounds'] * out_of_bounds_cost +
+            weights['time'] * time_cost +
+            weights['slow_speed'] * slow_speed_cost
+        ) * 1e-2
          
         return total_cost
     
@@ -572,33 +1471,44 @@ class TrajectoryOptimizerSE2:
         # occupancy / obstacle cost
         dense_traj_world = torch.stack([Sx, Sy, Syaw], dim=1)
         grid_coords = self.world_to_grid_normalized(dense_traj_world)
-        occupancy_values = F.grid_sample(self.occupancy_map, grid_coords, mode='bilinear', padding_mode='border', align_corners=True)
+        esdf_sample = F.grid_sample(
+            self.occupancy_map,
+            grid_coords,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True
+        )
+        esdf_flat = esdf_sample.reshape(-1)
+        d_safe = 0.15
+        kalpa = 0.08
+        z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
+        occupancy_values = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
         obstacle_cost = torch.mean(occupancy_values)
 
         # smoothness
-        smoothness_cost = torch.mean(Sx_ddot**2 + Sy_ddot**2 + Syaw_ddot**2)
+        smoothness_cost = torch.mean(1e-0*Sx_ddot**2 + 1e-0*Sy_ddot**2 + 2e-0*Syaw_ddot**2)
 
         # curvature with low-speed gate
-        eps = 1e-9
+        eps = 1e-6
         speed = torch.sqrt(Sx_dot**2 + Sy_dot**2 + eps)
         geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-9)
         v_thresh = 0.08
         gate_k = 80.0
         gate = torch.sigmoid((speed - v_thresh) * gate_k)
-        curvature_limit = 2.1
+        curvature_limit = 1.4
         curvature_violation = torch.relu(geom_curvature - curvature_limit)
-        curvature_cost = torch.mean(gate * curvature_violation)
+        curvature_cost = torch.mean(gate * curvature_violation)*1e3
 
         # yaw per meter
         v_eps = 1e-3
         yaw_per_meter = torch.abs(Syaw_dot) / (speed + v_eps)
-        yaw_per_meter_limit = 2.0
+        yaw_per_meter_limit = 0.4
         yaw_per_meter_violation = torch.relu(yaw_per_meter - yaw_per_meter_limit)
-        yaw_per_meter_cost = torch.mean(yaw_per_meter_violation**2)
+        yaw_per_meter_cost = torch.mean(yaw_per_meter_violation**2)*1e1
 
         # control cost
         w_angular_vel = 0.1
-        control_cost = torch.mean(Sx_dot**2 + Sy_dot**2) + w_angular_vel * torch.mean(Syaw_dot**2)
+        control_cost = 0.0*torch.mean(Sx_dot**2 + Sy_dot**2) + w_angular_vel * torch.mean(Syaw_dot**2)
 
         # angle diff cost (sin^2 保持允许倒车)
         tangent_angle = torch.atan2(Sy_dot, Sx_dot)
@@ -628,8 +1538,96 @@ class TrajectoryOptimizerSE2:
                 ctrl_y_ddot = ctrl_y_dot[1:] - ctrl_y_dot[:-1]
                 ctrl_smoothness_cost = torch.mean(ctrl_x_ddot**2 + ctrl_y_ddot**2)
 
+        # i) 重新设计：基于累积弧长的均匀性损失
+        N = ctrl_poses.shape[0]  # 控制点数量
+        K = len(self.t_dense)   # 密集采样点数量
+        
+        if N >= 2 and K >= 3:
+            # 1. 计算密集轨迹的累积弧长
+            dx_dense = Sx[1:] - Sx[:-1]  # (K-1,)
+            dy_dense = Sy[1:] - Sy[:-1]  # (K-1,)
+            segment_distances = torch.sqrt(dx_dense**2 + dy_dense**2 + eps)  # (K-1,)
+            
+            # 累积弧长：s[0]=0, s[i] = sum(segment_distances[0:i])
+            cumulative_arclength = torch.cat([
+                torch.zeros(1, device=self.device),
+                torch.cumsum(segment_distances, dim=0)
+            ])  # (K,)
+            
+            total_length = cumulative_arclength[-1]
+            
+            if total_length > 1e-8:
+                # 2. 计算理想的均匀分布弧长位置
+                ideal_positions = torch.linspace(0, total_length.cpu().item(), N, device=self.device)  # (N,)
+                
+                # 3. 找到每个控制点对应的实际弧长位置
+                # 控制点在参数空间的位置
+                t_ctrl = torch.linspace(0, 1, N, device=self.device)
+                
+                # 通过插值找到控制点对应的累积弧长
+                actual_positions = torch.zeros(N, device=self.device)
+                for i in range(N):
+                    t_val = t_ctrl[i]
+                    # 在 t_dense 中找到对应的索引（线性插值）
+                    if t_val <= 0:
+                        actual_positions[i] = 0
+                    elif t_val >= 1:
+                        actual_positions[i] = total_length
+                    else:
+                        # 线性插值
+                        idx_float = t_val * (K - 1)
+                        idx_low = int(torch.floor(idx_float))
+                        idx_high = min(idx_low + 1, K - 1)
+                        alpha = idx_float - idx_low
+                        
+                        if idx_low == idx_high:
+                            actual_positions[i] = cumulative_arclength[idx_low]
+                        else:
+                            actual_positions[i] = ((1 - alpha) * cumulative_arclength[idx_low] + 
+                                                alpha * cumulative_arclength[idx_high])
+                
+                # 4. 计算均匀性损失：实际位置与理想均匀位置的差异
+                position_errors = actual_positions - ideal_positions  # (N,)
+                
+                # 方法1：均方误差
+                uniformity_cost_mse = torch.mean(position_errors**2) / (total_length**2 + 1e-8)
+                
+                # 方法2：相对误差的平方和
+                relative_errors = position_errors / (total_length / (N - 1) + 1e-8)
+                uniformity_cost_rel = torch.mean(relative_errors**2)
+                
+                # 方法3：最大绝对误差的平方（关注最坏情况）
+                max_abs_error = torch.max(torch.abs(position_errors))
+                uniformity_cost_max = (max_abs_error / (total_length / (N - 1) + 1e-8))**2
+                
+                # 方法4：相邻段长度差异的平方和
+                segment_lengths = actual_positions[1:] - actual_positions[:-1]  # (N-1,)
+                ideal_segment_length = total_length / (N - 1)
+                length_deviations = segment_lengths - ideal_segment_length
+                uniformity_cost_dev = torch.mean(length_deviations**2) / (ideal_segment_length**2 + 1e-8)
+                
+                # 组合多种损失，提供更稳定的梯度
+                uniformity_cost = (0. * uniformity_cost_mse + 
+                                0. * uniformity_cost_rel + 
+                                0.1 * uniformity_cost_max + 
+                                0. * uniformity_cost_dev)
+                
+                # 调试信息
+                # print(f"Total length: {total_length.item():.4f}")
+                # print(f"Ideal positions: {ideal_positions.detach().cpu().numpy()}")
+                # print(f"Actual positions: {actual_positions.detach().cpu().numpy()}")
+                # print(f"Position errors: {position_errors.detach().cpu().numpy()}")
+                # print(f"Uniformity costs: MSE={uniformity_cost_mse.item():.6f}, "
+                #     f"REL={uniformity_cost_rel.item():.6f}, "
+                #     f"MAX={uniformity_cost_max.item():.6f}, "
+                #     f"DEV={uniformity_cost_dev.item():.6f}")
+            else:
+                uniformity_cost = torch.tensor(0.0, device=self.device)
+        else:
+            uniformity_cost = torch.tensor(0.0, device=self.device)
+
         # out of bounds
-        map_limit = 5.0
+        map_limit = 20.0
         overflow_x = torch.relu(torch.abs(Sx) - map_limit)
         overflow_y = torch.relu(torch.abs(Sy) - map_limit)
         out_of_bounds_cost = torch.mean(overflow_x + overflow_y)
@@ -646,16 +1644,29 @@ class TrajectoryOptimizerSE2:
         #     'out_of_bounds': 1e8,
         # }
         
+        # weights = {
+        #     'obstacle': 1e1,
+        #     'smoothness': 1e-4,
+        #     'curvature': 5e2,
+        #     'yaw_per_meter': 1e2,
+        #     'control': 1e-2,
+        #     'angle_diff': 1e4,
+        #     'endpoints': 1e4,
+        #     'control_smoothness': 0e3,
+        #     'out_of_bounds': 1e8,
+        # }
+        
         weights = {
-            'obstacle': 1e1,
-            'smoothness': 1e-4,
-            'curvature': 5e2,
-            'yaw_per_meter': 1e2,
-            'control': 1e-2,
-            'angle_diff': 1e4,
-            'endpoints': 1e4,
-            'control_smoothness': 0e3,
-            'out_of_bounds': 1e8,
+            'obstacle': 3e-3,
+            'smoothness': 1e-7,
+            'curvature': 1e-2,
+            'yaw_per_meter': 0e-1, # 惩罚原地大角度转动的权重
+            'control': 1e-7,
+            'angle_diff': 0e-5, # 惩罚角度与切线方向不一致的权重
+            'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
+            'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
+            'uniformity': 1e1,  # 轨迹段长度均匀性损失
+            'out_of_bounds': 1e22,  # 超出地图范围的惩罚
         }
 
         total_cost = (
@@ -667,8 +1678,12 @@ class TrajectoryOptimizerSE2:
             weights['angle_diff'] * angle_diff_cost +
             weights['endpoints'] * yaw_endpoint_cost +
             weights['control_smoothness'] * ctrl_smoothness_cost +
+            weights['uniformity'] * uniformity_cost +
             weights['out_of_bounds'] * out_of_bounds_cost
         )
+        
+        total_cost = total_cost * 1e-2  # 统一缩放，避免数值过大
+        
         return total_cost
 
     def optimize(self, iterations=300, lr=0.01, verbose=True):
@@ -732,7 +1747,8 @@ def visualize_terrain_trajectory(ax, trajectory, elev, nx, ny, nz, positions=Non
     height_map = elev
     
     # 显示地形
-    im = ax.imshow(height_map, cmap='terrain', extent=[-5, 5, -5, 5], origin='lower')
+    # im = ax.imshow(height_map, cmap='terrain', extent=[-5, 5, -5, 5], origin='lower')
+    im = ax.imshow(height_map, cmap='terrain', extent=[-20, 20, -20, 20], origin='lower')
     plt.colorbar(im, ax=ax, label='Terrain Height')
     
     # 绘制轨迹
@@ -943,10 +1959,10 @@ if __name__ == "__main__":
 
     # --- 0. 加载地形数据 ---
     from dataLoader_uneven import UnevenPathDataLoader
-    env_list = ['env000012']
-    dataFolder = '/home/yrf/MPT/data/terrain/train'
+    env_list = ['env000000']
+    dataFolder = '/home/yrf/MPT/data/sim_dataset/train'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
-    path_index = 32    
+    path_index = 41
     sample = dataset[path_index]
     if sample is None:
         raise ValueError(f"Sample at index {path_index} is invalid.")
@@ -957,8 +1973,8 @@ if __name__ == "__main__":
 
     # --- 1. 定义代价地图参数并生成地图 ---
     map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
-    resolution = 0.1
-    origin = (-5.0, -5.0, -np.pi) # x, y, yaw
+    resolution = 0.4
+    origin = (-20.0, -20.0, -np.pi) # x, y, yaw
     map_info = {
         'resolution': resolution,
         'origin': origin,
@@ -971,7 +1987,67 @@ if __name__ == "__main__":
 
     # --- 2. 定义初始轨迹控制点 ---
     initial_points = sample['trajectory'].cpu().numpy()  # (x, y, yaw)
-    # 注意：这里不对 yaw 做周期化或 unwrap，保持原样
+
+    # --- 使用网络推理结果作为初始点 ---
+    # 生成模型预测轨迹
+    from dataLoader_uneven import get_encoder_input
+    from eval_model_uneven import get_patch
+    from transformer import Models
+    import os.path as osp
+    import json
+    
+    best = True
+    # best = False
+    stage = 1
+    # epoch = 39
+    # stage = 2
+    # epoch = 24
+
+    modelFolder = 'data/sim'
+    # modelFolder = 'data/uneven_old'
+    modelFile = osp.join(modelFolder, f'model_params.json')
+    model_param = json.load(open(modelFile))
+
+    transformer = Models.UnevenTransformer(**model_param)
+    _ = transformer.to(device)
+
+    # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
+    if stage == 1:
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
+    else:
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
+    transformer.load_state_dict(checkpoint['state_dict'])
+    
+    trajectory = sample['trajectory'].cpu().numpy()  # (N, 3)
+    goal_pos = trajectory[-1, :]  # 终点位置
+    start_pos = trajectory[0, :]  # 起点位置
+    
+    normal_x = nx.cpu().numpy()
+    normal_y = ny.cpu().numpy()
+    normal_z = nz.cpu().numpy()
+    
+    encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
+    patch_maps, predProb_list, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
+    # 确保 predTraj 是一个连续的 numpy/torch Tensor，然后再拼接起止点
+    if isinstance(predTraj, list):
+        pred_arr = np.asarray(predTraj, dtype=np.float32) if len(predTraj) > 0 else np.zeros((0, 3), dtype=np.float32)
+        pred_traj_t = torch.from_numpy(pred_arr).to(device)
+    elif torch.is_tensor(predTraj):
+        pred_traj_t = predTraj.to(device).float()
+    else:
+        pred_traj_t = torch.from_numpy(np.asarray(predTraj, dtype=np.float32)).to(device)
+
+    start_t = torch.tensor(start_pos, dtype=torch.float32, device=device).unsqueeze(0)
+    goal_t  = torch.tensor(goal_pos,  dtype=torch.float32, device=device).unsqueeze(0)
+    predTraj = torch.cat((start_t, pred_traj_t, goal_t), dim=0)
+    
+    initial_points = predTraj.cpu().numpy()  # 使用模型预测轨迹作为初始点
 
     # --- 3. 初始化并运行优化器 (使用 TrajectoryOptimizerSE2) ---
     optimizer = TrajectoryOptimizerSE2(initial_points, stability_cost_map, map_info, device=device)
@@ -983,8 +2059,7 @@ if __name__ == "__main__":
         initial_trajectory = torch.stack([Sx_i, Sy_i], dim=1).cpu().numpy()
 
     # 执行优化
-    optimized_trajectory, optimized_yaw_dense, cost_history = optimizer.optimize(iterations=400, lr=0.05, verbose=True)
-
+    optimized_trajectory, optimized_yaw_dense, cost_history = optimizer.optimize(iterations=1200, lr=0.1, verbose=True)
 
     # --- 4. 可视化结果 ---
     import mpl_toolkits.mplot3d  # 确保 3D 支持
@@ -1082,11 +2157,11 @@ if __name__ == "__main__":
     
     res = compute_esdf_batch(
         nx, ny, nz, queries,
-        resolution=0.1, origin=(-5.0, -5.0),
+        resolution=0.4, origin=(-20.0, -20.0),
         yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-5.0, -5.0), resolution=0.1)
-    
+    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
+
     # 绘制出 is_unreachables 对应的xy点
     if isinstance(is_unreachables, torch.Tensor):
         is_unreachables_np = is_unreachables.cpu().numpy()
@@ -1134,11 +2209,11 @@ if __name__ == "__main__":
 
     res = compute_esdf_batch(
         nx, ny, nz, queries,
-        resolution=0.1, origin=(-5.0, -5.0),
+        resolution=0.4, origin=(-20.0, -20.0),
         yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-5.0, -5.0), resolution=0.1)
-    
+    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
+
     # 绘制出 is_unreachables 对应的xy点
     if isinstance(is_unreachables, torch.Tensor):
         is_unreachables_np = is_unreachables.cpu().numpy()
@@ -1221,10 +2296,10 @@ if __name__ == "__main__":
     queries = torch.stack([x_q_mid, y_q_mid, yaw_q_mid], dim=1)
     res = compute_esdf_batch(
         nx, ny, nz, queries,
-        resolution=0.1, origin=(-5.0, -5.0),
+        resolution=0.4, origin=(-20.0, -20.0),
         yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-5.0, -5.0), resolution=0.1)
+    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
     # 绘制出 is_unreachables 对应的xy点
     if isinstance(is_unreachables, torch.Tensor):
         is_unreachables_np = is_unreachables.cpu().numpy()
@@ -1274,10 +2349,10 @@ if __name__ == "__main__":
     queries = torch.stack([x_q_mid, y_q_mid, yaw_q_mid], dim=1)
     res = compute_esdf_batch(
         nx, ny, nz, queries,
-        resolution=0.1, origin=(-5.0, -5.0),
+        resolution=0.4, origin=(-20.0, -20.0),
         yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-5.0, -5.0), resolution=0.1)
+    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
     # 绘制出 is_unreachables 对应的xy点
     if isinstance(is_unreachables, torch.Tensor):
         is_unreachables_np = is_unreachables.cpu().numpy()
@@ -1307,4 +2382,11 @@ if __name__ == "__main__":
     ax4.grid(True); ax4.set_yscale('log')
 
     plt.tight_layout()
+    
+    # savefig
+    fig1.savefig(f'figure_1_trajectory_comparison_{path_index}.png', dpi=300)
+    fig2.savefig(f'figure_2_3d_manifold_{path_index}.png', dpi=300)
+    fig3.savefig(f'figure_3_resampled_vs_optimized_{path_index}.png', dpi=300)
+    fig4.savefig(f'figure_4_cost_convergence_{path_index}.png', dpi=300)
+    
     plt.show()

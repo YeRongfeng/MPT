@@ -1,0 +1,5 @@
+# ninja log v5
+1	4527	1756369736986323082	/home/yrf/MPT/causal-conv1d-1.1.3/build/temp.linux-x86_64-cpython-313/csrc/causal_conv1d_update.o	35e018a8782088a1
+0	14354	1756369746802308372	/home/yrf/MPT/causal-conv1d-1.1.3/build/temp.linux-x86_64-cpython-313/csrc/causal_conv1d_fwd.o	e17a375d5a7aefb3
+0	22802	1756369755258295720	/home/yrf/MPT/causal-conv1d-1.1.3/build/temp.linux-x86_64-cpython-313/csrc/causal_conv1d.o	8f61792db31a350c
+0	31979	1756369764422282028	/home/yrf/MPT/causal-conv1d-1.1.3/build/temp.linux-x86_64-cpython-313/csrc/causal_conv1d_bwd.o	2d0a33804bed0f2c
