@@ -52,7 +52,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
         loss_weights = {
             'classification': 1e-2,  # 第一阶段专注轨迹回归
             'regression': 1e-4,
-            'uniformity': 0e-4,
+            'uniformity': 1e-4,
             'angle': 1e-3,
             'smoothness': 1e-4,
             'capsize': 0e-2,
@@ -84,7 +84,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 3e-7,
+            'capsize': 1e-2,
             'curvature': 0e-3,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
@@ -133,7 +133,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
                 weighted_coords = torch.einsum('nt,nc->tc', pred_probs, hash_table_tensor)
                 
                 # 坐标映射到实际坐标系
-                weighted_coords = -5.0 + weighted_coords * 0.1
+                weighted_coords = -20.0 + weighted_coords * 0.4
                 
                 # 应用修正偏移（基于概率计算）
                 if correctionVals is not None:
@@ -989,7 +989,7 @@ if __name__ == "__main__":
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
             # lr_mul = 0.3,
-            lr_mul = 1e-0,
+            lr_mul = 1e-1,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200
@@ -1109,7 +1109,7 @@ if __name__ == "__main__":
         # lr_mul = 1.0,
         lr_mul = 1e-3,
         d_model = 512,
-        n_warmup_steps = 800
+        n_warmup_steps = 200
     )
     
     # 第二阶段训练

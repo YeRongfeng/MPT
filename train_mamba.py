@@ -56,10 +56,10 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'classification': 1e-2,  # 第一阶段专注轨迹回归
             'regression': 1e-4, #1e-3
             'uniformity': 1e-4, #1e-4
-            'angle': 3e-4,      #3e-4
+            'angle': 1e-3,      #3e-3
             'smoothness': 1e-4, #1e-4
             'capsize': 0e-2,
-            'curvature': 1e-5,  #1e-5
+            'curvature': 0e-5,  #1e-5
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
         # loss_weights = {
@@ -136,7 +136,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
                 weighted_coords = torch.einsum('nt,nc->tc', pred_probs, hash_table_tensor)
                 
                 # 坐标映射到实际坐标系
-                weighted_coords = -5.0 + weighted_coords * 0.1
+                weighted_coords = -20.0 + weighted_coords * 0.4
                 
                 # 应用修正偏移（基于概率计算）
                 if correctionVals is not None:

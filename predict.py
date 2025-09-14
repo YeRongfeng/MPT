@@ -234,6 +234,8 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
     # 生成路径编号列表的简短表示，例如 1_2_3
     path_ids_str = "_".join(str(p) for p in pathNums)
     plt.savefig(osp.join(save_path, f'multi_trajectories_{path_ids_str}.png'), dpi=300)
+    print(f"Saved multi-trajectory comparison figure for paths {path_ids_str} in {envType} environment.")
+    print("fig saved to", osp.join(save_path, f'multi_trajectories_{path_ids_str}.png'))
     
 def plot_predProb_map(pathNum, envType, save_path='predictions'):
     """
@@ -349,9 +351,9 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
 if __name__ == "__main__":
     best = True
     # best = False
-    stage = 1
+    # stage = 1
     # epoch = 39
-    # stage = 2
+    stage = 2
     epoch = 24
     # envType_list = ['desert']
     envNum = np.random.randint(0, 99)  # 随机选择环境id
@@ -375,13 +377,17 @@ if __name__ == "__main__":
     if stage == 1:
         if best:
             checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
+            print("Loaded best stage 1 model.")
         else:
             checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
+            print(f"Loaded stage 1 model from epoch {epoch}.")
     else:
         if best:
             checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
+            print("Loaded best stage 2 model.")
         else:
             checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
+            print(f"Loaded stage 2 model from epoch {epoch}.")
     transformer.load_state_dict(checkpoint['state_dict'])
 
     _ = transformer.eval()
@@ -417,8 +423,8 @@ if __name__ == "__main__":
     for env in envType_list:
         print(f"Evaluating environment: {env}")
         # 绘制多条轨迹的预测概率图和GT标签图对比
-        for path_index in path_index_list:
-            plot_predProb_map(path_index, env, save_path)
+        # for path_index in path_index_list:
+            # plot_predProb_map(path_index, env, save_path)
 
         # 绘制多组轨迹对比图
         plot_elevation_map(path_index_list, env, save_path)
