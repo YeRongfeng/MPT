@@ -1694,16 +1694,23 @@ class TrajectoryOptimizerSE2:
         angle_diff = tangent_angle - Syaw
         angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
         # angle_diff_cost = torch.mean(torch.sin(angle_diff)**2)
-        angle_diff_cost = torch.mean(1.0 - torch.cos(angle_diff))
+        # angle_diff_cost = torch.mean(1.0 - torch.cos(angle_diff))
+        angle_diff_cost = torch.mean(angle_diff**2)
 
         # endpoints yaw cost (使用 ctrl 的首尾)
         start_yaw_opt = ctrl[0, 2]
         end_yaw_opt = ctrl[-1, 2]
+        start_yaw_interp = Syaw[0]   # 插值轨迹的起点 yaw
+        end_yaw_interp = Syaw[-1]    # 插值轨迹的终点 yaw
         yaw0 = self.start_pose[2]
         yawn = self.end_pose[2]
-        yaw_diff_start = torch.atan2(torch.sin(start_yaw_opt - yaw0), torch.cos(start_yaw_opt - yaw0))
-        yaw_diff_end = torch.atan2(torch.sin(end_yaw_opt - yawn), torch.cos(end_yaw_opt - yawn))
-        yaw_endpoint_cost = torch.mean(torch.abs(yaw_diff_start)) + torch.mean(torch.abs(yaw_diff_end))
+        # 确保插值轨迹的端点 yaw 与固定端点 yaw 一致
+        yaw_diff_start = torch.atan2(torch.sin(start_yaw_interp - yaw0), torch.cos(start_yaw_interp - yaw0))
+        yaw_diff_end = torch.atan2(torch.sin(end_yaw_interp - yawn), torch.cos(end_yaw_interp - yawn))
+        yaw_endpoint_cost = torch.mean(yaw_diff_start**2) + torch.mean(yaw_diff_end**2)
+        # yaw_diff_start = torch.atan2(torch.sin(start_yaw_opt - yaw0), torch.cos(start_yaw_opt - yaw0))
+        # yaw_diff_end = torch.atan2(torch.sin(end_yaw_opt - yawn), torch.cos(end_yaw_opt - yawn))
+        # yaw_endpoint_cost = torch.mean(torch.abs(yaw_diff_start)) + torch.mean(torch.abs(yaw_diff_end))
 
         # control smoothness on control points if available (use ctrl directly)
         ctrl_smoothness_cost = torch.tensor(0.0, device=device)
@@ -1717,92 +1724,72 @@ class TrajectoryOptimizerSE2:
                 ctrl_y_ddot = ctrl_y_dot[1:] - ctrl_y_dot[:-1]
                 ctrl_smoothness_cost = torch.mean(ctrl_x_ddot**2 + ctrl_y_ddot**2)
 
-        # i) 重新设计：基于累积弧长的均匀性损失
+        # i) 重新设计：基于控制点间直线距离的均匀性损失
         N = ctrl_poses.shape[0]  # 控制点数量
-        K = len(self.t_dense)   # 密集采样点数量
-        
-        if N >= 2 and K >= 3:
-            # 1. 计算密集轨迹的累积弧长
-            dx_dense = Sx[1:] - Sx[:-1]  # (K-1,)
-            dy_dense = Sy[1:] - Sy[:-1]  # (K-1,)
-            segment_distances = torch.sqrt(dx_dense**2 + dy_dense**2 + eps)  # (K-1,)
+                
+        if N >= 2:
+            # 1. 计算控制点之间的直线距离
+            dx = ctrl_poses[1:, 0] - ctrl_poses[:-1, 0]  # (N-1,)
+            dy = ctrl_poses[1:, 1] - ctrl_poses[:-1, 1]  # (N-1,)
+            segment_distances = torch.sqrt(dx**2 + dy**2 + eps)  # (N-1,) 相邻控制点间的直线距离
             
-            # 累积弧长：s[0]=0, s[i] = sum(segment_distances[0:i])
-            cumulative_arclength = torch.cat([
-                torch.zeros(1, device=self.device),
-                torch.cumsum(segment_distances, dim=0)
-            ])  # (K,)
+            # 2. 计算总路径长度（所有线段距离之和）
+            total_length = torch.sum(segment_distances)
             
-            total_length = cumulative_arclength[-1]
-            
-            if total_length > 1e-8:
-                # 2. 计算理想的均匀分布弧长位置
-                ideal_positions = torch.linspace(0, total_length.cpu().item(), N, device=self.device)  # (N,)
+            # 修复：降低阈值判断，添加调试信息
+            if total_length > 1e-10:  # 降低阈值从 1e-8 到 1e-10
+                # 3. 计算理想的均匀段长度
+                ideal_segment_length = total_length / (N - 1)  # 理想情况下每段的长度
                 
-                # 3. 找到每个控制点对应的实际弧长位置
-                # 控制点在参数空间的位置
-                t_ctrl = torch.linspace(0, 1, N, device=self.device)
+                # 4. 计算各种均匀性损失
                 
-                # 通过插值找到控制点对应的累积弧长
-                actual_positions = torch.zeros(N, device=self.device)
-                for i in range(N):
-                    t_val = t_ctrl[i]
-                    # 在 t_dense 中找到对应的索引（线性插值）
-                    if t_val <= 0:
-                        actual_positions[i] = 0
-                    elif t_val >= 1:
-                        actual_positions[i] = total_length
-                    else:
-                        # 线性插值
-                        idx_float = t_val * (K - 1)
-                        idx_low = int(torch.floor(idx_float))
-                        idx_high = min(idx_low + 1, K - 1)
-                        alpha = idx_float - idx_low
-                        
-                        if idx_low == idx_high:
-                            actual_positions[i] = cumulative_arclength[idx_low]
-                        else:
-                            actual_positions[i] = ((1 - alpha) * cumulative_arclength[idx_low] + 
-                                                alpha * cumulative_arclength[idx_high])
+                # 方法1：段长度方差（标准化）
+                length_deviations = segment_distances - ideal_segment_length  # (N-1,)
+                uniformity_cost_var = torch.var(segment_distances) / (ideal_segment_length**2 + 1e-12)
                 
-                # 4. 计算均匀性损失：实际位置与理想均匀位置的差异
-                position_errors = actual_positions - ideal_positions  # (N,)
+                # 方法2：段长度的均方偏差
+                uniformity_cost_mse = torch.mean(length_deviations**2) / (ideal_segment_length**2 + 1e-12)
                 
-                # 方法1：均方误差
-                uniformity_cost_mse = torch.mean(position_errors**2) / (total_length**2 + 1e-8)
+                # 方法3：相对偏差的平方和
+                relative_deviations = length_deviations / (ideal_segment_length + 1e-12)
+                uniformity_cost_rel = torch.mean(relative_deviations**2)
                 
-                # 方法2：相对误差的平方和
-                relative_errors = position_errors / (total_length / (N - 1) + 1e-8)
-                uniformity_cost_rel = torch.mean(relative_errors**2)
+                # 方法4：最大偏差的平方（关注最不均匀的段）
+                max_deviation = torch.max(torch.abs(length_deviations))
+                uniformity_cost_max = (max_deviation / (ideal_segment_length + 1e-12))**2
                 
-                # 方法3：最大绝对误差的平方（关注最坏情况）
-                max_abs_error = torch.max(torch.abs(position_errors))
-                uniformity_cost_max = (max_abs_error / (total_length / (N - 1) + 1e-8))**2
+                # 方法5：基于比值的损失（避免某段过长或过短）
+                # 计算每段与理想长度的比值，理想情况下所有比值都应该接近1
+                length_ratios = segment_distances / (ideal_segment_length + 1e-12)  # (N-1,)
+                # 使用对数来惩罚比值偏离1的情况（对称地惩罚过长和过短）
+                log_ratios = torch.log(torch.clamp(length_ratios, min=1e-12))  # 添加clamp防止log(0)
+                uniformity_cost_ratio = torch.mean(log_ratios**2)
                 
-                # 方法4：相邻段长度差异的平方和
-                segment_lengths = actual_positions[1:] - actual_positions[:-1]  # (N-1,)
-                ideal_segment_length = total_length / (N - 1)
-                length_deviations = segment_lengths - ideal_segment_length
-                uniformity_cost_dev = torch.mean(length_deviations**2) / (ideal_segment_length**2 + 1e-8)
+                # 修复：调整权重，确保至少一个方法有非零权重
+                uniformity_cost = (1.0 * uniformity_cost_mse + 
+                                0.0 * uniformity_cost_var + 
+                                0.0 * uniformity_cost_rel + 
+                                0.0 * uniformity_cost_max + 
+                                0.0 * uniformity_cost_ratio)
                 
-                # 组合多种损失，提供更稳定的梯度
-                uniformity_cost = (0.1 * uniformity_cost_mse + 
-                                0. * uniformity_cost_rel + 
-                                0. * uniformity_cost_max + 
-                                0. * uniformity_cost_dev)
+                # 添加调试信息 - 临时开启
+                # print(f"Debug uniformity cost:")
+                # print(f"  N={N}, total_length={total_length.item():.6f}")
+                # print(f"  ideal_segment_length={ideal_segment_length.item():.6f}")
+                # print(f"  segment_distances={segment_distances.detach().cpu().numpy()}")
+                # print(f"  length_deviations={length_deviations.detach().cpu().numpy()}")
+                # print(f"  uniformity_cost_mse={uniformity_cost_mse.item():.6f}")
+                # print(f"  uniformity_cost_var={uniformity_cost_var.item():.6f}")
+                # print(f"  uniformity_cost_rel={uniformity_cost_rel.item():.6f}")
+                # print(f"  uniformity_cost_max={uniformity_cost_max.item():.6f}")
+                # print(f"  uniformity_cost_ratio={uniformity_cost_ratio.item():.6f}")
+                # print(f"  final uniformity_cost={uniformity_cost.item():.6f}")
                 
-                # 调试信息
-                # print(f"Total length: {total_length.item():.4f}")
-                # print(f"Ideal positions: {ideal_positions.detach().cpu().numpy()}")
-                # print(f"Actual positions: {actual_positions.detach().cpu().numpy()}")
-                # print(f"Position errors: {position_errors.detach().cpu().numpy()}")
-                # print(f"Uniformity costs: MSE={uniformity_cost_mse.item():.6f}, "
-                #     f"REL={uniformity_cost_rel.item():.6f}, "
-                #     f"MAX={uniformity_cost_max.item():.6f}, "
-                #     f"DEV={uniformity_cost_dev.item():.6f}")
             else:
+                # print(f"Debug: total_length too small: {total_length.item():.10f}")
                 uniformity_cost = torch.tensor(0.0, device=self.device)
         else:
+            # print(f"Debug: N={N} < 2, skipping uniformity cost")
             uniformity_cost = torch.tensor(0.0, device=self.device)
 
         # out of bounds
@@ -1840,8 +1827,8 @@ class TrajectoryOptimizerSE2:
             'smoothness': 1e-7,
             'curvature': 1e-3,
             'yaw_per_meter': 1e-2, # 惩罚原地大角度转动的权重
-            'control': 1e-7,
-            'angle_diff': 1e-1, # 惩罚角度与切线方向不一致的权重
+            'control': 0e-7,
+            'angle_diff': 1e-0, # 惩罚角度与切线方向不一致的权重
             'endpoints': 1e0,    # 强力惩罚端点 yaw 对齐
             'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
             'uniformity': 1e-1,  # 轨迹段长度均匀性损失
@@ -1856,7 +1843,7 @@ class TrajectoryOptimizerSE2:
             weights['control'] * control_cost +
             weights['angle_diff'] * angle_diff_cost +
             weights['endpoints'] * yaw_endpoint_cost +
-            weights['control_smoothness'] * ctrl_smoothness_cost +
+            # weights['control_smoothness'] * ctrl_smoothness_cost +
             weights['uniformity'] * uniformity_cost +
             weights['out_of_bounds'] * out_of_bounds_cost
         )
@@ -2290,10 +2277,10 @@ if __name__ == "__main__":
     
     res = compute_esdf_batch(
         nx, ny, nz, queries,
-        resolution=0.1, origin=(-5.0, -5.0),
+        resolution=0.4, origin=(-20.0, -20.0),
         yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-5.0, -5.0), resolution=0.1)
+    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
     # 打印 is_unreachables 的统计信息
     if isinstance(is_unreachables, torch.Tensor):
         is_unreachables_np = is_unreachables.cpu().numpy()

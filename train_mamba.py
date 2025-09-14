@@ -87,7 +87,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 1e-5,
+            'capsize': 1e-2,
             'curvature': 0e-3,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
@@ -1109,7 +1109,7 @@ if __name__ == "__main__":
         optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                    betas=(0.9, 0.98), eps=1e-9),
         # lr_mul = 1.0,
-        lr_mul = 1e-3,
+        lr_mul = 1e-4,
         d_model = 512,
         n_warmup_steps = 800
     )
