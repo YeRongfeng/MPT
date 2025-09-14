@@ -637,9 +637,9 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         # model.correctionPred.train()
     else:
         # 第二阶段：只训练correctionPred
-        # model.train()  # 设置模型为训练模式：启用dropout和batch normalization
-        model.eval() 
-        model.correctionPred.train()
+        model.train()  # 设置模型为训练模式：启用dropout和batch normalization
+        # model.eval() 
+        # model.correctionPred.train()
     total_loss = 0  # 初始化总损失
     total_n_correct = 0  # 初始化总正确预测数
     total_samples = 0  # 初始化总样本数

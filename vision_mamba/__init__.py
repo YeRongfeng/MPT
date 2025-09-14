@@ -1,3 +1,3 @@
-from vision_mamba.model import Vim
+# from vision_mamba.model import Vim
 
-__all__ = ["Vim"]
+# __all__ = ["Vim"]

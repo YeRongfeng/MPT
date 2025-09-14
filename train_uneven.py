@@ -84,7 +84,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 1e-2,
+            'capsize': 1e-3,
             'curvature': 0e-3,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
@@ -634,9 +634,9 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         # model.correctionPred.train()
     else:
         # 第二阶段：只训练correctionPred
-        # model.train()  # 设置模型为训练模式：启用dropout和batch normalization
-        model.eval() 
-        model.correctionPred.train()
+        model.train()  # 设置模型为训练模式：启用dropout和batch normalization
+        # model.eval() 
+        # model.correctionPred.train()
     total_loss = 0  # 初始化总损失
     total_n_correct = 0  # 初始化总正确预测数
     total_samples = 0  # 初始化总样本数
@@ -1085,8 +1085,8 @@ if __name__ == "__main__":
             writer.add_scalar('Stage1/Accuracy/train', train_accuracy, n)
             writer.add_scalar('Stage1/Accuracy/test', val_accuracy, n)
     
-    # 第二阶段：冻结其他参数，只训练correctionPred
-    print("=== Stage 2: Training only correctionPred parameters ===")
+    # 第二阶段
+    print("=== Stage 2: Training by optimizer ===")
     # for param in transformer.parameters():
     #     param.requires_grad = False
     # for param in transformer.correctionPred.parameters():
@@ -1109,7 +1109,7 @@ if __name__ == "__main__":
         # lr_mul = 1.0,
         lr_mul = 1e-3,
         d_model = 512,
-        n_warmup_steps = 200
+        n_warmup_steps = 800
     )
     
     # 第二阶段训练

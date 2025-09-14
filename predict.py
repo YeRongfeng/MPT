@@ -349,12 +349,12 @@ def plot_predProb_map(pathNum, envType, save_path='predictions'):
     plt.close()  # 关闭图像以释放内存
 
 if __name__ == "__main__":
-    best = True
-    # best = False
+    # best = True
+    best = False
     # stage = 1
     # epoch = 39
     stage = 2
-    epoch = 24
+    epoch = 4
     # envType_list = ['desert']
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
@@ -418,7 +418,7 @@ if __name__ == "__main__":
     # # 绘制多组轨迹对比图
     # plot_elevation_map(path_index_list, envType_random, save_path)
     
-    # plot_predProb_map(0, envType_list[0], save_path)
+    plot_predProb_map(2, envType_list[0], save_path)
     
     for env in envType_list:
         print(f"Evaluating environment: {env}")
