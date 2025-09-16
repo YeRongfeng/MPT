@@ -1869,7 +1869,7 @@ class TrajectoryOptimizerSE2:
         # }
 
         weights = {
-            'obstacle': 3e-3,
+            'obstacle': 1e-2,
             'smoothness': 1e-7,
             'curvature': 1e-3,
             'yaw_per_meter': 0e-2, # 惩罚原地大角度转动的权重
@@ -2165,6 +2165,40 @@ def generate_stability_cost_map(nx, ny, nz, map_info, device='cuda'):
     print("Stability cost map generated.")
     return cost_map
 
+def check_trajectory_reachability(trajectory_points, yaw_values, yaw_stability):
+    """
+    使用与 data_clean.py 一致的方法检查轨迹点的可达性
+    
+    Args:
+        trajectory_points: numpy array of shape (N, 2) - x, y coordinates
+        yaw_values: numpy array of shape (N,) - yaw angles
+        yaw_stability: torch tensor of shape (H, W, 36) - stability map
+    
+    Returns:
+        capsize_mask: numpy array of shape (N,) - True for unreachable points
+    """
+    capsize_mask = []
+    
+    for i in range(len(trajectory_points)):
+        x, y = trajectory_points[i]
+        yaw = yaw_values[i]
+        
+        # 与 data_clean.py 完全一致的坐标转换
+        x_idx = int((x + 20) / 0.4)
+        y_idx = int((y + 20) / 0.4)
+        yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
+        
+        # 边界检查和稳定性判断
+        if 0 <= x_idx < yaw_stability.shape[0] and 0 <= y_idx < yaw_stability.shape[1]:
+            yaw_stability_value = yaw_stability[x_idx, y_idx, yaw_idx]
+            is_unreachable = (yaw_stability_value == 0)
+        else:
+            is_unreachable = True  # 超出地图边界
+            
+        capsize_mask.append(is_unreachable)
+    
+    return np.array(capsize_mask, dtype=bool)
+
 
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -2193,7 +2227,7 @@ if __name__ == "__main__":
     # --- 0. 加载地形数据 ---
     from dataLoader_uneven import UnevenPathDataLoader
     env_list = ['env000000']
-    dataFolder = '/home/sdu/MPT/data/sim_dataset/train'
+    dataFolder = '/home/yrf/MPT/data/sim_dataset/train'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
     path_index = 2
     sample = dataset[path_index]
@@ -2222,67 +2256,67 @@ if __name__ == "__main__":
     # --- 2. 定义初始轨迹控制点 ---
     initial_points = sample['trajectory'].cpu().numpy()  # (x, y, yaw)
 
-    # --- 使用网络推理结果作为初始点 ---
-    # 生成模型预测轨迹
-    from dataLoader_uneven import get_encoder_input
-    from eval_model_uneven import get_patch
-    # from transformer import Models
-    from vision_mamba import Models
-    import os.path as osp
-    import json
+    # # --- 使用网络推理结果作为初始点 ---
+    # # 生成模型预测轨迹
+    # from dataLoader_uneven import get_encoder_input
+    # from eval_model_uneven import get_patch
+    # # from transformer import Models
+    # from vision_mamba import Models
+    # import os.path as osp
+    # import json
     
-    best = True
-    # best = False
-    stage = 1
-    # epoch = 39
-    # stage = 2
-    # epoch = 24
+    # best = True
+    # # best = False
+    # stage = 1
+    # # epoch = 39
+    # # stage = 2
+    # # epoch = 24
 
-    modelFolder = 'data/sim'
-    # modelFolder = 'data/uneven_old'
-    modelFile = osp.join(modelFolder, f'model_params.json')
-    model_param = json.load(open(modelFile))
+    # modelFolder = 'data/sim'
+    # # modelFolder = 'data/uneven_old'
+    # modelFile = osp.join(modelFolder, f'model_params.json')
+    # model_param = json.load(open(modelFile))
 
-    transformer = Models.UnevenTransformer(**model_param)
-    _ = transformer.to(device)
+    # transformer = Models.UnevenTransformer(**model_param)
+    # _ = transformer.to(device)
 
-    # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
-    if stage == 1:
-        if best:
-            checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
-        else:
-            checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
-    else:
-        if best:
-            checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
-        else:
-            checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
-    transformer.load_state_dict(checkpoint['state_dict'])
+    # # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
+    # if stage == 1:
+    #     if best:
+    #         checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
+    #     else:
+    #         checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
+    # else:
+    #     if best:
+    #         checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
+    #     else:
+    #         checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
+    # transformer.load_state_dict(checkpoint['state_dict'])
     
-    trajectory = sample['trajectory'].cpu().numpy()  # (N, 3)
-    goal_pos = trajectory[-1, :]  # 终点位置
-    start_pos = trajectory[0, :]  # 起点位置
+    # trajectory = sample['trajectory'].cpu().numpy()  # (N, 3)
+    # goal_pos = trajectory[-1, :]  # 终点位置
+    # start_pos = trajectory[0, :]  # 起点位置
     
-    normal_x = nx.cpu().numpy()
-    normal_y = ny.cpu().numpy()
-    normal_z = nz.cpu().numpy()
+    # normal_x = nx.cpu().numpy()
+    # normal_y = ny.cpu().numpy()
+    # normal_z = nz.cpu().numpy()
     
-    encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
-    patch_maps, predProb_list, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
-    # 确保 predTraj 是一个连续的 numpy/torch Tensor，然后再拼接起止点
-    if isinstance(predTraj, list):
-        pred_arr = np.asarray(predTraj, dtype=np.float32) if len(predTraj) > 0 else np.zeros((0, 3), dtype=np.float32)
-        pred_traj_t = torch.from_numpy(pred_arr).to(device)
-    elif torch.is_tensor(predTraj):
-        pred_traj_t = predTraj.to(device).float()
-    else:
-        pred_traj_t = torch.from_numpy(np.asarray(predTraj, dtype=np.float32)).to(device)
+    # encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
+    # patch_maps, predProb_list, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
+    # # 确保 predTraj 是一个连续的 numpy/torch Tensor，然后再拼接起止点
+    # if isinstance(predTraj, list):
+    #     pred_arr = np.asarray(predTraj, dtype=np.float32) if len(predTraj) > 0 else np.zeros((0, 3), dtype=np.float32)
+    #     pred_traj_t = torch.from_numpy(pred_arr).to(device)
+    # elif torch.is_tensor(predTraj):
+    #     pred_traj_t = predTraj.to(device).float()
+    # else:
+    #     pred_traj_t = torch.from_numpy(np.asarray(predTraj, dtype=np.float32)).to(device)
 
-    start_t = torch.tensor(start_pos, dtype=torch.float32, device=device).unsqueeze(0)
-    goal_t  = torch.tensor(goal_pos,  dtype=torch.float32, device=device).unsqueeze(0)
-    predTraj = torch.cat((start_t, pred_traj_t, goal_t), dim=0)
+    # start_t = torch.tensor(start_pos, dtype=torch.float32, device=device).unsqueeze(0)
+    # goal_t  = torch.tensor(goal_pos,  dtype=torch.float32, device=device).unsqueeze(0)
+    # predTraj = torch.cat((start_t, pred_traj_t, goal_t), dim=0)
     
-    initial_points = predTraj.cpu().numpy()  # 使用模型预测轨迹作为初始点
+    # initial_points = predTraj.cpu().numpy()  # 使用模型预测轨迹作为初始点
 
     # # 在训练前验证
     # if not verify_optimizer_consistency():
@@ -2302,7 +2336,7 @@ if __name__ == "__main__":
 
     # 设置优化参数
     iterations = 800
-    lr = 0.3
+    lr = 0.1
     grad_clip_norm = 1.0
 
     # 只优化中间点，固定起点和终点
@@ -2476,36 +2510,80 @@ if __name__ == "__main__":
     # --- 先单独检测一下原轨迹的控制点，是否存在会倾覆的点 ---
     initial_yaw_dense = initial_trajectory_full[:, 2]  # 初始轨迹的 yaw_dense
     initial_points_tensor = torch.tensor(initial_points, device=device, dtype=torch.float32)
-    # 计算初始轨迹的中间点（去除首尾）
-    x_q = initial_points_tensor[1:-1, 0]
-    y_q = initial_points_tensor[1:-1, 1]
-    yaw_q = initial_points_tensor[1:-1, 2]
-    queries = torch.stack([x_q, y_q, yaw_q], dim=1)
+    # # 计算初始轨迹的中间点（去除首尾）
+    # x_q = initial_points_tensor[1:-1, 0]
+    # y_q = initial_points_tensor[1:-1, 1]
+    # yaw_q = initial_points_tensor[1:-1, 2]
+    # queries = torch.stack([x_q, y_q, yaw_q], dim=1)
     
-    res = compute_esdf_batch(
-        nx, ny, nz, queries,
-        resolution=0.4, origin=(-20.0, -20.0),
-        yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
-    )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
-    # 打印 is_unreachables 的统计信息
-    if isinstance(is_unreachables, torch.Tensor):
-        is_unreachables_np = is_unreachables.cpu().numpy()
-    else:
-        is_unreachables_np = np.asarray(is_unreachables)
-    capsize_mask = is_unreachables_np > 0  # 将不可行点置为 True，其余为 False
-    # 安全检查掩码长度是否与中间点数一致，若不一致则尝试对齐或截断
-    mid_points = initial_trajectory[1:-1]
-    if capsize_mask.shape[0] != mid_points.shape[0]:
-        # 尽量截断或扩展掩码到匹配长度（以 False 填充）
-        mask = np.zeros(mid_points.shape[0], dtype=bool)
-        L = min(mask.shape[0], capsize_mask.shape[0])
-        mask[:L] = capsize_mask[:L]
-        capsize_mask = mask
-    capsize_points = mid_points[capsize_mask]
-    num_capsize = np.sum(capsize_mask)
-    print(f"Number of points which is unreachable in <initial_control_poses>: {num_capsize} out of {len(is_unreachables)}, percentage: {num_capsize / len(is_unreachables) * 100:.2f}%")
+    # res = compute_esdf_batch(
+    #     nx, ny, nz, queries,
+    #     resolution=0.4, origin=(-20.0, -20.0),
+    #     yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
+    # )
+    # is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
+    # # 打印 is_unreachables 的统计信息
+    # if isinstance(is_unreachables, torch.Tensor):
+    #     is_unreachables_np = is_unreachables.cpu().numpy()
+    # else:
+    #     is_unreachables_np = np.asarray(is_unreachables)
+    # capsize_mask = is_unreachables_np > 0  # 将不可行点置为 True，其余为 False
+    # # 安全检查掩码长度是否与中间点数一致，若不一致则尝试对齐或截断
+    # mid_points = initial_trajectory[1:-1]
+    # if capsize_mask.shape[0] != mid_points.shape[0]:
+    #     # 尽量截断或扩展掩码到匹配长度（以 False 填充）
+    #     mask = np.zeros(mid_points.shape[0], dtype=bool)
+    #     L = min(mask.shape[0], capsize_mask.shape[0])
+    #     mask[:L] = capsize_mask[:L]
+    #     capsize_mask = mask
+    # capsize_points = mid_points[capsize_mask]
+    # num_capsize = np.sum(capsize_mask)
+    # print(f"Number of points which is unreachable in <initial_control_poses>: {num_capsize} out of {len(is_unreachables)}, percentage: {num_capsize / len(is_unreachables) * 100:.2f}%")
+    
+    # 计算初始轨迹的中间点（去除首尾）- 使用控制点
+    initial_control_mid_points = initial_points[1:-1, :2]  # (N-2, 2)
+    initial_control_mid_yaws = initial_points[1:-1, 2]     # (N-2,)
 
+    from dataLoader_uneven import compute_map_yaw_bins
+    yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=36)  # [H, W, 36]
+
+    def check_trajectory_reachability_consistent(trajectory_points, yaw_values, yaw_stability):
+        """使用与 data_clean.py 完全一致的方法检查轨迹点的可达性"""
+        capsize_mask = []
+        
+        for i in range(len(trajectory_points)):
+            x, y = trajectory_points[i]
+            yaw = yaw_values[i]
+            
+            # 与 data_clean.py 完全一致的坐标转换
+            x_idx = int((x + 20) / 0.4)
+            y_idx = int((y + 20) / 0.4)
+            yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
+            
+            # 边界检查和稳定性判断
+            if 0 <= x_idx < yaw_stability.shape[0] and 0 <= y_idx < yaw_stability.shape[1]:
+                yaw_stability_value = yaw_stability[x_idx, y_idx, yaw_idx]
+                if torch.is_tensor(yaw_stability_value):
+                    is_unreachable = bool((yaw_stability_value == 0).cpu().numpy())
+                else:
+                    is_unreachable = bool(yaw_stability_value == 0)
+            else:
+                is_unreachable = True  # 超出地图边界
+                
+            capsize_mask.append(is_unreachable)
+        
+        capsize_mask = np.array(capsize_mask, dtype=bool)
+        capsize_points = trajectory_points[capsize_mask]
+        
+        return capsize_mask, capsize_points
+
+    # 检查初始控制点（中间点）的可达性
+    capsize_mask, capsize_points = check_trajectory_reachability_consistent(
+        initial_control_mid_points, initial_control_mid_yaws, yaw_stability
+    )
+    num_capsize = np.sum(capsize_mask)
+    print(f"Number of points which is unreachable in <initial_control_poses>: {num_capsize} out of {len(capsize_mask)}, percentage: {num_capsize / len(capsize_mask) * 100:.2f}%")
+        
     # --- Figure 1: 两个子图（分别显示初始轨迹 / 优化后轨迹，各自叠在彩色高程上） ---
     fig1, axes1 = plt.subplots(1, 2, figsize=(16, 8))
 
@@ -2522,41 +2600,19 @@ if __name__ == "__main__":
     )
     axes1[0].set_title('Initial Trajectory')
 
-    # 去除端点以匹配后续对中间点的处理
-    x_q = Sx_i[1:-1]
-    y_q = Sy_i[1:-1]
-    yaw_q = Syaw_i[1:-1]
+    # 检查初始密集轨迹的可达性（去除端点）
+    initial_traj_mid_points = initial_trajectory[1:-1]     # (K-2, 2)
+    initial_traj_mid_yaws = initial_trajectory_full[1:-1, 2]       # (K-2,)
 
-    queries = torch.stack([x_q, y_q, yaw_q], dim=1)
-    
-    res = compute_esdf_batch(
-        nx, ny, nz, queries,
-        resolution=0.4, origin=(-20.0, -20.0),
-        yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
+    capsize_mask, capsize_points = check_trajectory_reachability_consistent(
+        initial_traj_mid_points, initial_traj_mid_yaws, yaw_stability
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
-
-    # 绘制出 is_unreachables 对应的xy点
-    if isinstance(is_unreachables, torch.Tensor):
-        is_unreachables_np = is_unreachables.cpu().numpy()
-    else:
-        is_unreachables_np = np.asarray(is_unreachables)
-    capsize_mask = is_unreachables_np > 0  # 将不可行点置为 True，其余为 False
-    # 安全检查掩码长度是否与中间点数一致，若不一致则尝试对齐或截断
-    mid_points = initial_trajectory[1:-1]
-    if capsize_mask.shape[0] != mid_points.shape[0]:
-        # 尽量截断或扩展掩码到匹配长度（以 False 填充）
-        mask = np.zeros(mid_points.shape[0], dtype=bool)
-        L = min(mask.shape[0], capsize_mask.shape[0])
-        mask[:L] = capsize_mask[:L]
-        capsize_mask = mask
-    capsize_points = mid_points[capsize_mask]
     axes1[0].scatter(capsize_points[:, 0], capsize_points[:, 1], c='green', s=20, label='unreachable points')
     axes1[0].legend() # 添加图例
 
-    # 添加对于 is_unreachables 的统计信息
+    # 添加对于可达性的统计信息
     num_capsize = np.sum(capsize_mask)
-    print(f"Number of points which is unreachable in  <initial_trajectory> : {num_capsize} out of {len(is_unreachables)}, percentage: {num_capsize / len(is_unreachables) * 100:.2f}%")
+    print(f"Number of points which is unreachable in  <initial_trajectory> : {num_capsize} out of {len(capsize_mask)}, percentage: {num_capsize / len(capsize_mask) * 100:.2f}%")
 
     # 可视化优化后轨迹
     visualize_terrain_trajectory(
@@ -2571,42 +2627,19 @@ if __name__ == "__main__":
     )
     axes1[1].set_title('Optimized Trajectory')
 
-    # 使用 optimizer 返回的密集 yaw 配合轨迹做不可达判断
-    x_q = torch.tensor(optimized_trajectory[:, 0], device=device, dtype=torch.float32)
-    y_q = torch.tensor(optimized_trajectory[:, 1], device=device, dtype=torch.float32)
-    yaw_q = torch.tensor(optimized_yaw_dense, device=device, dtype=torch.float32)
-    # 剪裁端点以匹配之前的 "中间点" 处理（如果需要）
-    x_q_mid = x_q[1:-1]
-    y_q_mid = y_q[1:-1]
-    yaw_q_mid = yaw_q[1:-1]
-    queries = torch.stack([x_q_mid, y_q_mid, yaw_q_mid], dim=1)
+    # 检查优化后密集轨迹的可达性（去除端点）
+    optimized_traj_mid_points = optimized_trajectory[1:-1]     # (K-2, 2)
+    optimized_traj_mid_yaws = optimized_yaw_dense[1:-1]       # (K-2,)
 
-    res = compute_esdf_batch(
-        nx, ny, nz, queries,
-        resolution=0.4, origin=(-20.0, -20.0),
-        yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
+    capsize_mask, capsize_points = check_trajectory_reachability_consistent(
+        optimized_traj_mid_points, optimized_traj_mid_yaws, yaw_stability
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
-
-    # 绘制出 is_unreachables 对应的xy点
-    if isinstance(is_unreachables, torch.Tensor):
-        is_unreachables_np = is_unreachables.cpu().numpy()
-    else:
-        is_unreachables_np = np.asarray(is_unreachables)
-    capsize_mask = is_unreachables_np > 0
-    mid_points = optimized_trajectory[1:-1]
-    if capsize_mask.shape[0] != mid_points.shape[0]:
-        mask = np.zeros(mid_points.shape[0], dtype=bool)
-        L = min(mask.shape[0], capsize_mask.shape[0])
-        mask[:L] = capsize_mask[:L]
-        capsize_mask = mask
-    capsize_points = mid_points[capsize_mask]
     axes1[1].scatter(capsize_points[:, 0], capsize_points[:, 1], c='green', s=20, label='unreachable points')
     axes1[1].legend()
     
-    # 添加对于 is_unreachables 的统计信息
+    # 添加对于可达性的统计信息
     num_capsize = np.sum(capsize_mask)
-    print(f"Number of points which is unreachable in <optimized_trajectory>: {num_capsize} out of {len(is_unreachables)}, percentage: {num_capsize / len(is_unreachables) * 100:.2f}%")
+    print(f"Number of points which is unreachable in <optimized_trajectory>: {num_capsize} out of {len(capsize_mask)}, percentage: {num_capsize / len(capsize_mask) * 100:.2f}%")
 
     # --- Figure 2: 两个 3D 子图（流形空间：x, y, yaw）---
     # 构建占据体小量采样点以供 3D 可视化（下采样以减少点数）
@@ -2660,35 +2693,12 @@ if __name__ == "__main__":
     ax3[0].set_title('Optimized Trajectory')
     
     # 绘制优化后轨迹的不可达点（复用图1中的结果）
-    x_q = torch.tensor(optimized_trajectory[:, 0], device=device, dtype=torch.float32)
-    y_q = torch.tensor(optimized_trajectory[:, 1], device=device, dtype=torch.float32)
-    yaw_q = torch.tensor(optimized_yaw_dense, device=device, dtype=torch.float32)
-    # 剪裁端点以匹配之前的 "中间点"
-    x_q_mid = x_q[1:-1]
-    y_q_mid = y_q[1:-1]
-    yaw_q_mid = yaw_q[1:-1]
-    queries = torch.stack([x_q_mid, y_q_mid, yaw_q_mid], dim=1)
-    res = compute_esdf_batch(
-        nx, ny, nz, queries,
-        resolution=0.4, origin=(-20.0, -20.0),
-        yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
+    optimized_traj_mid_points_fig3 = optimized_trajectory[1:-1]     # (K-2, 2)
+    optimized_traj_mid_yaws_fig3 = optimized_yaw_dense[1:-1]       # (K-2,)
+
+    capsize_mask, capsize_points = check_trajectory_reachability_consistent(
+        optimized_traj_mid_points_fig3, optimized_traj_mid_yaws_fig3, yaw_stability
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
-    # 绘制出 is_unreachables 对应的xy点
-    if isinstance(is_unreachables, torch.Tensor):
-        is_unreachables_np = is_unreachables.cpu().numpy()
-    else:
-        is_unreachables_np = np.asarray(is_unreachables)
-    capsize_mask = is_unreachables_np > 0  # 将不可行点置为 True，其余为 False
-    # 安全检查掩码长度是否与中间点数一致，若不一致则尝试对齐或截断
-    mid_points = optimized_trajectory[1:-1]
-    if capsize_mask.shape[0] != mid_points.shape[0]:
-        # 尽量截断或扩展掩码到匹配长度（以 False 填充）
-        mask = np.zeros(mid_points.shape[0], dtype=bool)
-        L = min(mask.shape[0], capsize_mask.shape[0])
-        mask[:L] = capsize_mask[:L]
-        capsize_mask = mask
-    capsize_points = mid_points[capsize_mask]
     ax3[0].scatter(capsize_points[:, 0], capsize_points[:, 1], c='green', s=20, label='unreachable points')
     ax3[0].legend()  # 添加图例
     
@@ -2713,40 +2723,17 @@ if __name__ == "__main__":
     ax3[1].set_title('Resampled Trajectory from Optimized Controls')
     
     # 统计 resampled 轨迹各点的可达性
-    x_q = torch.tensor(resampled_trajectory[:, 0], device=device, dtype=torch.float32)
-    y_q = torch.tensor(resampled_trajectory[:, 1], device=device, dtype=torch.float32)
-    yaw_q = torch.tensor(resampled_trajectory_full[:, 2], device=device, dtype=torch.float32)
-    # 剪裁端点以匹配之前的 "中间点" 处理（如果需要）
-    x_q_mid = x_q[1:-1]
-    y_q_mid = y_q[1:-1]
-    yaw_q_mid = yaw_q[1:-1]
-    queries = torch.stack([x_q_mid, y_q_mid, yaw_q_mid], dim=1)
-    res = compute_esdf_batch(
-        nx, ny, nz, queries,
-        resolution=0.4, origin=(-20.0, -20.0),
-        yaw_weight=1.4, search_radius=5.0, chunk_cells=3000, device=device
+    resampled_traj_mid_points = resampled_trajectory[1:-1]     # (K-2, 2)
+    resampled_traj_mid_yaws = resampled_trajectory_full[1:-1, 2]       # (K-2,)
+
+    capsize_mask, capsize_points = check_trajectory_reachability_consistent(
+        resampled_traj_mid_points, resampled_traj_mid_yaws, yaw_stability
     )
-    is_unreachables, infos = query_is_unreachable_by_match_batch(res, queries, origin=(-20.0, -20.0), resolution=0.4)
-    # 绘制出 is_unreachables 对应的xy点
-    if isinstance(is_unreachables, torch.Tensor):
-        is_unreachables_np = is_unreachables.cpu().numpy()
-    else:
-        is_unreachables_np = np.asarray(is_unreachables)
-    capsize_mask = is_unreachables_np > 0  # 将不可行点置为 True，其余为 False
-    # 安全检查掩码长度是否与中间点数一致，若不一致则尝试对齐或截断
-    mid_points = resampled_trajectory[1:-1]
-    if capsize_mask.shape[0] != mid_points.shape[0]:
-        # 尽量截断或扩展掩码到匹配长度（以 False 填充）
-        mask = np.zeros(mid_points.shape[0], dtype=bool)
-        L = min(mask.shape[0], capsize_mask.shape[0])
-        mask[:L] = capsize_mask[:L]
-        capsize_mask = mask
-    capsize_points = mid_points[capsize_mask]
     ax3[1].scatter(capsize_points[:, 0], capsize_points[:, 1], c='green', s=20, label='unreachable points')
     ax3[1].legend()  # 添加图例
-    # 打印 is_unreachables 的统计信息
+    # 打印可达性统计信息
     num_capsize = np.sum(capsize_mask)
-    print(f"Number of points which is unreachable in <resampled_trajectory>: {num_capsize} out of {len(is_unreachables)}, percentage: {num_capsize / len(is_unreachables) * 100:.2f}%")
+    print(f"Number of points which is unreachable in <resampled_trajectory>: {num_capsize} out of {len(capsize_mask)}, percentage: {num_capsize / len(capsize_mask) * 100:.2f}%")
 
     # --- Figure 4: 损失曲线 ---
     fig4, ax4 = plt.subplots(1, 1, figsize=(8, 4))
