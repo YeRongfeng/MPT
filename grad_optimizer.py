@@ -58,24 +58,43 @@ class TrajectoryOptimizerSE2:
         self.map_size_pixels = occupancy_map.shape # (D, H, W)
 
         # --- 3. 样条参数化 ---
-        # 把 (x,y,yaw) 当作 3D 空间坐标来参数化 t（不做角度 unwrap）
-        # 注意：这里我们保留 rot_scale 作为可选项，但默认将其设为 0.0，让 t 只由平移 (x,y) 决定，避免 yaw 导致参数化不一致而使样条看起来不平滑。
-        rot_scale = 0.0  # 将 yaw 差值映射为“等效距离”的缩放；设为 0 则 yaw 不影响 t
-        xy = self.initial_poses[:, :2].to(self.device)
-        yaw = self.initial_poses[:, 2].to(self.device)
-        diffs_xy = xy[1:] - xy[:-1]
-        trans_dists = torch.norm(diffs_xy, dim=1)  # (N-1,)
+        # # 把 (x,y,yaw) 当作 3D 空间坐标来参数化 t（不做角度 unwrap）
+        # # 注意：这里我们保留 rot_scale 作为可选项，但默认将其设为 0.0，让 t 只由平移 (x,y) 决定，避免 yaw 导致参数化不一致而使样条看起来不平滑。
+        # rot_scale = 0.0  # 将 yaw 差值映射为“等效距离”的缩放；设为 0 则 yaw 不影响 t
+        # xy = self.initial_poses[:, :2].to(self.device)
+        # yaw = self.initial_poses[:, 2].to(self.device)
+        # diffs_xy = xy[1:] - xy[:-1]
+        # trans_dists = torch.norm(diffs_xy, dim=1)  # (N-1,)
 
-        # **注意**：此处如需把 yaw 也参与参数化，可将 rot_scale 设置为非零；
-        # 但为了避免 yaw 的跳变（或 wrap）引起 t 不连续，默认不参与。
-        # yaw_diffs = (yaw[1:] - yaw[:-1]).abs()  # 直接绝对差，保留但默认不影响（rot_scale=0）
-        yaw_diffs_raw = yaw[1:] - yaw[:-1]
-        yaw_diffs = torch.abs(torch.atan2(torch.sin(yaw_diffs_raw), torch.cos(yaw_diffs_raw)))
+        # # **注意**：此处如需把 yaw 也参与参数化，可将 rot_scale 设置为非零；
+        # # 但为了避免 yaw 的跳变（或 wrap）引起 t 不连续，默认不参与。
+        # # yaw_diffs = (yaw[1:] - yaw[:-1]).abs()  # 直接绝对差，保留但默认不影响（rot_scale=0）
+        # yaw_diffs_raw = yaw[1:] - yaw[:-1]
+        # yaw_diffs = torch.abs(torch.atan2(torch.sin(yaw_diffs_raw), torch.cos(yaw_diffs_raw)))
 
-        total_dists = torch.sqrt(trans_dists**2 + (rot_scale * yaw_diffs)**2) + 1e-8
-        t = torch.cat([torch.tensor([0.0], device=self.device), torch.cumsum(total_dists, dim=0)])
-        t = (t / (t[-1] if t[-1] > 0 else 1.0)).cpu().numpy()
-        self.t_points = torch.tensor(t, device=self.device, dtype=torch.float32).detach()
+        # total_dists = torch.sqrt(trans_dists**2 + (rot_scale * yaw_diffs)**2) + 1e-8
+        # t = torch.cat([torch.tensor([0.0], device=self.device), torch.cumsum(total_dists, dim=0)])
+        # t = (t / (t[-1] if t[-1] > 0 else 1.0)).cpu().numpy()
+        # self.t_points = torch.tensor(t, device=self.device, dtype=torch.float32).detach()
+
+        # 关键修改：统一使用固定参数化策略
+        self.parameterization_mode = 'uniform'  # 'uniform' 或 'geometric'
+        
+        if self.parameterization_mode == 'uniform':
+            # 使用均匀参数化
+            self.t_points = torch.linspace(0, 1, self.N, device=self.device, dtype=torch.float32)
+        else:
+            # 使用几何参数化（原有逻辑）
+            rot_scale = 0.0
+            xy = pts_t[:, :2]
+            diffs_xy = xy[1:] - xy[:-1]
+            trans_dists = torch.norm(diffs_xy, dim=1)
+            yaw_diffs_raw = pts_t[1:, 2] - pts_t[:-1, 2]
+            yaw_diffs = torch.abs(self._normalize_angle_diff(yaw_diffs_raw))
+            total_dists = torch.sqrt(trans_dists**2 + (rot_scale * yaw_diffs)**2) + 1e-8
+            t = torch.cat([torch.tensor([0.0], device=self.device), torch.cumsum(total_dists, dim=0)])
+            t = (t / (t[-1] if t[-1] > 0 else 1.0))
+            self.t_points = t.to(device=self.device, dtype=torch.float32)
 
         # --- 4. 预计算参考轨迹 (用于 follow_cost) ---
         self.K_cost = 400
@@ -120,32 +139,43 @@ class TrajectoryOptimizerSE2:
         return torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
 
     def _evaluate_spline_se2(self, control_poses, t_eval):
-        """对 SE(2) 控制点 (x, y, yaw) 进行样条插值，正确处理 yaw 的周期性"""
-        # control_poses: (N, 3)
+        """完全修复的版本：确保参数化依赖于控制点坐标"""
+        device = control_poses.device
+        N_current = control_poses.shape[0]
+        
+        # 使用固定的均匀参数化，不依赖于控制点位置
+        t_ctrl = torch.linspace(0, 1, N_current, device=device, dtype=torch.float32)
+        
+        # 执行插值（确保使用计算出的 t_ctrl）
         x_ctrl, y_ctrl, yaw_ctrl = control_poses.T
-
-        # 根据当前 control_poses 重新计算 t_ctrl，正确处理 yaw 的周期性
-        rot_scale = 0.0
-        xy = control_poses[:, :2]
-        diffs_xy = xy[1:] - xy[:-1]
-        trans_dists = torch.norm(diffs_xy, dim=1)
+        Sx, Sx_dot, Sx_ddot = self._evaluate_scalar_spline(x_ctrl, t_eval, t_ctrl=t_ctrl)
+        Sy, Sy_dot, Sy_ddot = self._evaluate_scalar_spline(y_ctrl, t_eval, t_ctrl=t_ctrl)
+        Syaw, Syaw_dot, Syaw_ddot = self._evaluate_yaw_spline(yaw_ctrl, t_eval, t_ctrl=t_ctrl)
         
-        # 修复：正确计算 yaw 的最短角度差
-        yaw_diffs_raw = yaw_ctrl[1:] - yaw_ctrl[:-1]
-        yaw_diffs = torch.abs(self._normalize_angle_diff(yaw_diffs_raw))
-        
-        total_dists = torch.sqrt(trans_dists**2 + (rot_scale * yaw_diffs)**2) + 1e-8
-        t_local = torch.cat([torch.tensor([0.0], device=self.device), torch.cumsum(total_dists, dim=0)])
-        t_local = (t_local / (t_local[-1] if t_local[-1] > 0 else 1.0)).to(device=self.device, dtype=torch.float32)
-
-        # 对 x, y 直接插值
-        Sx, Sx_dot, Sx_ddot = self._evaluate_scalar_spline(x_ctrl, t_eval, t_ctrl=t_local)
-        Sy, Sy_dot, Sy_ddot = self._evaluate_scalar_spline(y_ctrl, t_eval, t_ctrl=t_local)
-
-        # 修复：对 yaw 进行周期性感知的插值
-        Syaw, Syaw_dot, Syaw_ddot = self._evaluate_yaw_spline(yaw_ctrl, t_eval, t_ctrl=t_local)
-
         return Sx, Sy, Syaw, Sx_dot, Sy_dot, Syaw_dot, Sx_ddot, Sy_ddot, Syaw_ddot
+
+        # # 根据当前 control_poses 重新计算 t_ctrl，正确处理 yaw 的周期性
+        # rot_scale = 0.0
+        # xy = control_poses[:, :2]
+        # diffs_xy = xy[1:] - xy[:-1]
+        # trans_dists = torch.norm(diffs_xy, dim=1)
+        
+        # # 修复：正确计算 yaw 的最短角度差
+        # yaw_diffs_raw = yaw_ctrl[1:] - yaw_ctrl[:-1]
+        # yaw_diffs = torch.abs(self._normalize_angle_diff(yaw_diffs_raw))
+        
+        # total_dists = torch.sqrt(trans_dists**2 + (rot_scale * yaw_diffs)**2) + 1e-8
+        # t_local = torch.cat([torch.tensor([0.0], device=self.device), torch.cumsum(total_dists, dim=0)])
+        # t_local = (t_local / (t_local[-1] if t_local[-1] > 0 else 1.0)).to(device=self.device, dtype=torch.float32)
+
+        # # 对 x, y 直接插值
+        # Sx, Sx_dot, Sx_ddot = self._evaluate_scalar_spline(x_ctrl, t_eval, t_ctrl=t_local)
+        # Sy, Sy_dot, Sy_ddot = self._evaluate_scalar_spline(y_ctrl, t_eval, t_ctrl=t_local)
+
+        # # 修复：对 yaw 进行周期性感知的插值
+        # Syaw, Syaw_dot, Syaw_ddot = self._evaluate_yaw_spline(yaw_ctrl, t_eval, t_ctrl=t_local)
+
+        # return Sx, Sy, Syaw, Sx_dot, Sy_dot, Syaw_dot, Sx_ddot, Sy_ddot, Syaw_ddot
 
     def _evaluate_yaw_spline(self, yaw_ctrl, t_eval, t_ctrl=None):
         """对 yaw 角度进行周期性感知的样条插值"""
@@ -1232,7 +1262,7 @@ class TrajectoryOptimizerSE2:
         # c) 几何曲率
         eps = 1e-6
         speed = torch.sqrt(Sx_dot**2 + Sy_dot**2 + eps)
-        geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-9)
+        geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-6)
         v_thresh = 0.08
         gate_k = 80.0
         gate = torch.sigmoid((speed - v_thresh) * gate_k)
@@ -1670,13 +1700,16 @@ class TrajectoryOptimizerSE2:
         # curvature with low-speed gate
         eps = 1e-6
         speed = torch.sqrt(Sx_dot**2 + Sy_dot**2 + eps)
-        geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-9)
+        geom_curvature = torch.abs(Sx_dot * Sy_ddot - Sy_dot * Sx_ddot) / (speed**3 + 1e-6)
         v_thresh = 0.08
         gate_k = 80.0
         gate = torch.sigmoid((speed - v_thresh) * gate_k)
         curvature_limit = 1.4
-        curvature_violation = torch.relu(geom_curvature - curvature_limit)
-        curvature_cost = torch.mean(gate * curvature_violation)*1e3
+        # curvature_violation = torch.relu(geom_curvature - curvature_limit)
+        # curvature_cost = torch.mean(gate * curvature_violation)*1e3
+        curvature_violation = geom_curvature - curvature_limit
+        # 使用软ReLU，避免梯度突变
+        curvature_cost = torch.mean(F.softplus(curvature_violation, beta=2.0))*1e3
 
         # yaw per meter
         v_eps = 1e-3
@@ -1694,8 +1727,8 @@ class TrajectoryOptimizerSE2:
         angle_diff = tangent_angle - Syaw
         angle_diff = torch.atan2(torch.sin(angle_diff), torch.cos(angle_diff))
         # angle_diff_cost = torch.mean(torch.sin(angle_diff)**2)
-        # angle_diff_cost = torch.mean(1.0 - torch.cos(angle_diff))
-        angle_diff_cost = torch.mean(angle_diff**2)
+        angle_diff_cost = torch.mean(1.0 - torch.cos(angle_diff))
+        # angle_diff_cost = torch.mean(angle_diff**2)
 
         # endpoints yaw cost (使用 ctrl 的首尾)
         start_yaw_opt = ctrl[0, 2]
@@ -1822,17 +1855,30 @@ class TrajectoryOptimizerSE2:
         #     'out_of_bounds': 1e8,
         # }
         
+        # weights = {
+        #     'obstacle': 3e-3,
+        #     'smoothness': 1e-7,
+        #     'curvature': 1e-3,
+        #     'yaw_per_meter': 1e-2, # 惩罚原地大角度转动的权重
+        #     'control': 0e-7,
+        #     'angle_diff': 1e-0, # 惩罚角度与切线方向不一致的权重
+        #     'endpoints': 1e0,    # 强力惩罚端点 yaw 对齐
+        #     'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
+        #     'uniformity': 1e-1,  # 轨迹段长度均匀性损失
+        #     'out_of_bounds': 1e2,  # 超出地图范围的惩罚
+        # }
+
         weights = {
             'obstacle': 3e-3,
             'smoothness': 1e-7,
             'curvature': 1e-3,
-            'yaw_per_meter': 1e-2, # 惩罚原地大角度转动的权重
+            'yaw_per_meter': 0e-2, # 惩罚原地大角度转动的权重
             'control': 0e-7,
             'angle_diff': 1e-0, # 惩罚角度与切线方向不一致的权重
-            'endpoints': 1e0,    # 强力惩罚端点 yaw 对齐
+            'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
             'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
-            'uniformity': 1e-1,  # 轨迹段长度均匀性损失
-            'out_of_bounds': 1e2,  # 超出地图范围的惩罚
+            'uniformity': 0e-1,  # 轨迹段长度均匀性损失
+            'out_of_bounds': 0e2,  # 超出地图范围的惩罚
         }
 
         total_cost = (
@@ -2123,12 +2169,33 @@ def generate_stability_cost_map(nx, ny, nz, map_info, device='cuda'):
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    def verify_optimizer_consistency():
+        """验证优化器的一致性"""
+        # 创建测试轨迹
+        test_traj = torch.randn(5, 3, requires_grad=True, device=device)
+        
+        # 创建优化器
+        optimizer = TrajectoryOptimizerSE2(test_traj.detach(), stability_cost_map, map_info, device=device)
+        
+        # 设置相同的控制点
+        optimizer.variable_poses.data = test_traj[1:-1].detach()
+        
+        # 计算两种损失
+        cost1 = optimizer.cost_function()
+        cost2 = optimizer.cost_on_poses(test_traj)
+        
+        print(f"cost_function: {cost1.item():.6e}")
+        print(f"cost_on_poses: {cost2.item():.6e}")
+        print(f"Difference: {abs(cost1.item() - cost2.item()):.6e}")
+        
+        return abs(cost1.item() - cost2.item()) < 1e-6
+
     # --- 0. 加载地形数据 ---
     from dataLoader_uneven import UnevenPathDataLoader
     env_list = ['env000000']
-    dataFolder = '/home/yrf/MPT/data/sim_dataset/train'
+    dataFolder = '/home/sdu/MPT/data/sim_dataset/train'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
-    path_index = 33
+    path_index = 2
     sample = dataset[path_index]
     if sample is None:
         raise ValueError(f"Sample at index {path_index} is invalid.")
@@ -2159,7 +2226,8 @@ if __name__ == "__main__":
     # 生成模型预测轨迹
     from dataLoader_uneven import get_encoder_input
     from eval_model_uneven import get_patch
-    from transformer import Models
+    # from transformer import Models
+    from vision_mamba import Models
     import os.path as osp
     import json
     
@@ -2216,6 +2284,10 @@ if __name__ == "__main__":
     
     initial_points = predTraj.cpu().numpy()  # 使用模型预测轨迹作为初始点
 
+    # # 在训练前验证
+    # if not verify_optimizer_consistency():
+    #     print("Warning: Optimizer consistency check failed!")
+
     # --- 3. 初始化并运行优化器 (使用 TrajectoryOptimizerSE2) ---
     optimizer = TrajectoryOptimizerSE2(initial_points, stability_cost_map, map_info, device=device)
     
@@ -2225,8 +2297,143 @@ if __name__ == "__main__":
         Sx_i, Sy_i, *_ = optimizer._evaluate_spline_se2(initial_poses_torch, optimizer.t_dense)
         initial_trajectory = torch.stack([Sx_i, Sy_i], dim=1).cpu().numpy()
 
-    # 执行优化
-    optimized_trajectory, optimized_yaw_dense, cost_history = optimizer.optimize(iterations=800, lr=0.1, verbose=True)
+    # # 执行优化
+    # optimized_trajectory, optimized_yaw_dense, cost_history = optimizer.optimize(iterations=800, lr=0.1, verbose=True)
+
+    # 设置优化参数
+    iterations = 800
+    lr = 0.3
+    grad_clip_norm = 1.0
+
+    # 只优化中间点，固定起点和终点
+    start_point = torch.tensor(initial_points[0], device=device, dtype=torch.float32)  # 固定起点
+    end_point = torch.tensor(initial_points[-1], device=device, dtype=torch.float32)   # 固定终点
+
+    middle_points = torch.tensor(initial_points[1:-1], device=device, dtype=torch.float32, requires_grad=True)
+    
+    # 将初始轨迹转为可优化的参数
+    # 注意：这里我们优化整个轨迹，包括起点和终点（如果需要固定起终点，可以只优化中间点）
+    # trajectory_params = torch.tensor(initial_points, device=device, dtype=torch.float32, requires_grad=True)
+    
+    # 初始化优化器
+    optimizer_adam = torch.optim.Adam([middle_points], lr=lr, betas=(0.9, 0.999), eps=1e-8)
+    
+    # 学习率调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_adam, T_max=iterations, eta_min=lr * 0.01
+    )
+    
+    # 记录训练过程
+    cost_history = []
+    best_cost = float('inf')
+    best_middle_points = middle_points.detach().clone()
+    
+    print("Starting neural network style optimization...")
+    print(f"Parameters: iterations={iterations}, lr={lr}, grad_clip={grad_clip_norm}")
+    print()
+    
+    # 主训练循环
+    for iteration in range(iterations):
+        # 1. 清零梯度
+        optimizer_adam.zero_grad()
+        
+        # 2. 构建完整的轨迹参数（起点 + 中间点 + 终点）
+        full_trajectory = torch.cat([
+            start_point.unsqueeze(0),  # 起点
+            middle_points,             # 可优化的中间点
+            end_point.unsqueeze(0)     # 终点
+        ], dim=0)
+
+        # 2. 每次迭代创建新的优化器实例（关键步骤）
+        # 使用当前轨迹参数创建优化器，但不进行内部优化
+        trajectory_optimizer = TrajectoryOptimizerSE2(
+            full_trajectory.detach(),  # 用detach避免影响计算图
+            stability_cost_map, 
+            map_info, 
+            device=device
+        )
+        
+        # 3. 使用 cost_on_poses 计算损失（保持梯度）
+        cost = trajectory_optimizer.cost_on_poses(full_trajectory)
+
+        # 4. 数值稳定性检查
+        if torch.isnan(cost) or torch.isinf(cost):
+            print(f"Warning: Invalid cost at iteration {iteration}: {cost.item()}")
+            break
+        
+        # 5. 反向传播
+        cost.backward()
+        
+        # 6. 梯度裁剪
+        original_grad_norm = torch.nn.utils.clip_grad_norm_([middle_points], grad_clip_norm)
+        was_clipped = original_grad_norm > grad_clip_norm
+        
+        # 7. 参数更新
+        optimizer_adam.step()
+        
+        # 8. 学习率调度
+        scheduler.step()
+        
+        # 9. 记录和跟踪
+        current_cost = cost.item()
+        cost_history.append(current_cost)
+        current_lr = optimizer_adam.param_groups[0]['lr']
+        
+        # 10. 最佳模型保存
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_middle_points = middle_points.detach().clone()
+
+        # 11. 打印训练进度
+        if (iteration + 1) % 25 == 0 or iteration == 0:
+            grad_info = f'{original_grad_norm:.2e}→{grad_clip_norm:.1e}' if was_clipped else f'{original_grad_norm:.2e}'
+            
+            print(f"Iter [{iteration+1:4d}/{iterations}] "
+                  f"Cost: {current_cost:.6e} "
+                  f"GradNorm: {grad_info} "
+                  f"LR: {current_lr:.2e} "
+                  f"Best: {best_cost:.6e}")
+        
+        # # 12. 早停检查（可选）
+        # if len(cost_history) >= 100:
+        #     recent_improvement = cost_history[-100] - cost_history[-1]
+        #     if recent_improvement < 1e-8:
+        #         print(f"Early stopping at iteration {iteration}: minimal improvement")
+        #         break
+
+    # --- 4. 恢复最佳轨迹并生成密集采样 ---
+    print(f"\nOptimization completed!")
+    print(f"Final cost: {best_cost:.6e}")
+    print(f"Total iterations: {len(cost_history)}")
+    if len(cost_history) > 0:
+        print(f"Cost reduction: {cost_history[0]:.6e} → {best_cost:.6e} "
+              f"({((cost_history[0] - best_cost) / cost_history[0] * 100):.2f}% improvement)")
+        
+    # 使用最佳轨迹生成密集采样
+    with torch.no_grad():
+        # 构建最终的完整控制点
+        final_full_trajectory = torch.cat([
+            start_point.unsqueeze(0),    # 固定的起点
+            best_middle_points,          # 优化后的中间点
+            end_point.unsqueeze(0)       # 固定的终点
+        ], dim=0)
+
+        final_trajectory_optimizer = TrajectoryOptimizerSE2(
+            final_full_trajectory, 
+            stability_cost_map, 
+            map_info, 
+            device=device
+        )
+        
+        # 生成密集轨迹
+        Sx, Sy, Syaw, *_ = final_trajectory_optimizer._evaluate_spline_se2(
+            final_full_trajectory, 
+            final_trajectory_optimizer.t_dense
+        )
+        
+        optimized_trajectory = torch.stack([Sx, Sy], dim=1).cpu().numpy()
+        optimized_yaw_dense = Syaw.cpu().numpy()
+        final_control_poses = final_full_trajectory.cpu().numpy()
 
     # --- 4. 可视化结果 ---
     import mpl_toolkits.mplot3d  # 确保 3D 支持
@@ -2253,7 +2460,7 @@ if __name__ == "__main__":
     # 优化后轨迹（已经有 xy 和 yaw_dense）
     optimized_trajectory_full = np.concatenate([optimized_trajectory, optimized_yaw_dense.reshape(-1,1)], axis=1)  # (K,3)
 
-    final_control_poses = optimizer._assemble_control_poses().detach().cpu().numpy()
+    # final_control_poses = optimizer._assemble_control_poses().detach().cpu().numpy()
 
     # --- 修复：final_control_poses 是完整的控制点集合 (N,3)
     if optimizer.variable_indices:

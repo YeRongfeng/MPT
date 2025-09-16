@@ -29,6 +29,36 @@ from torch.utils.tensorboard import SummaryWriter
 from ESDF3d_atpoint import compute_esdf_batch
 from grad_optimizer import TrajectoryOptimizerSE2
 
+_global_optimizer_cache = {}
+
+def get_unified_optimizer(traj_length, map_shape, device):
+    """获取统一的优化器实例，确保计算标准一致"""
+    cache_key = f"{traj_length}_{map_shape}"
+    
+    if cache_key not in _global_optimizer_cache:
+        # 创建标准化的参考轨迹
+        standard_traj = torch.zeros((traj_length, 3), device=device)
+        standard_traj[:, 0] = torch.linspace(-10, 10, traj_length)  # 标准x轴分布
+        standard_traj[:, 1] = 0.0  # y轴为0
+        standard_traj[:, 2] = 0.0  # yaw为0
+        
+        # 创建标准化的cost map（或使用固定的参考地图）
+        standard_cost_map = torch.zeros(map_shape, device=device)
+        
+        # 固定的map_info
+        map_info = {
+            'resolution': 0.4,
+            'origin': (-20.0, -20.0, -np.pi),
+            'size': (100, 100, 36)
+        }
+        
+        _global_optimizer_cache[cache_key] = TrajectoryOptimizerSE2(
+            standard_traj, standard_cost_map, map_info, device=device
+        )
+        print(f"Created unified optimizer for key: {cache_key}")
+    
+    return _global_optimizer_cache[cache_key]
+
 def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map, anchorPoints, trueLabels, trajectory, stage=1):
     """
     计算loss损失
@@ -81,13 +111,20 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
         #     'smoothness': 1e-4,
         #     'capsize': 1e-3,
         # }
+        # 根据epoch动态调整权重
+        # if epoch < 20:
+        #     capsize_weight = 2e-6  # 从 1e-6 增加到 2e-6
+        # elif epoch < 40:
+        #     capsize_weight = 3e-6  # 进一步增加
+        # else:
+        #     capsize_weight = 5e-6  # 后期使用更大权重
         loss_weights = {
             'classification': 0e-1,  # 第二阶段专注安全性优化
             'regression': 0e-4,
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 1e-2,
+            'capsize': 1e-3,
             'curvature': 0e-3,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
@@ -440,13 +477,22 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
                 weighted_pred_angles,  # 来自回归损失计算的预测角度
                 goal_state[i][2].unsqueeze(0)  # 终点角度
             ], dim=0)  # [steps_to_process+2, 1]
+
+            # # 检查梯度状态
+            # print(f"weighted_coords requires_grad: {weighted_coords.requires_grad}")
+            # print(f"weighted_pred_angles requires_grad: {weighted_pred_angles.requires_grad}")
+            # print(f"full_coords requires_grad: {full_coords.requires_grad}")
+            # print(f"full_yaws requires_grad: {full_yaws.requires_grad}")
             
             # 将坐标和角度按列堆叠为 [steps_to_process+2, 3]
             full_traj = torch.stack([
                 full_coords[:, 0],  # x坐标
                 full_coords[:, 1],  # y坐标
                 full_yaws  # 预测角度
-            ], dim=1).to(dtype=torch.float32, device=predVals.device)
+            ], dim=1)
+            # ], dim=1).to(dtype=torch.float32, device=predVals.device)
+
+            # print(f"full_traj requires_grad: {full_traj.requires_grad}")
             
             map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
             resolution = 0.4
@@ -456,11 +502,22 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
                 'origin': origin,
                 'size': map_size
             }
-            optimizer = TrajectoryOptimizerSE2(full_traj, stability_cost_map, map_info, device=device)
+            dummy_traj = torch.zeros_like(full_traj).detach()  # 创建形状相同的虚拟轨迹
+            optimizer = TrajectoryOptimizerSE2(dummy_traj, stability_cost_map, map_info, device=device)
+
+            # # 使用统一的优化器
+            # map_shape = stability_cost_map.shape
+            # unified_optimizer = get_unified_optimizer(
+            #     full_traj.shape[0], 
+            #     map_shape, 
+            #     device=device
+            # )
+    
             # 获得优化轨迹的损失
             capsize_loss = torch.tensor(0.0, device=predVals.device, requires_grad=True)
             # 直接基于模型输出的 full_traj 计算代价并保留计算图，以便梯度能回传到模型
             capsize_loss = optimizer.cost_on_poses(full_traj)
+            # capsize_loss = unified_optimizer.cost_on_poses(full_traj)
             # 数值稳定性检查
             if not (torch.isnan(capsize_loss) or torch.isinf(capsize_loss) or capsize_loss.item() > 1000):
                 total_loss = total_loss + capsize_loss * loss_weights['capsize']
@@ -702,12 +759,12 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         if was_clipped:
             grad_info = f'{original_grad_norm:.2f}→{max_grad_norm:.1f}'
         else:
-            grad_info = f'{original_grad_norm:.2f}'
+            grad_info = f'{original_grad_norm:.2e}'
         
         stage_info = "S1" if stage == 1 else "S2"  # 显示训练阶段
         pbar.set_postfix({
             'Stage': stage_info,
-            'Loss': f'{loss.item():.4f}',
+            'Loss': f'{loss.item():.2e}',
             'GradNorm': grad_info,
             'LR': f'{optimizer._optimizer.param_groups[0]["lr"]:.2e}'
         })
@@ -726,9 +783,12 @@ def eval_epoch(model, validationData, device, stage=1):
     total_n_correct = 0.0  # 初始化总正确预测数
     total_samples = 0  # 初始化总样本数
     epoch_stats = [0, 0, 0, 0]  # [total_positive, total_negative, correct_positive, correct_negative]
+
+    batch_losses = []
     
     with torch.no_grad():  # 禁用梯度计算：节省内存并加速评估
-        for batch in tqdm(validationData, mininterval=2):  # 遍历验证数据批次，使用tqdm显示进度
+        for batch_idx, batch in enumerate(tqdm(validationData, mininterval=2)):
+        # for batch in tqdm(validationData, mininterval=2):  # 遍历验证数据批次，使用tqdm显示进度
 
             # encoder_input = batch['map'].float().to(device)  # 准备输入数据：将地图数据转换为浮点型并移至指定设备
             # predVal, correctionVal = model(encoder_input)  # 前向传播：获取模型预测值和修正值
@@ -751,6 +811,13 @@ def eval_epoch(model, validationData, device, stage=1):
                 stage=stage  # 传递阶段信息
             )
 
+            # 记录每个batch的损失
+            batch_losses.append(loss.item())
+            
+            # # 前几个batch详细输出
+            # if batch_idx < 3:
+            #     print(f"Val batch {batch_idx}: loss={loss.item():.8e}")
+
             total_loss += loss.item()  # 累加批次损失
             total_n_correct += n_correct  # 累加批次正确预测数
             total_samples += n_samples  # 累加总样本数
@@ -758,6 +825,14 @@ def eval_epoch(model, validationData, device, stage=1):
             # 累加统计信息
             for i in range(4):
                 epoch_stats[i] += batch_stats[i]
+            
+    # 输出验证损失的统计信息
+    if len(batch_losses) > 0:
+        import numpy as np
+        print(f"Val loss stats: mean={np.mean(batch_losses):.8e}, "
+              f"std={np.std(batch_losses):.8e}, "
+              f"min={np.min(batch_losses):.8e}, "
+              f"max={np.max(batch_losses):.8e}")
                 
     return total_loss, total_n_correct, total_samples, epoch_stats  # 返回整个验证集的统计结果
 
@@ -1027,7 +1102,7 @@ if __name__ == "__main__":
                         'epoch': n,
                         'val_loss': val_total_loss
                     }, best_stage1_path)
-                    print(f"Saved new best Stage1 model to {best_stage1_path} (val_loss={val_total_loss:.4f})")
+                    print(f"Saved new best Stage1 model to {best_stage1_path} (val_loss={val_total_loss:.4e})")
             except Exception as e:
                 print(f"Warning: Failed to save best stage1 model: {e}")
             
@@ -1035,8 +1110,8 @@ if __name__ == "__main__":
             train_accuracy = train_n_correct / train_samples if train_samples > 0 else 0.0
             val_accuracy = val_n_correct / val_samples if val_samples > 0 else 0.0
             
-            print(f"Stage 1 - Epoch {n} Train Loss: {train_total_loss:.4f}")
-            print(f"Stage 1 - Epoch {n} Val Loss: {val_total_loss:.4f}")
+            print(f"Stage 1 - Epoch {n} Train Loss: {train_total_loss:.4e}")
+            print(f"Stage 1 - Epoch {n} Val Loss: {val_total_loss:.4e}")
             print(f"Stage 1 - Epoch {n} Train Accuracy: {train_accuracy:.4f} ({train_n_correct}/{train_samples})")
             print(f"Stage 1 - Epoch {n} Val Accuracy: {val_accuracy:.4f} ({val_n_correct}/{val_samples})")
             
@@ -1102,16 +1177,16 @@ if __name__ == "__main__":
     #     param.requires_grad = False
     
     # 打印参数状态
-    print_model_parameters(transformer, "Stage 2")
+    # print_model_parameters(transformer, "Stage 2")
     
     # 第二阶段优化器
     stage2_optimizer = Optim.ScheduledOptim(
         optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
-                   betas=(0.9, 0.98), eps=1e-9),
+                   betas=(0.9, 0.999), eps=1e-8),
         # lr_mul = 1.0,
-        lr_mul = 1e-4,
+        lr_mul = 1e-3,
         d_model = 512,
-        n_warmup_steps = 800
+        n_warmup_steps = 50
     )
     
     # 第二阶段训练
@@ -1136,7 +1211,7 @@ if __name__ == "__main__":
                     'epoch': n,
                     'val_loss': val_total_loss
                 }, best_stage2_path)
-                print(f"Saved new best Stage2 model to {best_stage2_path} (val_loss={val_total_loss:.4f})")
+                print(f"Saved new best Stage2 model to {best_stage2_path} (val_loss={val_total_loss:.4e})")
         except Exception as e:
             print(f"Warning: Failed to save best stage2 model: {e}")
         
@@ -1144,22 +1219,22 @@ if __name__ == "__main__":
         train_accuracy = train_n_correct / train_samples if train_samples > 0 else 0.0
         val_accuracy = val_n_correct / val_samples if val_samples > 0 else 0.0
         
-        print(f"Stage 2 - Epoch {n} Train Loss: {train_total_loss:.4f}")
-        print(f"Stage 2 - Epoch {n} Val Loss: {val_total_loss:.4f}")
-        print(f"Stage 2 - Epoch {n} Train Accuracy: {train_accuracy:.4f} ({train_n_correct}/{train_samples})")
-        print(f"Stage 2 - Epoch {n} Val Accuracy: {val_accuracy:.4f} ({val_n_correct}/{val_samples})")
+        print(f"Stage 2 - Epoch {n} Train Loss: {train_total_loss:.4e}")
+        print(f"Stage 2 - Epoch {n} Val Loss: {val_total_loss:.4e}")
+        # print(f"Stage 2 - Epoch {n} Train Accuracy: {train_accuracy:.4f} ({train_n_correct}/{train_samples})")
+        # print(f"Stage 2 - Epoch {n} Val Accuracy: {val_accuracy:.4f} ({val_n_correct}/{val_samples})")
         
-        # 打印详细的分类统计
-        total_pos, total_neg, correct_pos, correct_neg = val_stats
-        if total_pos > 0:
-            precision_pos = correct_pos / max(1, (correct_pos + (total_neg - correct_neg)))
-            recall_pos = correct_pos / total_pos
-            print(f"  Positive: {correct_pos}/{total_pos} (recall: {recall_pos:.4f})")
-        if total_neg > 0:
-            precision_neg = correct_neg / max(1, (correct_neg + (total_pos - correct_pos)))
-            recall_neg = correct_neg / total_neg
-            print(f"  Negative: {correct_neg}/{total_neg} (recall: {recall_neg:.4f})")
-        print(f"  Label distribution: {total_pos} positive, {total_neg} negative")
+        # # 打印详细的分类统计
+        # total_pos, total_neg, correct_pos, correct_neg = val_stats
+        # if total_pos > 0:
+        #     precision_pos = correct_pos / max(1, (correct_pos + (total_neg - correct_neg)))
+        #     recall_pos = correct_pos / total_pos
+        #     print(f"  Positive: {correct_pos}/{total_pos} (recall: {recall_pos:.4f})")
+        # if total_neg > 0:
+        #     precision_neg = correct_neg / max(1, (correct_neg + (total_pos - correct_pos)))
+        #     recall_neg = correct_neg / total_neg
+        #     print(f"  Negative: {correct_neg}/{total_neg} (recall: {recall_neg:.4f})")
+        # print(f"  Label distribution: {total_pos} positive, {total_neg} negative")
         print()
 
         # Log data (继续累加到之前的数据中)

@@ -15,8 +15,8 @@ import torch
 import torch.nn.functional as F
 import json
 
-from transformer import Models
-# from vision_mamba import Models
+# from transformer import Models
+from vision_mamba import Models
 from dataLoader_uneven import get_encoder_input, receptive_field
 from eval_model_uneven import getHashTable, get_patch
 import torch

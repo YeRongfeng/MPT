@@ -295,7 +295,14 @@ class ScheduledOptim():
         """
         d_model = self.d_model  # 获取模型维度：用于维度缩放计算
         n_steps, n_warmup_steps = self.n_steps, self.n_warmup_steps  # 获取当前步数和预热步数
-        return (d_model ** -0.5) * min(n_steps ** (-0.5), n_steps * n_warmup_steps ** (-1.5))  # 计算学习率缩放因子：实现Transformer论文中的学习率公式
+      #   return (d_model ** -0.5) * min(n_steps ** (-0.5), n_steps * n_warmup_steps ** (-1.5))  # 计算学习率缩放因子：实现Transformer论文中的学习率公式
+      # 处理 n_warmup_steps 为 0 的情况
+        if n_warmup_steps == 0:
+            # 直接使用步数的负平方根（忽略预热项）
+            return (d_model ** -0.5) * n_steps ** (-0.5)
+        else:
+            # 原始公式
+            return (d_model ** -0.5) * min(n_steps ** (-0.5), n_steps * n_warmup_steps ** (-1.5))
 
 
     def _update_learning_rate(self):

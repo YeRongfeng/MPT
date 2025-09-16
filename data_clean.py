@@ -12,9 +12,10 @@ from dataLoader_uneven import compute_map_yaw_bins
 
 # data_Folder = '/home/yrf/MPT/data/terrain/train'
 # data_Folder = '/home/yrf/MPT/data/sim_dataset/val'
-data_Folder = '/home/yrf/MPT/data/sim_dataset/train'
+data_Folder = '/home/sdu/MPT/data/sim_dataset/train'
 # data_Folder = '/home/yrf/MPT/data/terrain_dataset/val'
-env_list = ['env{:06d}'.format(i) for i in range(0, 40)]
+env_list = ['env{:06d}'.format(i) for i in range(0, 2)]
+cnt = 0
 
 for env in env_list:
     env_path = os.path.join(data_Folder, env)
@@ -55,18 +56,23 @@ for env in env_list:
         valid = True
         for i in range(path.shape[0]):
             x, y, yaw = path[i]
-            x_idx = int((x + 10) / 0.1)
-            y_idx = int((y + 10) / 0.1)
+            x_idx = int((x + 20) / 0.4)
+            y_idx = int((y + 20) / 0.4)
             yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
+
+            # print(f'x: {x}, y: {y}, yaw: {yaw}')
+            # print(f'x_idx: {x_idx}, y_idx: {y_idx}, yaw_idx: {yaw_idx}')
             
             if 0 <= x_idx < yaw_stability.shape[0] and 0 <= y_idx < yaw_stability.shape[1]:
                 yaw_stability_value = yaw_stability[x_idx, y_idx, yaw_idx]
                 if yaw_stability_value == 0:
-                    print(f'Invalid trajectory at index {i} in {path_file}: yaw stability is zero.')
+                    # print(f'Invalid trajectory at index {i} in {path_file}: yaw stability is zero.')
                     valid = False
+                    cnt += 1
                     break
         
         # 覆写原文件，在文件内部添加标签"valid"
         with open(path_path, 'wb') as f:
             pickle.dump({'valid': valid, 'path': path, 'map_name': path_data['map_name']}, f)
         # print(f'Saved cleaned trajectory to {path_file}')
+print(f'Total invalid trajectories found: {cnt}')
