@@ -1469,7 +1469,7 @@ class UnevenPathDataLoader(Dataset):
         sdf_map = generate_sdf_from_yaw_stability(
             yaw_stability, 
             voxel_size_xy=0.1, 
-            yaw_weight=2.1
+            yaw_weight=1.4
         )
 
         # 转换为PyTorch张量

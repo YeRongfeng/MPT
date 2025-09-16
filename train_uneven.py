@@ -834,7 +834,7 @@ if __name__ == "__main__":
     # assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
     # env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
 
-    env_num = 2
+    env_num = 1
     env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
     # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
 
@@ -1100,16 +1100,16 @@ if __name__ == "__main__":
     #     param.requires_grad = False
     
     # 打印参数状态
-    print_model_parameters(transformer, "Stage 2")
+    # print_model_parameters(transformer, "Stage 2")
     
     # 第二阶段优化器
     stage2_optimizer = Optim.ScheduledOptim(
         optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                    betas=(0.9, 0.98), eps=1e-9),
         # lr_mul = 1.0,
-        lr_mul = 1e-4,
+        lr_mul = 1e-2,
         d_model = 512,
-        n_warmup_steps = 800
+        n_warmup_steps = 50
     )
     
     # 第二阶段训练

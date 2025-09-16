@@ -1680,19 +1680,73 @@ class TrajectoryOptimizerSE2:
         # occupancy / obstacle cost
         dense_traj_world = torch.stack([Sx, Sy, Syaw], dim=1)
         grid_coords = self.world_to_grid_normalized(dense_traj_world)
-        esdf_sample = F.grid_sample(
-            self.occupancy_map,
+        # esdf_sample = F.grid_sample(
+        #     self.occupancy_map,
+        #     grid_coords,
+        #     mode='bilinear',
+        #     padding_mode='border',
+        #     align_corners=True
+        # )
+        # esdf_flat = esdf_sample.reshape(-1)
+        # d_safe = 0.15
+        # kalpa = 0.08
+        # z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
+        # occupancy_values = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
+        # obstacle_cost = torch.mean(occupancy_values)
+        
+        # 从稳定性代价地图中采样
+        stability_sample = F.grid_sample(
+            self.occupancy_map,    # 这里应该是稳定性地图，不是ESDF
             grid_coords,
             mode='bilinear',
             padding_mode='border',
             align_corners=True
         )
-        esdf_flat = esdf_sample.reshape(-1)
-        d_safe = 0.15
-        kalpa = 0.08
-        z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
-        occupancy_values = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
-        obstacle_cost = torch.mean(occupancy_values)
+        stability_flat = stability_sample.reshape(-1)   # (K,) 每个点的稳定性成本 [0,1]
+        
+        # === 多层倾覆惩罚策略 ===
+        
+        # 1. 基础倾覆成本 - 直接使用稳定性地图的值
+        base_instability_cost = torch.mean(stability_flat)
+        
+        # 2. 高风险区域的指数惩罚
+        high_risk_threshold = 0.3  # 超过此值认为是高风险
+        high_risk_mask = stability_flat > high_risk_threshold
+        if torch.any(high_risk_mask):
+            high_risk_values = stability_flat[high_risk_mask]
+            # 对高风险区域施加指数惩罚
+            exp_penalty = torch.mean(torch.exp(5.0 * (high_risk_values - high_risk_threshold)))
+        else:
+            exp_penalty = torch.tensor(0.0, device=self.device)
+        
+        # 3. 极高风险区域的硬约束
+        critical_threshold = 0.7  # 极度危险阈值
+        critical_mask = stability_flat > critical_threshold
+        critical_penalty = torch.sum(critical_mask.float()) * 1e2  # 每个危险点都有巨大惩罚
+        
+        # 4. 连续高风险段的额外惩罚（避免长时间处于不稳定状态）
+        if len(stability_flat) > 1:
+            risk_diff = stability_flat[1:] - stability_flat[:-1]
+            # 惩罚进入高风险区域的行为
+            entering_risk = torch.relu(risk_diff) * (stability_flat[1:] > high_risk_threshold).float()
+            continuous_risk_penalty = torch.sum(entering_risk**2) * 100.0
+        else:
+            continuous_risk_penalty = torch.tensor(0.0, device=self.device)
+        
+        # 5. 最大风险点的强力惩罚
+        max_risk = torch.max(stability_flat)
+        max_risk_penalty = torch.relu(max_risk - 0.2)**3 * 1e4
+        
+        # 组合倾覆相关的所有惩罚
+        obstacle_cost = (
+            base_instability_cost * 10.0 +           # 基础成本
+            exp_penalty * 0.0 +                     # 高风险指数惩罚  
+            critical_penalty*0 +                        # 极度危险硬约束
+            continuous_risk_penalty*0 +                 # 连续风险惩罚
+            max_risk_penalty*100                             # 最大风险惩罚
+        )*1e-3
+        
+        # === 其他成本项保持不变 ===
 
         # smoothness
         smoothness_cost = torch.mean(1e-0*Sx_ddot**2 + 1e-0*Sy_ddot**2 + 1e-0*Syaw_ddot**2)
@@ -1869,15 +1923,15 @@ class TrajectoryOptimizerSE2:
         # }
 
         weights = {
-            'obstacle': 1e-2,
-            'smoothness': 1e-7,
-            'curvature': 1e-3,
+            'obstacle': 3e-4,
+            'smoothness': 1e-8,
+            'curvature': 0e-3,
             'yaw_per_meter': 0e-2, # 惩罚原地大角度转动的权重
             'control': 0e-7,
             'angle_diff': 1e-0, # 惩罚角度与切线方向不一致的权重
             'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
             'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
-            'uniformity': 0e-1,  # 轨迹段长度均匀性损失
+            'uniformity': 1e-1,  # 轨迹段长度均匀性损失
             'out_of_bounds': 0e2,  # 超出地图范围的惩罚
         }
 
@@ -2227,9 +2281,9 @@ if __name__ == "__main__":
     # --- 0. 加载地形数据 ---
     from dataLoader_uneven import UnevenPathDataLoader
     env_list = ['env000000']
-    dataFolder = '/home/yrf/MPT/data/sim_dataset/train'
+    dataFolder = '/home/yrf/MPT/data/sim_dataset/val'
     dataset = UnevenPathDataLoader(env_list, dataFolder)
-    path_index = 2
+    path_index = 7
     sample = dataset[path_index]
     if sample is None:
         raise ValueError(f"Sample at index {path_index} is invalid.")
@@ -2256,67 +2310,67 @@ if __name__ == "__main__":
     # --- 2. 定义初始轨迹控制点 ---
     initial_points = sample['trajectory'].cpu().numpy()  # (x, y, yaw)
 
-    # # --- 使用网络推理结果作为初始点 ---
-    # # 生成模型预测轨迹
-    # from dataLoader_uneven import get_encoder_input
-    # from eval_model_uneven import get_patch
-    # # from transformer import Models
+    # --- 使用网络推理结果作为初始点 ---
+    # 生成模型预测轨迹
+    from dataLoader_uneven import get_encoder_input
+    from eval_model_uneven import get_patch
+    from transformer import Models
     # from vision_mamba import Models
-    # import os.path as osp
-    # import json
+    import os.path as osp
+    import json
     
-    # best = True
-    # # best = False
-    # stage = 1
-    # # epoch = 39
-    # # stage = 2
-    # # epoch = 24
+    best = True
+    # best = False
+    stage = 1
+    # epoch = 39
+    # stage = 2
+    # epoch = 24
 
-    # modelFolder = 'data/sim'
-    # # modelFolder = 'data/uneven_old'
-    # modelFile = osp.join(modelFolder, f'model_params.json')
-    # model_param = json.load(open(modelFile))
+    modelFolder = 'data/sim'
+    # modelFolder = 'data/uneven_old'
+    modelFile = osp.join(modelFolder, f'model_params.json')
+    model_param = json.load(open(modelFile))
 
-    # transformer = Models.UnevenTransformer(**model_param)
-    # _ = transformer.to(device)
+    transformer = Models.UnevenTransformer(**model_param)
+    _ = transformer.to(device)
 
-    # # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
-    # if stage == 1:
-    #     if best:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
-    #     else:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
-    # else:
-    #     if best:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
-    #     else:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
-    # transformer.load_state_dict(checkpoint['state_dict'])
+    # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
+    if stage == 1:
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
+    else:
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
+    transformer.load_state_dict(checkpoint['state_dict'])
     
-    # trajectory = sample['trajectory'].cpu().numpy()  # (N, 3)
-    # goal_pos = trajectory[-1, :]  # 终点位置
-    # start_pos = trajectory[0, :]  # 起点位置
+    trajectory = sample['trajectory'].cpu().numpy()  # (N, 3)
+    goal_pos = trajectory[-1, :]  # 终点位置
+    start_pos = trajectory[0, :]  # 起点位置
     
-    # normal_x = nx.cpu().numpy()
-    # normal_y = ny.cpu().numpy()
-    # normal_z = nz.cpu().numpy()
+    normal_x = nx.cpu().numpy()
+    normal_y = ny.cpu().numpy()
+    normal_z = nz.cpu().numpy()
     
-    # encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
-    # patch_maps, predProb_list, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
-    # # 确保 predTraj 是一个连续的 numpy/torch Tensor，然后再拼接起止点
-    # if isinstance(predTraj, list):
-    #     pred_arr = np.asarray(predTraj, dtype=np.float32) if len(predTraj) > 0 else np.zeros((0, 3), dtype=np.float32)
-    #     pred_traj_t = torch.from_numpy(pred_arr).to(device)
-    # elif torch.is_tensor(predTraj):
-    #     pred_traj_t = predTraj.to(device).float()
-    # else:
-    #     pred_traj_t = torch.from_numpy(np.asarray(predTraj, dtype=np.float32)).to(device)
+    encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
+    patch_maps, predProb_list, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
+    # 确保 predTraj 是一个连续的 numpy/torch Tensor，然后再拼接起止点
+    if isinstance(predTraj, list):
+        pred_arr = np.asarray(predTraj, dtype=np.float32) if len(predTraj) > 0 else np.zeros((0, 3), dtype=np.float32)
+        pred_traj_t = torch.from_numpy(pred_arr).to(device)
+    elif torch.is_tensor(predTraj):
+        pred_traj_t = predTraj.to(device).float()
+    else:
+        pred_traj_t = torch.from_numpy(np.asarray(predTraj, dtype=np.float32)).to(device)
 
-    # start_t = torch.tensor(start_pos, dtype=torch.float32, device=device).unsqueeze(0)
-    # goal_t  = torch.tensor(goal_pos,  dtype=torch.float32, device=device).unsqueeze(0)
-    # predTraj = torch.cat((start_t, pred_traj_t, goal_t), dim=0)
+    start_t = torch.tensor(start_pos, dtype=torch.float32, device=device).unsqueeze(0)
+    goal_t  = torch.tensor(goal_pos,  dtype=torch.float32, device=device).unsqueeze(0)
+    predTraj = torch.cat((start_t, pred_traj_t, goal_t), dim=0)
     
-    # initial_points = predTraj.cpu().numpy()  # 使用模型预测轨迹作为初始点
+    initial_points = predTraj.cpu().numpy()  # 使用模型预测轨迹作为初始点
 
     # # 在训练前验证
     # if not verify_optimizer_consistency():
