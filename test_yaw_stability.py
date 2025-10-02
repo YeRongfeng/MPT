@@ -104,6 +104,13 @@ def test_yaw_stability_computation():
         axes[1, 2].set_title('Stability at ~90°')
         plt.colorbar(im6, ax=axes[1, 2])
         
+        # 将原点设置在左下角
+        for ax in axes.flat:
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_aspect('equal')
+            ax.invert_yaxis()  # 反转y轴以将原点放在左下角
+        
         plt.tight_layout()
         plt.savefig('/home/yrf/MPT/yaw_stability_test.png')
         plt.close()

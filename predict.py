@@ -395,12 +395,12 @@ if __name__ == "__main__":
     # envType_random = np.random.choice(envType_list, size=1)[0]
     # 随机选择一个路径用于概率图对比
     # path_index = np.random.choice(range(500), size=1)[0]
-    # path_index_list = list(np.random.choice(range(500), size=6, replace=False))
+    # path_index_list = list(np.random.choice(range(200), size=6, replace=False))
     # path_index_list = list([163, 119, 340, 416, 148, 260])
     # path_index_list = list([0, 1, 2, 3, 4, 5])
-    path_index_list = list([2, 3, 7, 17, 23, 25])
+    # path_index_list = list([2, 3, 7, 17, 23, 25])
     # path_index_list = list([0, 1, 2, 3, 4, 4])  # 测试前5条路径
-    # path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
+    path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
     # path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
     # path_index_list = list([16, 17, 18, 19, 20, 21])  # 测试前5条路径
     # path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径

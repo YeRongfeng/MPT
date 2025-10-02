@@ -124,7 +124,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'uniformity': 0e-4,
             'angle': 0e-4,
             'smoothness': 0e-4,
-            'capsize': 1e-3,
+            'capsize': 1e-2,
             'curvature': 0e-3,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
@@ -593,9 +593,15 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
                         weighted_coords,  # 来自回归损失计算的预测坐标
                         goal_xy.unsqueeze(0)
                     ], dim=0)  # [steps_to_process+2, 2]
+                    full_yaws = torch.cat([
+                        start_state[i][2].unsqueeze(0),  # 起点角度
+                        weighted_pred_angles,  # 来自回归损失计算的预测角度
+                        goal_state[i][2].unsqueeze(0)  # 终点角度
+                    ], dim=0)  # [steps_to_process+2, 1]
                 else:
                     # 如果没有回归损失计算，使用真实轨迹坐标
                     full_coords = trajectory_copy[i, :, :2]
+                    full_yaws = trajectory_copy[i, :, 2]
                     
                 # 计算曲率损失（使用差分近似速度和加速度）
                 if full_coords.shape[0] >= 3:
@@ -615,7 +621,11 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
                     ydot = vy[:-1]  # [N-2]
                     xdd = ax
                     ydd = ay
-                    
+                    yaw_dot = full_yaws[1:] - full_yaws[:-1]  # [N-1]
+                    speed = torch.sqrt(vx ** 2 + vy ** 2)  # [N-2]
+                    yaw_per_meter = torch.abs(yaw_dot) / (speed + 1e-3)
+                    yaw_per_meter_limit = 2.1
+
                     # 计算曲率：|x' y'' - y' x''| / (x'^2 + y'^2)^{3/2}
                     num = torch.abs(xdot * ydd - ydot * xdd)
                     denom = (xdot ** 2 + ydot ** 2) ** 1.5 + 1e-9
@@ -623,13 +633,20 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
                     denom = torch.clamp(denom, min=1e-3)
                     curvature = num / denom
                     
-                    # 曲率惩罚：只惩罚超过阈值的部分
-                    curvature_threshold = 2.1
-                    curvature_cost = torch.mean(F.relu(curvature - curvature_threshold))
+                    # # 曲率惩罚：只惩罚超过阈值的部分
+                    # curvature_threshold = 2.1
+                    # curvature_cost = torch.mean(F.relu(curvature - curvature_threshold))
+
+                    # if not (torch.isnan(curvature_cost) or torch.isinf(curvature_cost) or curvature_cost.item() > 100):
+                    #     total_loss = total_loss + curvature_cost * loss_weights['curvature']
+                    #     loss_count += 1
+
+                    yaw_per_meter_violation = torch.relu(yaw_per_meter - yaw_per_meter_limit)
+                    yaw_per_meter_cost = torch.mean(yaw_per_meter_violation**2)
                     
                     # 数值稳定性检查并加入损失
-                    if not (torch.isnan(curvature_cost) or torch.isinf(curvature_cost) or curvature_cost.item() > 100):
-                        total_loss = total_loss + curvature_cost * loss_weights['curvature']
+                    if not (torch.isnan(yaw_per_meter_cost) or torch.isinf(yaw_per_meter_cost) or yaw_per_meter_cost.item() > 100):
+                        total_loss = total_loss + yaw_per_meter_cost * loss_weights['curvature']
                         loss_count += 1
                         
         # =================== 损失8：轨迹点稳定性损失(L_stability) ===================
@@ -902,6 +919,7 @@ if __name__ == "__main__":
     parser.add_argument('--fileDir', help="Directory to save training Data")  # 添加训练数据保存目录参数
     parser.add_argument('--load_stage1_model', help="Path to stage1 model checkpoint to load and start stage2 training", default=None)  # 加载第一阶段的模型参数，直接开始第二阶段训练
     parser.add_argument('--resume_stage1_model', help="Path to resume stage1 training (continue from checkpoint)", default=None)  # 恢复阶段1训练
+    parser.add_argument('--resume_stage2_model', help="Path to resume stage2 training (continue from checkpoint)", default=None)  # 恢复阶段2训练
     args = parser.parse_args()  # 解析命令行参数
 
     map_load = False  # 是否加载地图数据
@@ -972,7 +990,7 @@ if __name__ == "__main__":
     
     # 双阶段训练配置
     stage1_epochs = 100  # 第一阶段训练轮数：训练除correctionPred外的所有参数
-    stage2_epochs = 80  # 第二阶段训练轮数：只训练correctionPred参数
+    stage2_epochs = 200  # 第二阶段训练轮数：只训练correctionPred参数
     total_epochs = stage1_epochs + stage2_epochs
     
     # 初始化数据记录变量
@@ -1028,6 +1046,7 @@ if __name__ == "__main__":
     start_stage = 1
     checkpoint = None  # 初始化 checkpoint 变量
     resume_stage1 = False
+    resume_stage2 = False
     resume_start_epoch = 0
     
     # 优先处理直接跳过到stage2的加载选项；否则检查是否需要从stage1检查点恢复训练
@@ -1049,6 +1068,25 @@ if __name__ == "__main__":
         except:
             pass
         print(f"Will resume Stage 1 from epoch {resume_start_epoch}")
+    elif args.resume_stage2_model:
+        # 从stage2检查点恢复训练（继续stage2）
+        print(f"Resuming stage 2 training from checkpoint: {args.resume_stage2_model}")
+        checkpoint = torch.load(args.resume_stage2_model, map_location=device)
+        if 'state_dict' not in checkpoint:
+            raise ValueError("Invalid checkpoint format: 'state_dict' not found")
+        if isinstance(transformer, nn.DataParallel):
+            transformer.module.load_state_dict(checkpoint['state_dict'])
+        else:
+            transformer.load_state_dict(checkpoint['state_dict'])
+        resume_stage2 = True
+        resume_start_epoch = checkpoint.get('epoch', -1) + 1
+        start_stage = 2  # 继续第二阶段训练
+        # 从checkpoint中恢复已保存的最佳验证loss（如果有）
+        try:
+            best_val_loss_stage2 = float(checkpoint.get('val_loss', best_val_loss_stage2))
+        except:
+            pass
+        print(f"Will resume Stage 2 from epoch {resume_start_epoch}")
     
     # 第一阶段：冻结correctionPred，训练其他参数
     if start_stage == 1:
@@ -1184,13 +1222,14 @@ if __name__ == "__main__":
         optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                    betas=(0.9, 0.999), eps=1e-8),
         # lr_mul = 1.0,
-        lr_mul = 1e-3,
+        lr_mul = 1e-4,
         d_model = 512,
         n_warmup_steps = 50
     )
     
     # 第二阶段训练
-    for n in range(stage2_epochs):
+    start_epoch = resume_start_epoch if resume_stage2 else 0
+    for n in range(start_epoch, stage2_epochs):
         train_total_loss, train_n_correct, train_samples, train_stats = train_epoch(
             transformer, trainingData, stage2_optimizer, device, epoch=n, stage=2
         )

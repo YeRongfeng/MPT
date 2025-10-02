@@ -100,7 +100,7 @@ def geom2pixMatpos(pos, res=0.4, size=(100, 100)):
 
     return indices  # 返回正样本锚点索引元组
 
-def geom2pix(pos, res=0.1, size=(100, 100)):
+def geom2pix(pos, res=0.4, size=(100, 100)):
     """
     几何坐标到像素坐标的转换函数
     
@@ -118,8 +118,8 @@ def geom2pix(pos, res=0.1, size=(100, 100)):
     # 将几何坐标转换为像素坐标
     # x: -5 到 5 映射到 0 到 100
     # y: -5 到 5 映射到 0 到 100
-    col = int((x + 5.0) / res)
-    row = int((y + 5.0) / res)
+    col = int((x + 20.0) / res)
+    row = int((y + 20.0) / res)
     
     # 边界检查
     row = max(0, min(size[0] - 1, row))

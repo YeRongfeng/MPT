@@ -49,6 +49,16 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
     
     # 根据训练阶段设置损失权重
     if stage == 1:
+        # loss_weights = {
+        #     'classification': 1e-2,  # 第一阶段专注轨迹回归
+        #     'regression': 1e-4,
+        #     'uniformity': 1e-4,
+        #     'angle': 1e-3,
+        #     'smoothness': 1e-4,
+        #     'capsize': 0e-2,
+        #     'curvature': 1e-2,
+        #     'stability': 0e-3,  # 轨迹点稳定性结果预测
+        # }
         loss_weights = {
             'classification': 1e-2,  # 第一阶段专注轨迹回归
             'regression': 1e-4,
@@ -56,19 +66,9 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             'angle': 1e-3,
             'smoothness': 1e-4,
             'capsize': 0e-2,
-            'curvature': 0e-5,
+            'curvature': 0e-2,
             'stability': 0e-3,  # 轨迹点稳定性结果预测
         }
-        # loss_weights = {
-        #     'classification': 0e-1,  # 第一阶段专注轨迹回归
-        #     'regression': 1e-3,
-        #     'uniformity': 0e-4,
-        #     'angle': 0e-3,
-        #     'smoothness': 0e-4,
-        #     'capsize': 0e-2,
-        #     'curvature': 0e-5,
-        #     'stability': 0e-3,  # 轨迹点稳定性结果预测
-        # }
     else:
         # loss_weights = {
         #     'classification': 1e-3,  # 第二阶段专注安全性优化
@@ -678,7 +678,7 @@ def train_epoch(model, trainingData, optimizer, device, epoch=0, stage=1):
         # 梯度裁剪：防止梯度爆炸 - 平衡稳定性和学习效率
         max_grad_norm = 5.0  # 适度控制，平衡稳定性和学习速度
         if stage == 2:
-            max_grad_norm = 1.0  # 第二阶段更严格的梯度裁剪
+            max_grad_norm = 0.5  # 第二阶段更严格的梯度裁剪
         
         # 进行梯度裁剪，返回的是裁剪前的原始梯度范数
         original_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, norm_type=2)
@@ -1107,7 +1107,7 @@ if __name__ == "__main__":
         optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                    betas=(0.9, 0.98), eps=1e-9),
         # lr_mul = 1.0,
-        lr_mul = 1e-2,
+        lr_mul = 3e-3,
         d_model = 512,
         n_warmup_steps = 50
     )

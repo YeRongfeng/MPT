@@ -12,7 +12,7 @@ from dataLoader_uneven import compute_map_yaw_bins
 
 # data_Folder = '/home/yrf/MPT/data/terrain/train'
 data_Folder = '/home/yrf/MPT/data/sim_dataset/val'
-# data_Folder = '/home/yrf/MPT/data/sim_dataset/train'
+data_Folder = '/home/yrf/MPT/data/sim_dataset/train'
 # data_Folder = '/home/yrf/MPT/data/terrain_dataset/val'
 env_list = ['env{:06d}'.format(i) for i in range(0, 1)]
 cnt = 0
