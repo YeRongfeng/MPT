@@ -61,9 +61,9 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
         # }
         loss_weights = {
             'classification': 1e-1,  # 第一阶段专注轨迹回归
-            'regression': 1e-4,
+            'regression': 1e-3,
             'uniformity': 1e-4,
-            'angle': 1e-3,
+            'angle': 3e-3,
             'smoothness': 1e-4,
             'capsize': 0e-2,
             'curvature': 0e-2,
@@ -990,7 +990,7 @@ if __name__ == "__main__":
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
             # lr_mul = 0.3,
-            lr_mul = 3e-2,
+            lr_mul = 1e-2,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200
