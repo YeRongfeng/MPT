@@ -930,8 +930,9 @@ if __name__ == "__main__":
     # assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
     # env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
 
-    env_num = 1
-    env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
+    # env_num = 1
+    # env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
+    env_list = ["env000004","env000005"]  # 指定环境进行训练
     # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
 
     check_data_folders(dataFolder) # 检查数据文件夹结构
@@ -969,7 +970,7 @@ if __name__ == "__main__":
     # )
     
     model_args = dict(        # 定义模型参数字典
-        n_layers=6,          # Mamba编码器层数：12层
+        n_layers=3,          # Mamba编码器层数：12层
         d_state=16,           # Mamba状态维度：16
         dt_rank=32,           # 动态张量分解秩：32
         d_model=512,          # 模型的主要特征维度：512
@@ -1113,6 +1114,8 @@ if __name__ == "__main__":
         if resume_stage1 and checkpoint is not None and 'optimizer' in checkpoint:
             try:
                 stage1_optimizer._optimizer.load_state_dict(checkpoint['optimizer'])
+                if 'n_steps' in checkpoint:
+                    stage1_optimizer.n_steps = checkpoint['n_steps']
                 print("Loaded stage1 optimizer state from checkpoint")
             except Exception as e:
                 print(f"Warning: Failed to load stage1 optimizer state: {e}")
@@ -1180,6 +1183,7 @@ if __name__ == "__main__":
                 states = {
                     'state_dict': state_dict,
                     'optimizer': stage1_optimizer._optimizer.state_dict(),
+                    'n_steps': stage1_optimizer.n_steps, 
                     'torch_seed': torch_seed,
                     'stage': 1,
                     'epoch': n

@@ -836,7 +836,7 @@ if __name__ == "__main__":
 
     # env_num = 1
     # env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
-    env_list = ["env000004"]  # 指定环境进行训练
+    env_list = ["env000004","env000005"]  # 指定环境进行训练
     # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
 
     check_data_folders(dataFolder) # 检查数据文件夹结构
