@@ -12,9 +12,10 @@ from dataLoader_uneven import compute_map_yaw_bins
 
 # data_Folder = '/home/yrf/MPT/data/terrain/train'
 data_Folder = '/home/yrf/MPT/data/sim_dataset/val'
-data_Folder = '/home/yrf/MPT/data/sim_dataset/train'
+# data_Folder = '/home/yrf/MPT/data/sim_dataset/train'
 # data_Folder = '/home/yrf/MPT/data/terrain_dataset/val'
-env_list = ['env{:06d}'.format(i) for i in range(0, 1)]
+# env_list = ['env{:06d}'.format(i) for i in range(0, 2)]
+env_list = ['env000005']  # 指定环境进行数据清洗
 cnt = 0
 
 for env in env_list:
@@ -32,6 +33,7 @@ for env in env_list:
     normal_z = map_tensor[:, :, 3]
     
     yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
+    # yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=63)  # [H, W, 63]
 
     path_files = [f for f in os.listdir(env_path) if f.startswith('path_') and f.endswith('.p')]
     # 使用 tqdm 进度条显示处理进度
@@ -53,6 +55,14 @@ for env in env_list:
         trajectory = path_data['path']
         
         path = trajectory[:, :3]  # 只取前3列（x, y, yaw）
+        # 使用深拷贝
+        # path = trajectory[:, :3].copy()  # 只取前3列（x, y, yaw）
+        # # 对x进行翻转
+        # path[:, 0] = -path[:, 0]
+        # # 对y进行翻转
+        # path[:, 1] = -path[:, 1]
+        # # 对xy进行对换
+        # path[:, [0, 1]] = path[:, [1, 0]]
         valid = True
         for i in range(path.shape[0]):
             x, y, yaw = path[i]
@@ -67,12 +77,12 @@ for env in env_list:
                 yaw_stability_value = yaw_stability[x_idx, y_idx, yaw_idx]
                 if yaw_stability_value == 0:
                     print(f'Invalid trajectory at index {i} in {path_file}: yaw stability is zero.')
-                    valid = False
+                    # valid = False
                     cnt += 1
                     break
         
         # 覆写原文件，在文件内部添加标签"valid"
         with open(path_path, 'wb') as f:
-            pickle.dump({'valid': valid, 'path': path, 'map_name': path_data['map_name']}, f)
+            pickle.dump({'valid': valid, 'path': trajectory[:, :3], 'map_name': path_data['map_name']}, f)
         # print(f'Saved cleaned trajectory to {path_file}')
 print(f'Total invalid trajectories found: {cnt}')

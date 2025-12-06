@@ -358,7 +358,7 @@ if __name__ == "__main__":
     # envType_list = ['desert']
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000000']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000004']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     # envType_list = ['desert','map1','map3','map4']
     # envType_list = ['hill']
     save_path = 'predictions'
@@ -400,8 +400,8 @@ if __name__ == "__main__":
     # path_index_list = list([0, 1, 2, 3, 4, 5])
     # path_index_list = list([2, 3, 7, 17, 23, 25])
     # path_index_list = list([0, 1, 2, 3, 4, 4])  # 测试前5条路径
-    path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
-    # path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
+    # path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
+    path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
     # path_index_list = list([16, 17, 18, 19, 20, 21])  # 测试前5条路径
     # path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
     # path_index_list = list([28, 29, 30, 31, 32, 33])  # 测试前5条路径
@@ -423,8 +423,8 @@ if __name__ == "__main__":
     for env in envType_list:
         print(f"Evaluating environment: {env}")
         # 绘制多条轨迹的预测概率图和GT标签图对比
-        # for path_index in path_index_list:
-            # plot_predProb_map(path_index, env, save_path)
+        for path_index in path_index_list:
+            plot_predProb_map(path_index, env, save_path)
 
         # 绘制多组轨迹对比图
         plot_elevation_map(path_index_list, env, save_path)

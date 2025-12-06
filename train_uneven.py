@@ -60,7 +60,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
         #     'stability': 0e-3,  # 轨迹点稳定性结果预测
         # }
         loss_weights = {
-            'classification': 1e-2,  # 第一阶段专注轨迹回归
+            'classification': 1e-1,  # 第一阶段专注轨迹回归
             'regression': 1e-4,
             'uniformity': 1e-4,
             'angle': 1e-3,
@@ -222,7 +222,7 @@ def cal_performance(predVals, correctionVals, normals, yaw_stabilities, cost_map
             
             # 批量计算准确率
             # threshold = max(0.01, 1.0 / num_tokens * 2)
-            threshold = 0.5 / num_tokens
+            threshold = 0.1 / num_tokens
             
             # 创建有效锚点和标签的掩码 [num_anchor_rows, MAX_POSITIVE_ANCHORS]
             valid_anchor_mask_acc = (anchorPoint != -1) & (trueLabel != -1) & (anchorPoint < num_tokens)
@@ -834,8 +834,9 @@ if __name__ == "__main__":
     # assert args.env_list is not None, "Please provide environment list"  # 确保提供了环境列表
     # env_list = args.env_list.split(',')  # 将环境列表字符串分割成列表
 
-    env_num = 1
-    env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
+    # env_num = 1
+    # env_list = [f"env{i:06d}" for i in range(env_num)]  # 生成环境列表，格式为 env000000, env000001, ..., env000099
+    env_list = ["env000004"]  # 指定环境进行训练
     # print(f"Training on {len(env_list)} environments: {env_list}")  # 打印环境列表长度和内容
 
     check_data_folders(dataFolder) # 检查数据文件夹结构
@@ -989,7 +990,7 @@ if __name__ == "__main__":
             optim.Adam(filter(lambda p: p.requires_grad, transformer.parameters()),
                        betas=(0.9, 0.98), eps=1e-9),
             # lr_mul = 0.3,
-            lr_mul = 1e-1,
+            lr_mul = 3e-2,
             d_model = 512,
             n_warmup_steps = 800
             # n_warmup_steps = 3200
@@ -998,6 +999,8 @@ if __name__ == "__main__":
         if resume_stage1 and checkpoint is not None and 'optimizer' in checkpoint:
             try:
                 stage1_optimizer._optimizer.load_state_dict(checkpoint['optimizer'])
+                if 'n_steps' in checkpoint:
+                    stage1_optimizer.n_steps = checkpoint['n_steps']
                 print("Loaded stage1 optimizer state from checkpoint")
             except Exception as e:
                 print(f"Warning: Failed to load stage1 optimizer state: {e}")
@@ -1065,6 +1068,7 @@ if __name__ == "__main__":
                 states = {
                     'state_dict': state_dict,
                     'optimizer': stage1_optimizer._optimizer.state_dict(),
+                    'n_steps': stage1_optimizer.n_steps, 
                     'torch_seed': torch_seed,
                     'stage': 1,
                     'epoch': n

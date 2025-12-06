@@ -627,7 +627,10 @@ def compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=18):
     # h = 8.0         # 机器人高度
     # min_edge = 10.0 # 最小边长约束
     # max_edge = 20.0 # 最大边长约束
-    h = 35.0         # 机器人高度
+    # h = 35.0         # 机器人高度
+    # min_edge = 8.0 # 最小边长约束
+    # max_edge = 15.0 # 最大边长约束
+    h = 15.0         # 机器人高度
     min_edge = 8.0 # 最小边长约束
     max_edge = 15.0 # 最大边长约束
     
@@ -1334,6 +1337,9 @@ class UnevenPathDataLoader(Dataset):
         
         # 3. 生成编码输入
         path = trajectory[:, :3]  # [N+2, 3]
+        
+        # # 对xy进行对换
+        # path[:, [0, 1]] = path[:, [1, 0]]
         
         map_input = torch.concatenate((
             # torch.tensor(elevation, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
