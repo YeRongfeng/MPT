@@ -502,7 +502,8 @@ class PathDiffusionTransformer(nn.Module):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Linear(d_model, 3)  # 预测 [x_noise, y_noise, yaw_noise]
+            nn.Linear(d_model, 3),  # 预测 [x_noise, y_noise, yaw_noise]
+            nn.Tanh()  # 限制输出范围在[-1, 1]
         )
         
         self.n_path_steps = n_path_steps
@@ -588,8 +589,9 @@ class PathDiffusionTransformer(nn.Module):
         alpha_t_prev = self.alphas_cumprod[t-1][:, None, None] if t[0] > 0 else torch.ones_like(alpha_t)
         beta_t = self.betas[t][:, None, None]
         
-        # 预测 x_0
+        # 预测 x_0 并裁剪
         pred_x0 = (x_t - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
+        pred_x0 = torch.clamp(pred_x0, min=-1.5, max=1.5)  # 稍微放宽范围
         
         # DDPM均值
         mean = torch.sqrt(alpha_t_prev) * beta_t / (1 - alpha_t) * pred_x0 + \
@@ -599,9 +601,13 @@ class PathDiffusionTransformer(nn.Module):
         if t[0] > 0:
             noise = torch.randn_like(x_t)
             variance = beta_t
-            return mean + torch.sqrt(variance) * noise
+            x_t_next = mean + torch.sqrt(variance) * noise
+            # 每步都轻微裁剪
+            x_t_next = torch.clamp(x_t_next, min=-2.0, max=2.0)
+            return x_t_next
         else:
-            return mean
+            # 最后一步严格裁剪到 [-1, 1]
+            return torch.clamp(mean, min=-1.0, max=1.0)
     
     @torch.no_grad()
     def sample(self, map_input, num_samples=5):
@@ -621,11 +627,15 @@ class PathDiffusionTransformer(nn.Module):
         
         # 从纯噪声开始
         x_t = torch.randn(num_samples, self.n_path_steps, 3, device=device)
+        x_t = torch.clamp(x_t, min=-2.0, max=2.0)
         
         # 逐步去噪
         for t in reversed(range(self.diffusion_steps)):
             t_batch = torch.full((num_samples,), t, device=device, dtype=torch.long)
             x_t = self.p_sample(map_input_expanded, x_t, t_batch)
+        
+        # 最终确保在 [-1, 1] 范围
+        x_t = torch.clamp(x_t, min=-1.0, max=1.0)
         
         return x_t  # (num_samples, 10, 3)
 

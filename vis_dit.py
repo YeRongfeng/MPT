@@ -1,0 +1,316 @@
+import matplotlib.pyplot as plt
+import os
+from os import path as osp
+import numpy as np
+import pickle
+
+from skimage import io
+
+import sys
+sys.modules['numpy._core'] = np
+sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
+sys.modules['numpy._core.multiarray'] = np.core.multiarray
+
+import torch
+import torch.nn.functional as F
+import json
+
+from dit.Models import PathDiffusionTransformer
+from dataLoader_uneven import get_encoder_input, receptive_field
+from eval_model_uneven import getHashTable, get_patch
+import torch
+
+dataset_path = 'data/sim_dataset/val'
+# dataset_path = 'data/sim_dataset/train'
+
+def generate_paths(model, map_input, start_point, goal_point, num_paths=5):
+    """
+    生成完整路径（包括起点和终点）
+    
+    Args:
+        model: 训练好的PathDiffusionTransformer
+        map_input: (1, 6, H, W) 已包含起点/终点嵌入的地图
+        start_point: (3,) [x, y, yaw] 起点坐标
+        goal_point: (3,) [x, y, yaw] 终点坐标
+        num_paths: 生成路径数量
+    Returns:
+        complete_paths: (num_paths, 20, 3) 中间路径
+    """
+    model.eval()
+    
+    # 生成中间20个点
+    with torch.no_grad():
+        middle_waypoints = model.sample(map_input, num_samples=num_paths)  # (num_paths, 20, 3)
+    
+    # 反归一化
+    xy_range = 20.0  # 和训练时保持一致
+    middle_waypoints[:, :, :2] = middle_waypoints[:, :, :2] * xy_range
+    middle_waypoints[:, :, 2] = middle_waypoints[:, :, 2] * np.pi
+    
+    # # 拼接起点和终点
+    # start_point_expanded = start_point.unsqueeze(0).expand(num_paths, 1, 3)  # (num_paths, 1, 3)
+    # goal_point_expanded = goal_point.unsqueeze(0).expand(num_paths, 1, 3)    # (num_paths, 1, 3)
+    
+    # complete_paths = torch.cat([
+    #     start_point_expanded,   # 起点
+    #     middle_waypoints,       # 20个中间点
+    #     goal_point_expanded     # 终点
+    # ], dim=1)  # (num_paths, 22, 3)
+    
+    return middle_waypoints
+    # return complete_paths
+
+# Define the network
+device='cuda' if torch.cuda.is_available() else 'cpu'
+
+def plot_single_trajectory(ax, elevation_masked, trajectory, predTraj=None, output_dim=None, is_pred=False):
+    """绘制单个轨迹子图的辅助函数"""
+    # 显示地形图
+    # ax.imshow(elevation_masked, extent=[-5, 5, -5, 5],
+    ax.imshow(elevation_masked, extent=[-20, 20, -20, 20],
+              origin='lower', cmap='terrain', aspect='equal')
+    ax.grid(True, alpha=0.3)
+    
+    start_pos = trajectory[0, :]
+    goal_pos = trajectory[-1, :]
+    
+    # 绘制轨迹线段
+    if is_pred and predTraj is not None:
+        # 将predTraj从(x,y,theta)格式转换为只包含(x,y)的格式用于绘制路径
+        predTraj_xy = np.array([[point[0], point[1]] for point in predTraj])
+        # 先为预测轨迹补足起点和终点，只使用x,y坐标
+        predTraj_path = np.vstack((start_pos[:2], predTraj_xy, goal_pos[:2]))
+        output_dim = predTraj_path.shape[0]  # 已经包括起点和终点
+        
+        # 绘制轨迹线段
+        for i in range(output_dim-1):
+            color = plt.cm.rainbow(i / (output_dim - 2))  # 使用rainbow颜色映射
+            ax.plot([predTraj_path[i][0], predTraj_path[i+1][0]], 
+                    [predTraj_path[i][1], predTraj_path[i+1][1]], 
+                    color=color, zorder=3, linewidth=2, marker='o', markersize=3)
+        
+        # 绘制预测轨迹的角度箭头（使用predTraj中的原始角度信息）
+        arrow_scale = 0.2
+        for i, (x, y, theta) in enumerate(predTraj):
+            color = plt.cm.rainbow(i / (len(predTraj) - 1)) if len(predTraj) > 1 else 'blue'
+            ax.arrow(x, y,
+                     np.cos(theta) * arrow_scale,
+                     np.sin(theta) * arrow_scale,
+                     head_width=0.08, head_length=0.12, fc=color, ec=color, zorder=4, alpha=0.8)
+    else:
+        # 绘制真实轨迹线段
+        for i in range(trajectory.shape[0] - 1):
+            color = plt.cm.rainbow(i / (trajectory.shape[0] - 2))  # 使用rainbow颜色映射
+            ax.plot(trajectory[i:i+2, 0], trajectory[i:i+2, 1], color=color, zorder=3, linewidth=2, marker='o', markersize=3)
+        
+        # 绘制真实轨迹的角度箭头（从轨迹数据第三列读取）
+        arrow_scale = 0.2
+        for i in range(1, trajectory.shape[0] - 1):  # 跳过起点和终点，它们单独处理
+            color = plt.cm.rainbow((i-1) / (trajectory.shape[0] - 3)) if trajectory.shape[0] > 3 else 'green'
+            x, y, theta = trajectory[i, :]
+            ax.arrow(x, y,
+                     np.cos(theta) * arrow_scale,
+                     np.sin(theta) * arrow_scale,
+                     head_width=0.08, head_length=0.12, fc=color, ec=color, zorder=4, alpha=0.8)
+    
+    # 绘制起点和终点
+    ax.scatter(start_pos[0], start_pos[1], color='purple', zorder=5, s=100, edgecolors='black', linewidth=1)
+    ax.scatter(goal_pos[0], goal_pos[1], color='r', zorder=5, s=100, edgecolors='black', linewidth=1)
+    
+    # 绘制起点和终点的朝向箭头（使用更大的箭头表示起点终点）
+    arrow_scale_large = 0.3
+    ax.arrow(start_pos[0], start_pos[1],
+             np.cos(start_pos[2]) * arrow_scale_large,
+             np.sin(start_pos[2]) * arrow_scale_large,
+             head_width=0.12, head_length=0.18, fc='purple', ec='black', zorder=6, linewidth=1)
+    ax.arrow(goal_pos[0], goal_pos[1],
+             np.cos(goal_pos[2]) * arrow_scale_large,
+             np.sin(goal_pos[2]) * arrow_scale_large,
+             head_width=0.12, head_length=0.18, fc='r', ec='black', zorder=6, linewidth=1)
+    
+    # 设置标题并关闭坐标轴
+    title = 'Predicted Trajectory' if is_pred else 'Ground Truth Trajectory'
+    ax.set_title(title, fontsize=12, pad=8)
+    ax.axis('off')
+
+def plot_elevation_map(pathNums, envType, save_path='predictions'):
+    """绘制多组轨迹对比图"""
+    if not isinstance(pathNums, list):
+        pathNums = [pathNums]  # 确保pathNums是列表
+    
+    # 限制最多显示6组对比
+    pathNums = pathNums[:6]
+    num_pairs = len(pathNums)
+    
+    # 创建大图和网格，不使用constrained_layout以便手动控制布局
+    fig = plt.figure(figsize=(18, 13))  # 略微增加高度，为标题和颜色条预留空间
+    gs = plt.GridSpec(3, 4, figure=fig, left=0.05, right=0.95, 
+                     bottom=0.08, top=0.9, wspace=0.15, hspace=0.3)  # 手动设置边距和间距
+    
+    # 加载环境数据，所有子图共用同一个环境
+    envFolder = osp.join(dataset_path, envType)
+    # envFolder = osp.join('data/test_training/val', envType)
+    env_path = osp.join(envFolder, f'map.p')
+    with open(env_path, 'rb') as f:
+        env = pickle.load(f)
+        tensor = env['tensor']
+        elevation = tensor[:, :, 0]
+        normal_x = tensor[:, :, 1]
+        normal_y = tensor[:, :, 2]
+        normal_z = tensor[:, :, 3]
+        elevation_masked = np.ma.masked_invalid(elevation)
+    
+    # 为每对轨迹创建子图
+    for idx, pathNum in enumerate(pathNums):
+        # 计算当前对应在网格中的位置
+        row = idx // 2
+        col = (idx % 2) * 2
+        
+        # 加载真实轨迹数据
+        path_file = osp.join(envFolder, f'path_{pathNum}.p')
+        with open(path_file, 'rb') as f:
+            path_data = pickle.load(f)
+            trajectory = path_data['path']  # [N, 3]
+        
+        start_pos = trajectory[0, :]
+        goal_pos = trajectory[-1, :]
+        
+        # print(f"True_x range: {min(trajectory[:, 0])} to {max(trajectory[:, 0])}")
+        # print(f"True_y range: {min(trajectory[:, 1])} to {max(trajectory[:, 1])}")
+        
+        # print(f"True Traj: {trajectory}")
+        
+        # 获取预测轨迹
+        # patch_map, predProb, predTraj = get_patch(transformer, start_pos[:2], goal_pos[:2], normal_x, normal_y, normal_z)
+        # patch_map, predProb, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
+        # output_dim = patch_map.shape[0]
+        # print(f"normal_z shape: {normal_z.shape}")
+        
+        encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
+        # 将numpy数组转换为PyTorch张量并确保正确的数据类型和维度顺序
+        if isinstance(encoder_input, np.ndarray):
+            # 从 [H, W, C] 转换为 [C, H, W]
+            encoder_input = torch.from_numpy(encoder_input).permute(2, 0, 1).float()
+        elif isinstance(encoder_input, torch.Tensor):
+            # 确保维度顺序正确
+            if encoder_input.dim() == 3 and encoder_input.shape[-1] == 4:
+                encoder_input = encoder_input.permute(2, 0, 1).float()
+            else:
+                encoder_input = encoder_input.float()
+        else:
+            encoder_input = torch.tensor(encoder_input, dtype=torch.float32)
+            if encoder_input.dim() == 3 and encoder_input.shape[-1] == 4:
+                encoder_input = encoder_input.permute(2, 0, 1)
+
+        predTraj = generate_paths(model, 
+                                  map_input=encoder_input[None, :].cuda(),
+                                  start_point=torch.tensor(start_pos).float().to(device),
+                                  goal_point=torch.tensor(goal_pos).float().to(device),
+                                  num_paths=1  # 只生成一条路径用于对比
+                                 ).squeeze(0).cpu().numpy()  # (20, 3)
+        output_dim = predTraj.shape[0]
+        
+        print(f"Predicted Traj: {predTraj}")
+        
+        # 创建左侧子图 - 预测轨迹
+        ax_pred = fig.add_subplot(gs[row, col])
+        # 为预测轨迹补足起点和终点
+        plot_single_trajectory(ax_pred, elevation_masked, trajectory, predTraj, output_dim, is_pred=True)
+        
+        # 创建右侧子图 - 真实轨迹
+        ax_true = fig.add_subplot(gs[row, col+1])
+        plot_single_trajectory(ax_true, elevation_masked, trajectory, is_pred=False)
+        
+        # 添加路径编号 - 调整位置和样式使其更加醒目
+        ax_pred.text(0.02, 0.98, f"Path #{pathNum}", transform=ax_pred.transAxes, 
+                   fontsize=11, weight='bold', verticalalignment='top', horizontalalignment='left',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=0.3, edgecolor='gray'))
+    
+    # 为轨迹的颜色添加全局颜色条 - 调整位置到图形底部，更合理的位置
+    norm = plt.Normalize(0, output_dim - 1)
+    cmap = plt.cm.rainbow
+    # 调整颜色条位置，放置在整个图形的底部
+    cbar_ax = fig.add_axes([0.3, 0.02, 0.4, 0.015])  # [left, bottom, width, height]
+    cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), 
+                       cax=cbar_ax, orientation='horizontal')
+    cbar.set_label('Trajectory Step', fontsize=12)
+    
+    # 添加超级标题，调整位置确保不被裁剪
+    plt.subplots_adjust(top=0.92)  # 为标题腾出更多空间
+    fig.suptitle(f'Trajectory Predictions for {envType.capitalize()} Environment', 
+                fontsize=18, y=0.98, fontweight='bold')
+    
+    # 保存图像
+    save_path = osp.join(save_path, f'{envType}')
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 生成路径编号列表的简短表示，例如 1_2_3
+    path_ids_str = "_".join(str(p) for p in pathNums)
+    plt.savefig(osp.join(save_path, f'multi_trajectories_{path_ids_str}.png'), dpi=300)
+    print(f"Saved multi-trajectory comparison figure for paths {path_ids_str} in {envType} environment.")
+    print("fig saved to", osp.join(save_path, f'multi_trajectories_{path_ids_str}.png'))
+    
+
+if __name__ == "__main__":
+    best = True
+    # best = False
+    epoch = 4
+
+    envNum = np.random.randint(0, 99)  # 随机选择环境id
+    # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000005']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    save_path = 'predictions'
+
+    modelFolder = 'data/sim'
+    modelFile = osp.join(modelFolder, f'model_params.json')
+    model_param = json.load(open(modelFile))
+
+    model = PathDiffusionTransformer(**model_param)
+    _ = model.to(device)
+
+    # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
+    
+    if best:
+        checkpoint = torch.load(osp.join(modelFolder, f'best_model.pth'))
+        print("Loaded best stage 1 model.")
+    else:
+        checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_epoch_{epoch}.pth'))
+        print(f"Loaded stage 1 model from epoch {epoch}.")
+    
+    # model.load_state_dict(checkpoint['state_dict'])
+
+    _ = model.eval()
+
+    # envType_random = np.random.choice(envType_list, size=1)[0]
+    # 随机选择一个路径用于概率图对比
+    # path_index = np.random.choice(range(500), size=1)[0]
+    # path_index_list = list(np.random.choice(range(200), size=6, replace=False))
+    # path_index_list = list([163, 119, 340, 416, 148, 260])
+    # path_index_list = list([0, 1, 2, 3, 4, 5])
+    # path_index_list = list([2, 3, 7, 17, 23, 25])
+    # path_index_list = list([0, 1, 2, 3, 4, 4])  # 测试前5条路径
+    # path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
+    path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
+    # path_index_list = list([16, 17, 18, 19, 20, 21])  # 测试前5条路径
+    # path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
+    # path_index_list = list([28, 29, 30, 31, 32, 33])  # 测试前5条路径
+    # path_index_list = list([34, 35, 36, 37, 38, 39])  # 测试前5条路径
+    # path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
+    # path_index_list = list([46, 47, 48, 49, 44, 45])  # 测试前5条路径
+    # print(f"Evaluating environment: {envType_random}")
+    print(f"Evaluating path index: {path_index_list}")
+
+    # # 绘制多条轨迹的预测概率图和GT标签图对比
+    # for path_index in path_index_list:
+    #     plot_predProb_map(path_index, envType_random, save_path)
+        
+    # # 绘制多组轨迹对比图
+    # plot_elevation_map(path_index_list, envType_random, save_path)
+    
+    # plot_predProb_map(2, envType_list[0], save_path)
+    
+    for env in envType_list:
+        print(f"Evaluating environment: {env}")
+
+        # 绘制多组轨迹对比图
+        plot_elevation_map(path_index_list, env, save_path)

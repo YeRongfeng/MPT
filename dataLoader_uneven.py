@@ -1341,6 +1341,9 @@ class UnevenPathDataLoader(Dataset):
         # # 对xy进行对换
         # path[:, [0, 1]] = path[:, [1, 0]]
         
+        # 对角度进行标准化，确保在[-pi, pi]范围内
+        path[:, 2] = (path[:, 2] + np.pi) % (2 * np.pi) - np.pi
+        
         map_input = torch.concatenate((
             # torch.tensor(elevation, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
             torch.tensor(normal_x, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
