@@ -17,6 +17,7 @@ from einops import rearrange  # 张量重排：高效的维度操作
 from torch.nn.utils.rnn import pad_sequence  # 序列填充：处理变长序列的批处理
 
 from utils import geom2pix  # 坐标转换工具：几何坐标到像素坐标的转换
+from relative_motion_utils import trajectory_to_relative_motion  # 相对运动工具：轨迹转换为相对运动表示
 
 # 添加兼容性处理
 import sys
@@ -158,18 +159,27 @@ def PaddedSequence(batch):
     """
     # 过滤有效样本：移除None值，确保数据完整性
     valid_batch = [batch_i for batch_i in batch if batch_i is not None]
+    relative_motions = torch.stack([item['relative_motion'] for item in batch])
+    start_poses = torch.stack([item['start_pose'] for item in batch])
+    goal_poses = torch.stack([item['goal_pose'] for item in batch])
     
     # 由于所有样本已经具有固定尺寸，直接堆叠即可
     data = {
         'map': torch.stack([batch_i['map'] for batch_i in valid_batch]),  # [B, C, H, W]
-        # 'pose': torch.stack([batch_i['pose'] for batch_i in valid_batch]),  # [B, 2, 4] - 起点和终点位姿
+        'relative_motion': torch.stack([batch_i['relative_motion'] for batch_i in valid_batch]),
+        'start_pose': torch.stack([batch_i['start_pose'] for batch_i in valid_batch]),
+        'goal_pose': torch.stack([batch_i['goal_pose'] for batch_i in valid_batch]),
         'anchor': torch.stack([batch_i['anchor'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'labels': torch.stack([batch_i['labels'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'length': torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch]),  # [B,] - 序列长度
         'trajectory': torch.stack([batch_i['trajectory'] for batch_i in valid_batch]),  # [B, N+2, 3]
-        # 'yaw_stability': torch.stack([batch_i['yaw_stability'] for batch_i in valid_batch]),  # [B, H, W, 36] - yaw分箱倾覆状态
-        # 'cost_map': torch.stack([batch_i['cost_map'] for batch_i in valid_batch]),  # [B, H, W, yaw_bins] - 成本图
     }
+    
+    # 如果有stability相关数据（Stage 2训练需要），则添加到返回字典
+    if valid_batch and 'normals' in valid_batch[0]:
+        data['normals'] = torch.stack([batch_i['normals'] for batch_i in valid_batch])  # [B, 3, H, W]
+    if valid_batch and 'cost_map' in valid_batch[0]:
+        data['cost_map'] = torch.stack([batch_i['cost_map'] for batch_i in valid_batch])  # [B, num_layers, max_anchors]
     
     return data
 
@@ -1291,10 +1301,11 @@ class UnevenPathDataLoader(Dataset):
 
     """
 
-    def __init__(self, env_list, dataFolder):
+    def __init__(self, env_list, dataFolder, compute_stability_map=False):
         self.num_env = len(env_list)
         self.env_list = env_list
         self.dataFolder = dataFolder
+        self.compute_stability_map = compute_stability_map
         self.env_index = {env_name: i for i, env_name in enumerate(env_list)}
         self.indexDict = []
         
@@ -1305,7 +1316,8 @@ class UnevenPathDataLoader(Dataset):
             for i in range(len(path_files)):
                 self.indexDict.append((self.env_index[env_name], i))
         
-        print(f"不平坦地面数据加载器初始化完成：{self.num_env}个环境，{len(self.indexDict)}个路径样本")
+        stability_info = "(启用stability map计算)" if self.compute_stability_map else "(禁用stability map计算)"
+        print(f"不平坦地面数据加载器初始化完成：{self.num_env}个环境，{len(self.indexDict)}个路径样本 {stability_info}")
     
     def __len__(self):
         return len(self.indexDict)
@@ -1338,6 +1350,15 @@ class UnevenPathDataLoader(Dataset):
         # 3. 生成编码输入
         path = trajectory[:, :3]  # [N+2, 3]
         
+        # 转换为相对位移
+        relative_motion, start_pose = trajectory_to_relative_motion(trajectory)
+        # relative_motion: (21, 3) [Δx, Δy, Δθ]
+        # start_pose: (3,) [x_0, y_0, θ_0]
+        
+        # 提取中间步骤（去掉第一步和最后一步）
+        middle_motion = relative_motion[1:-1]  # (19, 3)
+        goal_pose = trajectory[-1]  # (3,)
+        
         # # 对xy进行对换
         # path[:, [0, 1]] = path[:, [1, 0]]
         
@@ -1355,13 +1376,19 @@ class UnevenPathDataLoader(Dataset):
         # goal_pose = torch.tensor([path[-1, 0], path[-1, 1], np.cos(path[-1, 2]), np.sin(path[-1, 2])], dtype=torch.float32)  # [4] 终点位姿 [x, y, cos(yaw), sin(yaw)]
         # pose_input = torch.stack((start_pose, goal_pose), dim=0)  # [2, 4] 起点和终点位姿
         
-        encoded_input = get_encoder_input(
-            np.abs(normal_z),        # 确保使用的法向量z分量为正值
-            goal_state=path[-1, :],  # 终点位姿
-            start_state=path[0, :],  # 起点位姿
-            normal_x=normal_x, 
-            normal_y=normal_y
-        )
+        encoded_input = torch.tensor(np.concatenate((
+            normal_x[:, :, None],  # [H, W, 1]
+            normal_y[:, :, None],  # [H, W, 1]
+            normal_z[:, :, None]   # [H, W, 1]
+        ), axis=2), dtype=torch.float32)  # [H, W, 3]
+        
+        # encoded_input = get_encoder_input(
+        #     np.abs(normal_z),        # 确保使用的法向量z分量为正值
+        #     goal_state=path[-1, :],  # 终点位姿
+        #     start_state=path[0, :],  # 起点位姿
+        #     normal_x=normal_x, 
+        #     normal_y=normal_y
+        # )
         
         # encoded_input = get_encoder_input(
         #     normal_z, 
@@ -1465,32 +1492,47 @@ class UnevenPathDataLoader(Dataset):
         # 将填充位置(-1)的标签设为-1，训练时忽略
         labels[anchor == -1] = -1
         
-        # # # 5. 计算yaw_bins倾覆状态
-        # yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
-        # # cost_map = generate_cost_map_from_yaw_stability(
-        # #     yaw_stability, 
-        # #     voxel_size_xy=0.1, 
-        # #     yaw_weight=2.1, 
-        # #     d_safe=0.15, 
-        # #     kalpa=0.08, 
-        # #     return_esdf=False
-        # # )
-        # sdf_map = generate_sdf_from_yaw_stability(
-        #     yaw_stability, 
-        #     voxel_size_xy=0.1, 
-        #     yaw_weight=1.4
-        # )
+        # 5. 计算yaw_bins倾覆状态（根据参数决定是否计算）
+        yaw_stability = None
+        cost_map = None
+        if self.compute_stability_map:
+            yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
+            # 可以选择计算 cost_map 或 sdf_map
+            # cost_map = generate_cost_map_from_yaw_stability(
+            #     yaw_stability, 
+            #     voxel_size_xy=0.1, 
+            #     yaw_weight=2.1, 
+            #     d_safe=0.15, 
+            #     kalpa=0.08, 
+            #     return_esdf=False
+            # )
+            # 或者使用 sdf_map:
+            cost_map = generate_sdf_from_yaw_stability(
+                yaw_stability, 
+                voxel_size_xy=0.1, 
+                yaw_weight=1.4
+            )
 
         # 转换为PyTorch张量
-        return {
+        result = {
             'map': torch.as_tensor(encoded_input, dtype=torch.float).permute(2, 0, 1),  # 地图：(C, H, W) - 转换为channels-first格式
-            # 'map': torch.as_tensor(map_input, dtype=torch.float),  # 地图：(C, H, W) - map_input已经是正确的channels-first格式，无需permute
-            # 'pose': torch.as_tensor(pose_input, dtype=torch.float),  # 起点和终点位姿：(2, 4)
             'anchor': anchor,  # 锚点索引：(N, M)
             'labels': labels,  # 锚点标签：(N, M)
+            'relative_motion': torch.from_numpy(middle_motion).float(),  # ✅ 改为相对位移
+            'start_pose': torch.from_numpy(start_pose).float(),  # ✅ 添加起点
+            'goal_pose': torch.from_numpy(goal_pose).float(),    # ✅ 添加终点
             'trajectory': torch.as_tensor(trajectory, dtype=torch.float),  # 轨迹点：[N, 3]
-            # 'yaw_stability': torch.as_tensor(yaw_stability, dtype=torch.float),  # yaw分箱倾覆状态：[H, W, 36]
-            # 'cost_map': torch.as_tensor(sdf_map, dtype=torch.float),  # 成本图：[H, W, yaw_bins]
-            # 'cost_map': torch.as_tensor(cost_map, dtype=torch.float),  # 成本图：[H, W, yaw_bins]
             'elevation': torch.as_tensor(elevation, dtype=torch.float),  # 高程图：[H, W]
         }
+        
+        # 条件性地添加stability相关数据
+        if self.compute_stability_map:
+            result['normals'] = torch.stack([
+                torch.as_tensor(normal_x, dtype=torch.float),
+                torch.as_tensor(normal_y, dtype=torch.float),
+                torch.as_tensor(normal_z, dtype=torch.float)
+            ], dim=0)  # 法线：(3, H, W)
+            # result['yaw_stability'] = torch.as_tensor(yaw_stability, dtype=torch.float)  # yaw分箱倾覆状态：[H, W, 36]
+            result['cost_map'] = torch.as_tensor(cost_map, dtype=torch.float)  # 成本图：[H, W, yaw_bins]
+        
+        return result

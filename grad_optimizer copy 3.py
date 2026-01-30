@@ -6,9 +6,6 @@ import matplotlib.pyplot as plt
 
 import tqdm
 
-# 导入评估器
-from evaluator import TrajectoryEvaluator
-
 class TrajectoryOptimizerSE2:
     def __init__(self, points, occupancy_map, map_info, device='cuda'):
         """
@@ -110,18 +107,10 @@ class TrajectoryOptimizerSE2:
         return torch.cat([self.start_pose.unsqueeze(0), self.variable_poses, self.end_pose.unsqueeze(0)], dim=0)
 
 
-    def _solve_natural_cubic_M(self, y, t_ctrl=None):
-        """为自然三次样条求解二次导数 M
-        
-        Args:
-            y: 控制点值
-            t_ctrl: 控制点参数化（如果为None则使用self.t_points）
-        """
-        if t_ctrl is None:
-            t_ctrl = self.t_points
-        
-        N = len(y)
-        t = t_ctrl
+    def _solve_natural_cubic_M(self, y):
+        """为自然三次样条求解二次导数 M (与原版相同)"""
+        N = self.N
+        t = self.t_points
         h = torch.clamp(t[1:] - t[:-1], min=1e-6)
         
         A = torch.zeros((N, N), device=self.device, dtype=torch.float32)
@@ -197,8 +186,8 @@ class TrajectoryOptimizerSE2:
         # 将 yaw 序列展开（unwrap），消除跳跃
         yaw_unwrapped = self._unwrap_angles(yaw_ctrl)
         
-        # 对展开后的角度进行标量插值 - 关键修复：传递t_ctrl保持梯度流
-        M = self._solve_natural_cubic_M(yaw_unwrapped, t_ctrl=t_ctrl)
+        # 对展开后的角度进行标量插值
+        M = self._solve_natural_cubic_M(yaw_unwrapped)
         
         h = torch.clamp(t_ctrl[1:] - t_ctrl[:-1], min=1e-6)
         
@@ -259,7 +248,7 @@ class TrajectoryOptimizerSE2:
             t_ctrl = t_ctrl.to(device=self.device, dtype=torch.float32)
 
         N_local = t_ctrl.shape[0]
-        M = self._solve_natural_cubic_M(y_ctrl, t_ctrl=t_ctrl)  # 关键修复：传递t_ctrl
+        M = self._solve_natural_cubic_M(y_ctrl)
         
         h = torch.clamp(t_ctrl[1:] - t_ctrl[:-1], min=1e-6)
         
@@ -1697,8 +1686,7 @@ class TrajectoryOptimizerSE2:
         )
         esdf_flat = esdf_sample.reshape(-1)
         d_safe = 0.15
-        # kalpa = 0.15 # kalpa越大，过渡越平缓
-        kalpa = 0.3 # kalpa越大，过渡越平缓
+        kalpa = 0.15 # kalpa越大，过渡越平缓
         z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
         occupancy_values = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
         obstacle_cost = torch.mean(occupancy_values)*1e2
@@ -1959,43 +1947,16 @@ class TrajectoryOptimizerSE2:
         #     'out_of_bounds': 1e2,  # 超出地图范围的惩罚
         # }
 
-        # weights = {
-        #     'obstacle': 3e-6,
-        #     'smoothness': 2e-7,
-        #     'curvature': 1e-4,
-        #     'yaw_per_meter': 1e-0, # 惩罚原地大角度转动的权重
-        #     'control': 0e-7,
-        #     'angle_diff': 1e0, # 惩罚角度与切线方向不一致的权重
-        #     'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
-        #     'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
-        #     'uniformity': 0e-0,  # 轨迹段长度均匀性损失
-        #     'out_of_bounds': 0e2,  # 超出地图范围的惩罚
-        #     'endpoint_distance': 0e0,  # 首末段距离约束
-        # }
-        
-        # weights = {
-        #     'obstacle': 3e-6,
-        #     'smoothness': 1e-7,
-        #     'curvature': 1e-4,
-        #     'yaw_per_meter': 1e-0, # 惩罚原地大角度转动的权重
-        #     'control': 0e-7,
-        #     'angle_diff': 1e0, # 惩罚角度与切线方向不一致的权重
-        #     'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
-        #     'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
-        #     'uniformity': 0e-0,  # 轨迹段长度均匀性损失
-        #     'out_of_bounds': 0e2,  # 超出地图范围的惩罚
-        #     'endpoint_distance': 0e0,  # 首末段距离约束
-        # }
         weights = {
             'obstacle': 3e-5,
-            'smoothness': 1e-7,
-            'curvature': 1e-3,
-            'yaw_per_meter': 0e-2, # 惩罚原地大角度转动的权重
+            'smoothness': 1e-8,
+            'curvature': 0e-3,
+            'yaw_per_meter': 1e-0, # 惩罚原地大角度转动的权重
             'control': 0e-7,
             'angle_diff': 1e-0, # 惩罚角度与切线方向不一致的权重
             'endpoints': 0e0,    # 强力惩罚端点 yaw 对齐
             'control_smoothness': 0e-3,  # 控制点连线的光滑性损失
-            'uniformity': 0e-1,  # 轨迹段长度均匀性损失
+            'uniformity': 1e-0,  # 轨迹段长度均匀性损失
             'out_of_bounds': 0e2,  # 超出地图范围的惩罚
             'endpoint_distance': 0e0,  # 首末段距离约束
         }
@@ -2017,54 +1978,6 @@ class TrajectoryOptimizerSE2:
         total_cost = total_cost * 1e-1  # 统一缩放，避免数值过大
         
         return total_cost
-    
-    def step_on_poses(self, ctrl_poses, lr=0.01, num_steps=1):
-        """
-        对给定的控制点执行单步（或多步）梯度优化，返回优化后的控制点。
-        
-        该方法用于生成"优化器改进后的目标轨迹"，让网络学习模仿优化器的优化方向。
-        
-        Args:
-            ctrl_poses: (N, 3) 输入控制点 (x, y, yaw)，应该detach以避免影响主反向传播
-            lr: 优化步长
-            num_steps: 优化步数（默认1步）
-            
-        Returns:
-            optimized_poses: (N, 3) 优化后的控制点（detached，不带梯度）
-            cost_before: 优化前的cost值
-            cost_after: 优化后的cost值
-        """
-        # 确保输入是detached的副本
-        poses = ctrl_poses.detach().clone().requires_grad_(True)
-        
-        # 记录优化前的cost
-        with torch.no_grad():
-            cost_before = self.cost_on_poses(poses.detach()).item()
-        
-        # 执行梯度下降步骤
-        for _ in range(num_steps):
-            # 计算cost（保持梯度）
-            cost = self.cost_on_poses(poses)
-            
-            # 计算梯度
-            grad = torch.autograd.grad(
-                outputs=cost,
-                inputs=poses,
-                create_graph=False,
-                retain_graph=False
-            )[0]
-            
-            # 梯度下降更新（不修改固定的起点和终点）
-            with torch.no_grad():
-                # 只更新中间点（索引1到N-2）
-                poses[1:-1] = poses[1:-1] - lr * grad[1:-1]
-        
-        # 记录优化后的cost
-        with torch.no_grad():
-            cost_after = self.cost_on_poses(poses.detach()).item()
-            optimized_poses = poses.detach()
-        
-        return optimized_poses, cost_before, cost_after
 
     def optimize(self, iterations=300, lr=0.01, verbose=True):
         """执行优化循环"""
@@ -2367,51 +2280,6 @@ def check_trajectory_reachability(trajectory_points, yaw_values, yaw_stability):
     
     return np.array(capsize_mask, dtype=bool)
 
-def generate_paths(model, map_input, start_point, goal_point, num_paths=5):
-    """
-    生成完整路径（绝对坐标版本）
-    
-    Args:
-        model: 训练好的PathDiffusionTransformer
-        map_input: (1, 6, H, W) 已包含起点/终点嵌入的地图
-        start_point: (3,) [x, y, yaw] 起点坐标（真实坐标）
-        goal_point: (3,) [x, y, yaw] 终点坐标（真实坐标）
-        num_paths: 生成路径数量
-    Returns:
-        middle_paths: (num_paths, 20, 3) 中间20个点的绝对坐标
-    """
-    model.eval()
-    
-    # 归一化起点终点，并转换为 4D (x, y, sin(θ), cos(θ))
-    start_normalized = torch.zeros(4).to(start_point.device)
-    start_normalized[:2] = start_point[:2] / 20.0
-    start_normalized[2] = torch.sin(start_point[2])
-    start_normalized[3] = torch.cos(start_point[2])
-    start_normalized = torch.clamp(start_normalized, -1.0, 1.0).unsqueeze(0)  # (1, 4)
-    
-    goal_normalized = torch.zeros(4).to(goal_point.device)
-    goal_normalized[:2] = goal_point[:2] / 20.0
-    goal_normalized[2] = torch.sin(goal_point[2])
-    goal_normalized[3] = torch.cos(goal_point[2])
-    goal_normalized = torch.clamp(goal_normalized, -1.0, 1.0).unsqueeze(0)  # (1, 4)
-    
-    # 生成中间20个点（4维编码）
-    with torch.no_grad():
-        normalized_traj = model.sample(
-            map_input,
-            start_normalized,
-            goal_normalized,
-            num_samples=num_paths,
-            ddim_steps=50
-        )  # (num_paths, 20, 4) - 归一化的4维编码
-    
-    # 反归一化到真实坐标 (x, y, theta)
-    traj_denorm = torch.zeros(num_paths, 20, 3, device=normalized_traj.device)
-    traj_denorm[:, :, :2] = normalized_traj[:, :, :2] * 20.0  # x,y: [-1,1] → [-20,20]
-    # 从sin/cos恢复角度
-    traj_denorm[:, :, 2] = torch.atan2(normalized_traj[:, :, 2], normalized_traj[:, :, 3])  # θ ∈ [-π, π]
-    
-    return traj_denorm.cpu().numpy()  # (num_paths, 20, 3)
 
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -2438,12 +2306,10 @@ if __name__ == "__main__":
         return abs(cost1.item() - cost2.item()) < 1e-6
 
     # --- 0. 加载地形数据 ---
-    # from dataLoader_uneven import UnevenPathDataLoader
-    from dataLoader_dit import UnevenPathDataLoader
-    env_list = ['env000008']
+    from dataLoader_uneven import UnevenPathDataLoader
+    env_list = ['env000000']
     dataFolder = '/home/yrf/MPT/data/sim_dataset/val'
-    # dataset = UnevenPathDataLoader(env_list, dataFolder)
-    dataset = UnevenPathDataLoader(env_list, dataFolder, True)
+    dataset = UnevenPathDataLoader(env_list, dataFolder)
     path_index = 0
     sample = dataset[path_index]
     if sample is None:
@@ -2453,8 +2319,6 @@ if __name__ == "__main__":
     nx = sample['map'][0, :, :].to(device)
     ny = sample['map'][1, :, :].to(device)
     nz = sample['map'][2, :, :].to(device)
-    
-    nz = torch.abs(nz)  # 使用法向量的绝对值
 
     # --- 1. 定义代价地图参数并生成地图 ---
     map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
@@ -2473,7 +2337,7 @@ if __name__ == "__main__":
     # --- 2. 定义初始轨迹控制点 ---
     initial_points = sample['trajectory'].cpu().numpy()  # (x, y, yaw)
 
-    # # --- 使用网络推理结果作为初始点 ---
+    # --- 使用网络推理结果作为初始点 ---
     # 生成模型预测轨迹
     from dataLoader_uneven import get_encoder_input
     from eval_model_uneven import get_patch
@@ -2484,45 +2348,31 @@ if __name__ == "__main__":
     
     best = True
     # best = False
-    # stage = 1
+    stage = 1
     # epoch = 39
-    stage = 2
-    epoch = 24
+    # stage = 2
+    # epoch = 24
 
     modelFolder = 'data/sim'
     # modelFolder = 'data/uneven_old'
     modelFile = osp.join(modelFolder, f'model_params.json')
     model_param = json.load(open(modelFile))
 
-    # transformer = Models.UnevenTransformer(**model_param)
-    # _ = transformer.to(device)
+    transformer = Models.UnevenTransformer(**model_param)
+    _ = transformer.to(device)
 
-    # # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
-    # if stage == 1:
-    #     if best:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
-    #     else:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
-    # else:
-    #     if best:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
-    #     else:
-    #         checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
-    # transformer.load_state_dict(checkpoint['state_dict'])
-    
-    from dit.Models import PathDiffusionTransformer
-    
-    model = PathDiffusionTransformer(**model_param['model_args'])
-    _ = model.to(device)
-    
-    if best:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_model.pth'))
-        print(f"Loaded best stage {stage} model.")
+    # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
+    if stage == 1:
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
     else:
-        checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_stage{stage}_epoch_{epoch}.pth'))
-        print(f"Loaded stage {stage} model from epoch {epoch}.")
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
+        if best:
+            checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
+    transformer.load_state_dict(checkpoint['state_dict'])
     
     trajectory = sample['trajectory'].cpu().numpy()  # (N, 3)
     goal_pos = trajectory[-1, :]  # 终点位置
@@ -2532,24 +2382,8 @@ if __name__ == "__main__":
     normal_y = ny.cpu().numpy()
     normal_z = nz.cpu().numpy()
     
-    # encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
-    # patch_maps, predProb_list, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
-    
-    encoder_input = torch.tensor(np.concatenate((
-        normal_x[:, :, None],  # [H, W, 1]
-        normal_y[:, :, None],  # [H, W, 1]
-        normal_z[:, :, None]   # [H, W, 1]
-    ), axis=2), dtype=torch.float32)  # [H, W, 3]
-
-    predTraj = generate_paths(model, 
-                                map_input=encoder_input.permute(2, 0, 1)[None, :].cuda(),
-                                start_point=torch.tensor(start_pos).float().to(device),
-                                goal_point=torch.tensor(goal_pos).float().to(device),
-                                num_paths=1  # 生成多条轨迹
-                                )  # (num_pred_paths, 20, 3)
-    
-    predTraj = predTraj[0]
-    
+    encoder_input = get_encoder_input(normal_z, goal_pos, start_pos, normal_x, normal_y)
+    patch_maps, predProb_list, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
     # 确保 predTraj 是一个连续的 numpy/torch Tensor，然后再拼接起止点
     if isinstance(predTraj, list):
         pred_arr = np.asarray(predTraj, dtype=np.float32) if len(predTraj) > 0 else np.zeros((0, 3), dtype=np.float32)
@@ -2716,231 +2550,6 @@ if __name__ == "__main__":
         optimized_yaw_dense = Syaw.cpu().numpy()
         final_control_poses = final_full_trajectory.cpu().numpy()
 
-    # =================== 评估优化前后的轨迹质量 ===================
-    print("\n" + "="*100)
-    print("Trajectory Quality Evaluation: Before vs After Optimization".center(100))
-    print("="*100 + "\n")
-    
-    # 计算 yaw_stability 地图（用于评估）
-    from dataLoader_uneven import compute_map_yaw_bins
-    yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=36)  # [H, W, 36]
-    
-    # 将 yaw_stability 从 (H, W, D) 转置为 (D, H, W) 格式供评估器使用
-    # compute_map_yaw_bins 返回 (H, W, 36)，评估器期望 (36, H, W)
-    yaw_stability_transposed = yaw_stability.permute(2, 0, 1)  # (36, H, W)
-    
-    # 创建评估器
-    evaluator = TrajectoryEvaluator(
-        occupancy_map=stability_cost_map,
-        yaw_stability_map=yaw_stability_transposed,  # 使用转置后的地图
-        map_info=map_info,
-        device=device
-    )
-    
-    # 准备初始轨迹（优化前）
-    with torch.no_grad():
-        initial_poses_eval = torch.tensor(initial_points, device=device, dtype=torch.float32)
-        Sx_eval, Sy_eval, Syaw_eval, *_ = optimizer._evaluate_spline_se2(initial_poses_eval, optimizer.t_dense)
-        initial_trajectory_eval = torch.stack([Sx_eval, Sy_eval, Syaw_eval], dim=1)  # (K, 3)
-    
-    # 准备优化后的轨迹
-    optimized_trajectory_eval = torch.tensor(
-        np.concatenate([optimized_trajectory, optimized_yaw_dense.reshape(-1, 1)], axis=1),
-        dtype=torch.float32, device=device
-    )  # (K, 3)
-    
-    # 评估优化前的轨迹（DIT预测的轨迹）
-    metrics_before = evaluator.evaluate_trajectory(initial_trajectory_eval)
-    
-    # 评估优化后的轨迹
-    metrics_after = evaluator.evaluate_trajectory(optimized_trajectory_eval)
-    
-    # =================== 手动验证：对比两种计算方法 ===================
-    print("\n" + "="*100)
-    print("Manual Verification: Evaluator vs Direct Calculation".center(100))
-    print("="*100 + "\n")
-    
-    # 使用 check_trajectory_reachability_consistent 手动计算初始轨迹的不可达点
-    initial_traj_np = initial_trajectory_eval.cpu().numpy()
-    initial_mid_points = initial_traj_np[1:-1, :2]  # 去掉首尾
-    initial_mid_yaws = initial_traj_np[1:-1, 2]
-    
-    def check_trajectory_reachability_consistent_inline(trajectory_points, yaw_values, yaw_stability):
-        """内联版本的检查函数，用于调试"""
-        capsize_mask = []
-        for i in range(len(trajectory_points)):
-            x, y = trajectory_points[i]
-            yaw = yaw_values[i]
-            
-            # 坐标转换
-            x_idx = int((x + 20) / 0.4)
-            y_idx = int((y + 20) / 0.4)
-            yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
-            
-            # 边界检查和稳定性判断
-            # yaw_stability 的形状是 (H, W, D)，其中 H=y方向, W=x方向, D=yaw方向
-            if 0 <= y_idx < yaw_stability.shape[0] and 0 <= x_idx < yaw_stability.shape[1]:
-                yaw_stability_value = yaw_stability[y_idx, x_idx, yaw_idx]  # 修正：[y_idx, x_idx, yaw_idx]
-                if torch.is_tensor(yaw_stability_value):
-                    is_unreachable = bool((yaw_stability_value == 0).cpu().numpy())
-                else:
-                    is_unreachable = bool(yaw_stability_value == 0)
-            else:
-                is_unreachable = True
-            capsize_mask.append(is_unreachable)
-        
-        return np.array(capsize_mask, dtype=bool)
-    
-    manual_mask_initial = check_trajectory_reachability_consistent_inline(
-        initial_mid_points, initial_mid_yaws, yaw_stability
-    )
-    manual_ratio_initial = np.sum(manual_mask_initial) / len(manual_mask_initial)
-    
-    # 对比优化后的轨迹
-    optimized_traj_np = optimized_trajectory_eval.cpu().numpy()
-    optimized_mid_points = optimized_traj_np[1:-1, :2]
-    optimized_mid_yaws = optimized_traj_np[1:-1, 2]
-    
-    manual_mask_optimized = check_trajectory_reachability_consistent_inline(
-        optimized_mid_points, optimized_mid_yaws, yaw_stability
-    )
-    manual_ratio_optimized = np.sum(manual_mask_optimized) / len(manual_mask_optimized)
-    
-    print(f"Initial Trajectory (without endpoints):")
-    print(f"  Evaluator unstable_point_ratio: {metrics_before['unstable_point_ratio']:.6f} ({metrics_before['unstable_point_ratio']*100:.2f}%)")
-    print(f"  Manual calculation (direct):     {manual_ratio_initial:.6f} ({manual_ratio_initial*100:.2f}%)")
-    print(f"  Difference: {abs(metrics_before['unstable_point_ratio'] - manual_ratio_initial):.6f}")
-    print()
-    print(f"Optimized Trajectory (without endpoints):")
-    print(f"  Evaluator unstable_point_ratio: {metrics_after['unstable_point_ratio']:.6f} ({metrics_after['unstable_point_ratio']*100:.2f}%)")
-    print(f"  Manual calculation (direct):     {manual_ratio_optimized:.6f} ({manual_ratio_optimized*100:.2f}%)")
-    print(f"  Difference: {abs(metrics_after['unstable_point_ratio'] - manual_ratio_optimized):.6f}")
-    print()
-    
-    # 调试：打印一些样本点的对比
-    print("Sample point comparison (initial trajectory, first 5 mid-points):")
-    for i in range(min(5, len(initial_mid_points))):
-        x, y = initial_mid_points[i]
-        yaw = initial_mid_yaws[i]
-        x_idx = int((x + 20) / 0.4)
-        y_idx = int((y + 20) / 0.4)
-        yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
-        
-        if 0 <= y_idx < yaw_stability.shape[0] and 0 <= x_idx < yaw_stability.shape[1]:
-            stability_val = yaw_stability[y_idx, x_idx, yaw_idx].item() if torch.is_tensor(yaw_stability[y_idx, x_idx, yaw_idx]) else yaw_stability[y_idx, x_idx, yaw_idx]
-            print(f"  Point {i}: x={x:.2f}, y={y:.2f}, yaw={yaw:.2f} -> idx=({y_idx}, {x_idx}, {yaw_idx}) -> stability={stability_val}")
-    
-    print("\n" + "="*100 + "\n")
-    
-    # 评估真实轨迹（Ground Truth）
-    gt_trajectory_tensor = torch.tensor(trajectory, dtype=torch.float32, device=device)
-    metrics_gt = evaluator.evaluate_trajectory(gt_trajectory_tensor)
-    
-    # 定义关键指标
-    key_metrics = [
-        'collision_risk_mean',
-        'unstable_point_ratio',
-        'path_length',
-        'estimated_time',
-        'smoothness_total',
-        'jerk_x',
-        'jerk_y',
-        'jerk_yaw',
-        'curvature_mean',
-        'speed_mean',
-        'out_of_bounds_ratio',
-        'heading_error_mean'
-    ]
-    
-    # 打印对比结果
-    print("\nDetailed Metrics Comparison:")
-    print("-" * 100)
-    print(f"{'Metric':<30} {'GT':<15} {'Before Opt':<15} {'After Opt':<15} {'Improvement':<20}")
-    print("-" * 100)
-    
-    improvements = []
-    
-    for metric in key_metrics:
-        if metric in metrics_gt and metric in metrics_before and metric in metrics_after:
-            gt_val = metrics_gt[metric]
-            before_val = metrics_before[metric]
-            after_val = metrics_after[metric]
-            
-            # 计算改进百分比
-            if abs(before_val) > 1e-9:
-                improvement_pct = ((before_val - after_val) / abs(before_val)) * 100
-            else:
-                improvement_pct = 0.0
-            
-            # 确定改进方向
-            # 对于这些指标，值越小越好
-            better_lower = metric in [
-                'collision_risk_mean', 'unstable_point_ratio', 'out_of_bounds_ratio',
-                'heading_error_mean', 'jerk_x', 'jerk_y', 'jerk_yaw', 'smoothness_total'
-            ]
-            
-            if better_lower:
-                is_improvement = after_val < before_val
-                status = "↓" if is_improvement else "↑"
-            else:
-                is_improvement = after_val > before_val
-                status = "↑" if is_improvement else "↓"
-            
-            improvement_str = f"{status} {abs(improvement_pct):.2f}%"
-            if is_improvement:
-                improvement_str = f"✓ {improvement_str}"
-                improvements.append((metric, abs(improvement_pct)))
-            else:
-                improvement_str = f"✗ {improvement_str}"
-            
-            print(f"{metric:<30} {gt_val:>14.6f} {before_val:>14.6f} {after_val:>14.6f} {improvement_str:<20}")
-    
-    print("-" * 100)
-    
-    # 打印总结
-    print("\n" + "="*100)
-    print("Optimization Summary".center(100))
-    print("="*100 + "\n")
-    
-    # 统计改进的指标数量
-    num_improved = sum(1 for m in key_metrics 
-                      if m in metrics_before and m in metrics_after 
-                      and ((m in ['collision_risk_mean', 'unstable_point_ratio', 'out_of_bounds_ratio',
-                                  'heading_error_mean', 'jerk_x', 'jerk_y', 'jerk_yaw', 'smoothness_total']
-                           and metrics_after[m] < metrics_before[m])
-                          or (m not in ['collision_risk_mean', 'unstable_point_ratio', 'out_of_bounds_ratio',
-                                       'heading_error_mean', 'jerk_x', 'jerk_y', 'jerk_yaw', 'smoothness_total']
-                              and metrics_after[m] > metrics_before[m])))
-    
-    total_metrics = len([m for m in key_metrics if m in metrics_before and m in metrics_after])
-    
-    print(f"Total metrics evaluated: {total_metrics}")
-    print(f"Metrics improved: {num_improved} ({num_improved/total_metrics*100:.1f}%)")
-    print(f"Metrics worsened: {total_metrics - num_improved} ({(total_metrics-num_improved)/total_metrics*100:.1f}%)")
-    
-    # 列出改进最大的指标
-    if improvements:
-        print("\nTop improvements:")
-        improvements.sort(key=lambda x: x[1], reverse=True)
-        for i, (metric, pct) in enumerate(improvements[:5], 1):
-            print(f"  {i}. {metric}: {pct:.2f}%")
-    
-    # 关键安全指标对比
-    print("\n" + "-"*100)
-    print("Key Safety Metrics:".center(100))
-    print("-"*100)
-    
-    safety_metrics = ['collision_risk_mean', 'unstable_point_ratio', 'out_of_bounds_ratio']
-    for metric in safety_metrics:
-        if metric in metrics_before and metric in metrics_after:
-            before_val = metrics_before[metric]
-            after_val = metrics_after[metric]
-            change = ((after_val - before_val) / (abs(before_val) + 1e-9)) * 100
-            status = "IMPROVED" if after_val < before_val else "WORSENED"
-            print(f"  {metric}: {before_val:.6f} → {after_val:.6f} ({change:+.2f}%) [{status}]")
-    
-    print("\n" + "="*100 + "\n")
-
     # --- 4. 可视化结果 ---
     import mpl_toolkits.mplot3d  # 确保 3D 支持
 
@@ -3016,9 +2625,8 @@ if __name__ == "__main__":
     initial_control_mid_points = initial_points[1:-1, :2]  # (N-2, 2)
     initial_control_mid_yaws = initial_points[1:-1, 2]     # (N-2,)
 
-    # yaw_stability 已在评估部分计算，此处无需重复
-    # from dataLoader_uneven import compute_map_yaw_bins
-    # yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=36)  # [H, W, 36]
+    from dataLoader_uneven import compute_map_yaw_bins
+    yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=36)  # [H, W, 36]
 
     def check_trajectory_reachability_consistent(trajectory_points, yaw_values, yaw_stability):
         """使用与 data_clean.py 完全一致的方法检查轨迹点的可达性"""
@@ -3034,9 +2642,8 @@ if __name__ == "__main__":
             yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
             
             # 边界检查和稳定性判断
-            # yaw_stability 的形状是 (H, W, D)，其中 H=y方向, W=x方向, D=yaw方向
-            if 0 <= y_idx < yaw_stability.shape[0] and 0 <= x_idx < yaw_stability.shape[1]:
-                yaw_stability_value = yaw_stability[y_idx, x_idx, yaw_idx]  # 修正：[y_idx, x_idx, yaw_idx]
+            if 0 <= x_idx < yaw_stability.shape[0] and 0 <= y_idx < yaw_stability.shape[1]:
+                yaw_stability_value = yaw_stability[x_idx, y_idx, yaw_idx]
                 if torch.is_tensor(yaw_stability_value):
                     is_unreachable = bool((yaw_stability_value == 0).cpu().numpy())
                 else:

@@ -11,11 +11,11 @@ from tqdm import tqdm
 from dataLoader_uneven import compute_map_yaw_bins
 
 # data_Folder = '/home/yrf/MPT/data/terrain/train'
-data_Folder = '/home/yrf/MPT/data/sim_dataset/val'
-# data_Folder = '/home/yrf/MPT/data/sim_dataset/train'
+# data_Folder = '/home/yrf/MPT/data/sim_dataset/val'
+data_Folder = '/home/yrf/MPT/data/sim_dataset/train'
 # data_Folder = '/home/yrf/MPT/data/terrain_dataset/val'
 # env_list = ['env{:06d}'.format(i) for i in range(0, 2)]
-env_list = ['env000005']  # 指定环境进行数据清洗
+env_list = ['env000008']  # 指定环境进行数据清洗
 cnt = 0
 
 for env in env_list:

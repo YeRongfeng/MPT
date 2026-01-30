@@ -50,84 +50,6 @@ from transformer.Layers import EncoderLayer, DecoderLayer, PoseWiseEncoderLayer
 from einops.layers.torch import Rearrange
 from einops import rearrange
 
-
-import math
-
-
-class DiTBlock(nn.Module):
-    """标准DiT Block
-    
-    架构（来自DiT论文）：
-        Input --> LayerNorm --> Self-Attention --> Residual
-              --> LayerNorm --> FFN --> Residual
-              --> AdaLN modulation (时间步和条件调制)
-    """
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        
-        # Self-attention
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Feed-forward network
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout)
-        )
-        
-        # Layer norms
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-6)
-        self.norm2 = nn.LayerNorm(d_model, eps=1e-6)
-        
-        # AdaLN modulation
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(d_model, 6 * d_model, bias=True)
-        )
-        
-        # 关键！AdaLN-Zero 初始化（DiT原论文）
-        # 将gate参数初始化为0，使训练初期DiT block是恒等映射
-        # 这样网络可以从简单到复杂逐步学习，避免梯度消失
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-        
-    def forward(self, x, c):
-        """
-        Args:
-            x: (B, N, D) - 输入tokens
-            c: (B, D) - 全局条件（时间步 + 其他条件）
-            
-        Returns:
-            x: (B, N, D) - 输出tokens
-        """
-        # AdaLN调制参数
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        
-        # Self-attention分支
-        x_norm = self.norm1(x)
-        x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        x_self, _ = self.self_attn(x_norm, x_norm, x_norm)
-        x = x + gate_msa.unsqueeze(1) * x_self
-        
-        # FFN分支
-        x_norm2 = self.norm2(x)
-        x_norm2 = x_norm2 * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        x_ffn = self.ffn(x_norm2)
-        x = x + gate_mlp.unsqueeze(1) * x_ffn
-        
-        return x
-
-
 class PositionalEncoding(nn.Module):
     def __init__(self, d_hid, n_position, train_shape):
         super(PositionalEncoding, self).__init__()  # 调用父类nn.Module的初始化方法
@@ -272,28 +194,28 @@ class UnevenEncoder(nn.Module):
         self.map_fe = nn.Sequential(
             # Block 1
             nn.Conv2d(6, d_model//8, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=d_model//8),  # 使用GroupNorm替代BatchNorm
+            nn.BatchNorm2d(d_model//8),
             nn.ReLU(),
             nn.MaxPool2d(2),  # 50×50
             
             # Block 2
             nn.Conv2d(d_model//8, d_model//4, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=d_model//4),
+            nn.BatchNorm2d(d_model//4),
             nn.ReLU(),
             nn.MaxPool2d(2),  # 25×25
             
             # Block 3
             nn.Conv2d(d_model//4, d_model//2, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=d_model//2),
+            nn.BatchNorm2d(d_model//2),
             nn.ReLU(),
             nn.MaxPool2d(2),  # 12×12
             
             # Block 4
             nn.Conv2d(d_model//2, d_model, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=d_model),
+            nn.BatchNorm2d(d_model),
             nn.ReLU(),
             nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=d_model),
+            nn.BatchNorm2d(d_model),
             nn.ReLU(),             
         )
 
@@ -515,26 +437,16 @@ class PathDiffusionTransformer(nn.Module):
     
     def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, 
                  pad_idx, dropout, n_position, train_shape, 
-                 n_path_steps=20, diffusion_steps=50, prediction_type='epsilon', loss_type=None,
-                 use_flow_matching=False):
+                 n_path_steps=20, diffusion_steps=50, prediction_type='epsilon', loss_type=None):
         """
         Args:
             prediction_type: 'epsilon' (预测噪声), 'x0' (预测原始数据), 或 'v' (预测velocity)
             loss_type: 'epsilon', 'x0', 或 'v' - 损失函数的目标类型，如果为None则与prediction_type相同
-            use_flow_matching: bool - 是否使用Flow Matching而非标准Diffusion
-                Flow Matching特点：
-                - 使用线性插值路径：x_t = (1-t)*x_0 + t*noise
-                - 训练目标是向量场：v_t = x_0 - noise（从noise指向x_0的方向）
-                - 采样使用ODE solver（更高效）
         """
         super().__init__()
         
         self.prediction_type = prediction_type
         self.loss_type = loss_type if loss_type is not None else prediction_type
-        self.use_flow_matching = use_flow_matching
-        
-        if use_flow_matching and prediction_type != 'v':
-            print(f"⚠ Warning: Flow Matching通常使用prediction_type='v'（向量场），当前为'{prediction_type}'")
         
         # ========== 地图CNN特征提取（保留原架构）==========
         self.map_fe = nn.Sequential(
@@ -614,45 +526,21 @@ class PathDiffusionTransformer(nn.Module):
         # ========== 时间步嵌入 ==========
         self.time_embedder = TimestepEmbedder(d_model)
         
-        # ========== 改进的DiT Blocks ==========
-        # 标准DiT架构：Self-Attention + FFN + AdaLN调制
+        # ========== DiT Blocks（替代原Transformer blocks）==========
         self.dit_blocks = nn.ModuleList([
-            DiTBlock(
-                d_model=d_model,
-                n_heads=n_heads, 
-                d_ff=d_model * 4,  # FFN hidden dim (DiT标准设置)
-                dropout=dropout
-            ) 
+            DiTBlock(d_model, n_heads, mlp_ratio=4.0, dropout=dropout)
             for _ in range(n_layers)
         ])
         
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         
-        # ========== 解耦预测头设计 ==========
-        # 注意：final_norm 使用 elementwise_affine=False 会阻断梯度流
-        # main_pred 内部已有 LayerNorm，不需要额外的归一化层
-        # self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        # ========== 输出头（改为预测噪声）==========
+        self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.noise_head = nn.Linear(d_model, 4)  # 输出4维: (x,y,sin(θ),cos(θ))
         
-        # 主预测头（dit_blocks前已有LayerNorm，无需重复）
-        self.main_pred = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 4)  # (x, y, sin, cos)
-        )
-        
-        # # 细节预测头（用于精细化调整主预测）- 简化为两层
-        # detail_in_dim = d_model + 4  # DiT特征 + 主预测的完整4维
-        # self.detail_pred = nn.Sequential(
-        #     nn.Linear(detail_in_dim, d_model // 2),
-        #     nn.GELU(),
-        #     nn.Dropout(dropout),
-        #     nn.Linear(d_model // 2, 4)  # 输出增量 (dx, dy, d_sin, d_cos)
-        # )
-        
-        # # Zero初始化细节预测头
-        # nn.init.zeros_(self.detail_pred[-1].weight)
-        # nn.init.zeros_(self.detail_pred[-1].bias)
+        # Zero初始化
+        nn.init.zeros_(self.noise_head.weight)
+        nn.init.zeros_(self.noise_head.bias)
         
         # ========== 扩散参数 ==========
         self.n_path_steps = n_path_steps
@@ -727,9 +615,8 @@ class PathDiffusionTransformer(nn.Module):
             path_tokens   # [B, n_path_steps, D] - 路径tokens
         ], dim=1)  # (B, 2+N_map+n_path_steps, D)
         
-        # 正确顺序：LayerNorm → Dropout
-        combined_tokens = self.layer_norm(combined_tokens)
         combined_tokens = self.dropout(combined_tokens)
+        combined_tokens = self.layer_norm(combined_tokens)
         
         # ========== 步骤5：全局条件（用于DiT调制）==========
         c_time = self.time_embedder(timestep)  # (B, D) - 时间步条件
@@ -740,289 +627,102 @@ class PathDiffusionTransformer(nn.Module):
         c_goal_flat = c_goal.squeeze(1)    # (B, D)
         c_start_goal = self.start_goal_fusion(torch.cat([c_start_flat, c_goal_flat], dim=-1))  # (B, D)
         
-        # 【阶段1】基础条件：时间 + 地图 + 起点终点关系
+        # 融合所有全局条件：时间 + 地图整体 + 起点终点关系
         c = self.condition_mlp(torch.cat([c_time, map_global, c_start_goal], dim=-1))  # (B, D)
         
-        # ========== 步骤6：DiT Blocks ==========
-        # 标准DiT架构：所有tokens通过self-attention交互
-        
+        # ========== 步骤6：DiT Blocks（通过self-attention学习多模态关系）==========
+        # 改进后的attention范围：
+        #   - 路径tokens → 起点/终点tokens（直接的端点约束）
+        #   - 路径tokens → 地图tokens（局部障碍物感知）
+        #   - 路径tokens → 其他路径tokens（全局一致性）
         for dit_block in self.dit_blocks:
-            combined_tokens = dit_block(x=combined_tokens, c=c)
+            combined_tokens = dit_block(combined_tokens, c)
         
-        # ========== 步骤7：预测头 ==========
+        # ========== 步骤7：提取路径部分，输出预测 ==========
         # 序列结构：[起点(1), 终点(1), 地图(N_map), 路径(n_path_steps)]
         # 只取最后n_path_steps个tokens作为路径预测
         path_tokens_out = combined_tokens[:, -(self.n_path_steps):, :]  # (B, n_path_steps, D)
         
-        # 主预测头：粗略预测
-        main_output = self.main_pred(path_tokens_out)  # (B, n_path_steps, 4)
-        
-        # # 细节预测头：基于主预测和DiT特征的精细化增量
-        # detail_input = torch.cat([path_tokens_out, main_output], dim=-1)  # (B, n_path_steps, D+4)
-        # detail_output = self.detail_pred(detail_input)  # (B, n_path_steps, 4) - 增量
-        
-        # # 最终输出 = 主预测 + 细节增量
-        # model_output = main_output + detail_output  # (B, n_path_steps, 4)
-        
-        model_output = main_output
+        path_tokens_out = self.final_norm(path_tokens_out)
+        model_output = self.noise_head(path_tokens_out)  # (B, n_path_steps, 3)
         
         return model_output
     
     def q_sample(self, x_start, t, noise=None):
-        """
-        前向过程（训练时使用）
-        
-        Standard Diffusion:
-            x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
-        
-        Conditional Flow Matching (OT-CFM):
-            条件路径: q_t(x_t|x_0,x_1) = δ(x_t - [(1-t)x_0 + tx_1])
-            其中：
-            - x_0: 数据（干净轨迹）
-            - x_1: 高斯先验 N(0,I)
-            - t ∈ [0,1]: t=0是数据，t=1是噪声
-        """
+        """前向扩散"""
         if noise is None:
             noise = torch.randn_like(x_start)
         
-        if self.use_flow_matching:
-            # Conditional Flow Matching: OT条件路径（线性插值）
-            # t需要归一化到[0,1]
-            t_continuous = t.float() / self.diffusion_steps  # (B,) -> [0, 1]
-            t_continuous = t_continuous[:, None, None]  # (B, 1, 1)
-            
-            # x_t = (1-t)*x_0 + t*x_1
-            # t=0: x_0 (数据), t=1: x_1 (噪声)
-            return (1 - t_continuous) * x_start + t_continuous * noise
-        else:
-            # Standard Diffusion
-            sqrt_alphas = torch.sqrt(self.alphas_cumprod[t])[:, None, None]
-            sqrt_one_minus_alphas = torch.sqrt(1 - self.alphas_cumprod[t])[:, None, None]
-            
-            return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
+        sqrt_alphas = torch.sqrt(self.alphas_cumprod[t])[:, None, None]
+        sqrt_one_minus_alphas = torch.sqrt(1 - self.alphas_cumprod[t])[:, None, None]
+        
+        return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
     
     @torch.no_grad()
     def p_sample(self, map_input, x_t, t, start_pose, goal_pose):
         """
-        单步去噪/采样
+        DDIM去噪一步（支持三种预测类型）
+        使用4维表示: (x, y, sin(θ), cos(θ)) - sin/cos编码解决角度周期性
         
-        Standard Diffusion (DDIM):
-            - Epsilon prediction: x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
-            - X0 prediction: 直接预测 x_0
-            - V prediction: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-        
-        Conditional Flow Matching (OT-CFM):
-            - 条件路径：x_t = (1-t)*x_0 + t*x_1, t∈[0,1]
-            - 条件向量场：u_t(x_t|x_0,x_1) = x_1 - x_0（训练目标）
-            - 边际向量场：v_θ(x_t,t,cond)（推理使用）
-            - 采样：从t=1(噪声)到t=0(数据)，反向ODE积分
-            - Euler方法：x_{t-dt} = x_t - v_t * dt（反向走）
+        Epsilon prediction:
+            x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
+            → x_0 = (x_t - √(1-ᾱ_t) * ε) / √ᾱ_t
+            
+        X0 prediction:
+            直接预测 x_0
+            
+        V prediction:
+            v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+            → x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
         """
         # 获取模型输出
         model_output = self.forward(map_input, x_t, t, start_pose, goal_pose)
         
-        if self.use_flow_matching:
-            # ===== Conditional Flow Matching (CFM) ODE采样 =====
-            # 
-            # 边际向量场: v_θ(x_t, t, cond)
-            # 反向ODE: dx/dt = -v_θ(x_t, 1-t, cond), 从 t=1 (噪声) 到 t=0 (数据)
-            # 离散化 (Euler方法): x_{t-dt} = x_t - v_t * dt
-            # 
-            # 说明：训练时学习条件向量场 u_t(x_t|x_0,x_1) = x_1 - x_0
-            #      推理时使用边际向量场反向积分
-            
-            t_continuous = t.float() / self.diffusion_steps  # 将离散步归一化到[0, 1]
-            dt = 1.0 / self.diffusion_steps  # 时间步长
-            
-            # 边界条件
-            if t[0] == 0:
-                # t=0已经是数据分布，直接返回
-                return x_t
-            
-            # 提取向量场预测
-            if self.prediction_type == 'v':
-                # 直接预测向量场
-                v_t = model_output
-            elif self.prediction_type == 'x0':
-                # 预测x_0，计算向量场
-                pred_x0 = model_output
-                t_safe = torch.clamp(t_continuous[:, None, None], min=1e-5)
-                pred_x1 = (x_t - (1 - t_continuous[:, None, None]) * pred_x0) / t_safe
-                v_t = pred_x1 - pred_x0
-            elif self.prediction_type == 'epsilon':
-                # 预测x_1（噪声），计算向量场
-                pred_x1 = model_output
-                t_safe_inv = torch.clamp(1 - t_continuous[:, None, None], min=1e-5)
-                pred_x0 = (x_t - t_continuous[:, None, None] * pred_x1) / t_safe_inv
-                v_t = pred_x1 - pred_x0
-            else:
-                raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
-            
-            # Euler积分（反向）：x_{t-dt} = x_t - v_t * dt
-            # 注意：这里是减法，因为向量场指向噪声，我们要反向走到数据
-            x_prev = x_t - v_t * dt
-            
-            # 裁剪位置坐标
-            x_prev[:, :, :2] = torch.clamp(x_prev[:, :, :2], -1.0, 1.0)
-            
-            return x_prev
-            
+        # 提取alpha值
+        alpha_t = self.alphas_cumprod[t][:, None, None]
+        sqrt_alpha_t = torch.sqrt(alpha_t)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        
+        # 根据prediction_type解析模型输出
+        if self.prediction_type == 'epsilon':
+            # 模型预测噪声
+            pred_noise = model_output
+            pred_x0 = (x_t - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
+        elif self.prediction_type == 'x0':
+            # 模型直接预测 x_0
+            pred_x0 = model_output
+            # 从 x_0 反推噪声（用于DDIM采样）
+            pred_noise = (x_t - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
+        elif self.prediction_type == 'v':
+            # 模型预测velocity: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+            # 反推得到：
+            # x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
+            # ε = √(1-ᾱ_t) * x_t + √ᾱ_t * v
+            pred_v = model_output
+            pred_x0 = sqrt_alpha_t * x_t - sqrt_one_minus_alpha_t * pred_v
+            pred_noise = sqrt_one_minus_alpha_t * x_t + sqrt_alpha_t * pred_v
         else:
-            # ===== Standard Diffusion (DDIM)采样 =====
-            # 提取alpha值
-            alpha_t = self.alphas_cumprod[t][:, None, None]
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
-            
-            # 根据prediction_type解析模型输出
-            if self.prediction_type == 'epsilon':
-                pred_noise = model_output
-                pred_x0 = (x_t - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
-            elif self.prediction_type == 'x0':
-                pred_x0 = model_output
-                pred_noise = (x_t - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
-            elif self.prediction_type == 'v':
-                # V-prediction: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-                # 从v反推：
-                #   x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
-                #   ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
-                pred_v = model_output
-                pred_x0 = sqrt_alpha_t * x_t - sqrt_one_minus_alpha_t * pred_v
-                pred_noise = sqrt_alpha_t * pred_v + sqrt_one_minus_alpha_t * x_t
-            else:
-                raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
-            
-            # 裁剪位置坐标
-            pred_x0[:, :, :2] = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)
-            
-            # 最后一步直接返回x_0
-            if t[0] == 0:
-                return pred_x0
-            
-            # DDIM公式：x_{t-1} = √ᾱ_{t-1} * x_0 + √(1-ᾱ_{t-1}) * ε
-            alpha_prev = self.alphas_cumprod[t-1][:, None, None]
-            sqrt_alpha_prev = torch.sqrt(alpha_prev)
-            sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_prev)
-            
-            x_prev = sqrt_alpha_prev * pred_x0 + sqrt_one_minus_alpha_prev * pred_noise
-            
-            return x_prev
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
+        
+        # 裁剪位置坐标到训练时的归一化范围 [-1, 1]
+        pred_x0[:, :, :2] = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)
+        
+        # 注意：训练时不归一化sin/cos，让模型自然学习 sin²+cos²≈1
+        # 强制归一化会导致梯度断裂和NaN
+        
+        # 如果是最后一步，直接返回 x_0
+        if t[0] == 0:
+            return pred_x0
+        
+        # DDIM公式：计算 x_{t-1}
+        alpha_prev = self.alphas_cumprod[t-1][:, None, None]
+        sqrt_alpha_prev = torch.sqrt(alpha_prev)
+        sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_prev)
+        
+        # x_{t-1} = √ᾱ_{t-1} * x_0 + √(1-ᾱ_{t-1}) * ε
+        x_prev = sqrt_alpha_prev * pred_x0 + sqrt_one_minus_alpha_prev * pred_noise
         
         return x_prev
-    
-    def differentiable_sample(self, map_input, start_pose, goal_pose, ddim_steps=50, use_checkpoint=True):
-        """
-        可微分的DDIM采样（ODE方法，保持梯度连接）
-        
-        **原理**：
-        DDIM本质上是概率流ODE (Probability Flow ODE)：
-            dx/dt = -0.5 * β(t) * [x + (1-α(t)) * ∇_x log p(x)]
-        
-        在离散化后，ODE更新是确定性的且完全可微：
-            x_{t-1} = √ᾱ_{t-1} * pred_x0 + √(1-ᾱ_{t-1}) * pred_ε
-        
-        与标准采样的区别：
-        1. 不使用 @torch.no_grad()，保持梯度图
-        2. 使用模型的forward()而非p_sample()（后者有@torch.no_grad装饰器）
-        3. 手动实现DDIM更新逻辑，确保所有操作都可微
-        
-        **显存优化**：
-        使用梯度检查点(gradient checkpointing)减少显存占用：
-        - 前向传播时不保存中间激活值
-        - 反向传播时重新计算需要的激活值
-        - 显存消耗从O(n)降到O(1)，但计算量增加约2倍
-        
-        Args:
-            map_input: (B, 3, H, W) 输入地图
-            start_pose: (B, 4) 起点坐标 (x,y,sin(θ),cos(θ)) (已归一化)
-            goal_pose: (B, 4) 终点坐标 (x,y,sin(θ),cos(θ)) (已归一化)
-            ddim_steps: DDIM步数（默认50，与标准采样一致）
-            use_checkpoint: 是否使用梯度检查点节省显存（默认True）
-        
-        Returns:
-            x_0: (B, n_path_steps, 4) 采样得到的轨迹（保持梯度）
-        """
-        device = map_input.device
-        B = map_input.shape[0]
-        
-        # 从标准正态分布初始化 (4维: x,y,sin(θ),cos(θ))
-        # detach噪声以避免在反向传播时计算噪声的梯度（只需要模型参数的梯度）
-        x_t = torch.randn(B, self.n_path_steps, 4, device=device).detach()
-        
-        # DDIM时间步调度
-        step_size = max(1, self.diffusion_steps // ddim_steps)
-        time_steps = list(range(self.diffusion_steps-1, 0, -step_size)) + [0]
-        
-        # 定义单步更新函数（用于梯度检查点）
-        def ddim_step(x_in, t_val):
-            """单步DDIM更新（可以被checkpoint包装）"""
-            t_batch = torch.full((B,), t_val, device=device, dtype=torch.long)
-            
-            # 调用模型前向传播（保持梯度）
-            model_output = self.forward(map_input, x_in, t_batch, start_pose, goal_pose)
-            
-            # 提取alpha值
-            alpha_t = self.alphas_cumprod[t_val]
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
-            
-            # 根据prediction_type解析模型输出
-            if self.prediction_type == 'epsilon':
-                pred_noise = model_output
-                pred_x0 = (x_in - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
-            elif self.prediction_type == 'x0':
-                pred_x0 = model_output
-                pred_noise = (x_in - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
-            elif self.prediction_type == 'v':
-                pred_v = model_output
-                pred_x0 = sqrt_alpha_t * x_in - sqrt_one_minus_alpha_t * pred_v
-                pred_noise = sqrt_one_minus_alpha_t * x_in + sqrt_alpha_t * pred_v
-            else:
-                raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
-            
-            # 裁剪位置坐标到归一化范围 [-1, 1]（避免in-place操作）
-            # 使用torch.cat重新组合，而不是切片赋值
-            pred_x0_pos_clamped = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)  # (B, N, 2)
-            pred_x0_angle = pred_x0[:, :, 2:4]  # (B, N, 2)
-            pred_x0 = torch.cat([pred_x0_pos_clamped, pred_x0_angle], dim=2)  # (B, N, 4)
-            
-            # 如果是最后一步，直接返回 x_0
-            if t_val == 0:
-                return pred_x0
-            
-            # DDIM公式：计算 x_{t-1}（ODE更新）
-            alpha_prev = self.alphas_cumprod[t_val-1]
-            sqrt_alpha_prev = torch.sqrt(alpha_prev)
-            sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_prev)
-            
-            # x_{t-1} = √ᾱ_{t-1} * pred_x0 + √(1-ᾱ_{t-1}) * pred_ε
-            x_out = sqrt_alpha_prev * pred_x0 + sqrt_one_minus_alpha_prev * pred_noise
-            return x_out
-        
-        # 迭代ODE采样（保持梯度连接）
-        for i, t in enumerate(time_steps):
-            if use_checkpoint:
-                # 使用梯度检查点减少显存（以计算时间换空间）
-                x_t = torch.utils.checkpoint.checkpoint(
-                    ddim_step, x_t, t, use_reentrant=False
-                )
-            else:
-                # 标准前向传播（占用更多显存）
-                x_t = ddim_step(x_t, t)
-        
-        # 最终处理（避免in-place操作）
-        # 裁剪位置坐标
-        x_t_pos_clamped = torch.clamp(x_t[:, :, :2], -1.0, 1.0)  # (B, N, 2)
-        
-        # 归一化sin/cos部分，确保 sin²+cos² = 1
-        sin_cos = x_t[:, :, 2:4]  # (B, n_path_steps, 2)
-        norm = torch.sqrt(sin_cos[:, :, 0]**2 + sin_cos[:, :, 1]**2).unsqueeze(-1) + 1e-8
-        sin_cos_normalized = sin_cos / norm  # (B, N, 2)
-        
-        # 拼接最终结果
-        x_t = torch.cat([x_t_pos_clamped, sin_cos_normalized], dim=2)  # (B, N, 4)
-        
-        return x_t
     
     @torch.no_grad()
     def sample(self, map_input, start_pose, goal_pose, num_samples=5, ddim_steps=50):
@@ -1062,202 +762,5 @@ class PathDiffusionTransformer(nn.Module):
         x_t[:, :, 2:4] = sin_cos / norm  # 投影到单位圆
         
         return x_t
-    
-    def guided_sample(self, map_input, start_pose, goal_pose, cost_map, map_info, 
-                      num_samples=5, ddim_steps=50, guidance_scale=0.1, 
-                      guidance_start_step=0.5):
-        """
-        带Capsize Cost引导的DDIM采样
-        
-        在采样过程中注入capsize loss的梯度，引导生成更安全的轨迹
-        
-        Args:
-            map_input: (1, 3, H, W) 输入地图
-            start_pose: (1, 4) 起点 (x,y,sin(θ),cos(θ)) 已归一化
-            goal_pose: (1, 4) 终点 (x,y,sin(θ),cos(θ)) 已归一化
-            cost_map: (1, num_layers, max_anchors) 稳定性代价地图
-            map_info: dict 地图配置信息
-            num_samples: 采样数量
-            ddim_steps: DDIM步数
-            guidance_scale: 引导强度 (建议0.05-0.2)
-            guidance_start_step: 开始引导的时间点比例 (0.0-1.0，建议0.3-0.7)
-        """
-        from grad_optimizer import TrajectoryOptimizerSE2
-        
-        device = map_input.device
-        map_input = map_input.expand(num_samples, -1, -1, -1)
-        start_pose_expanded = start_pose.expand(num_samples, -1)
-        goal_pose_expanded = goal_pose.expand(num_samples, -1)
-        
-        # 扩展cost_map到batch（保持4D形状）
-        if cost_map.dim() == 4:
-            cost_map = cost_map.expand(num_samples, -1, -1, -1)
-        else:
-            cost_map = cost_map.expand(num_samples, -1, -1)
-        
-        # 从标准正态分布初始化
-        x_t = torch.randn(num_samples, self.n_path_steps, 4, device=device)
-        
-        # DDIM时间步调度
-        step_size = max(1, self.diffusion_steps // ddim_steps)
-        time_steps = list(range(self.diffusion_steps-1, 0, -step_size)) + [0]
-        
-        # 确定开始引导的步骤索引
-        guidance_start_idx = int(len(time_steps) * guidance_start_step)
-        
-        # print(f"\n🎯 Guided Sampling: steps={ddim_steps}, guidance_scale={guidance_scale}, "
-        #       f"start_step={guidance_start_step} (step {guidance_start_idx}/{len(time_steps)})")
-        
-        for step_idx, t in enumerate(time_steps):
-            t_batch = torch.full((num_samples,), t, device=device, dtype=torch.long)
-            
-            # 是否应用引导（只在低噪声阶段）
-            apply_guidance = (step_idx >= guidance_start_idx) and (guidance_scale > 0)
-            
-            if apply_guidance:
-                # 需要梯度的采样步骤
-                x_t_guided = x_t.clone().detach().requires_grad_(True)
-                
-                # 获取pred_x0（需要在梯度上下文中）
-                with torch.enable_grad():
-                    # 前向传播获取模型输出
-                    model_output = self.forward(
-                        map_input, x_t_guided, t_batch, 
-                        start_pose_expanded, goal_pose_expanded
-                    )
-                    
-                    # 计算pred_x0（假设prediction_type='x0'）
-                    if self.prediction_type == 'x0':
-                        pred_x0 = model_output
-                    elif self.prediction_type == 'epsilon':
-                        sqrt_alpha_t = torch.sqrt(self.alphas_cumprod[t_batch])[:, None, None]
-                        sqrt_one_minus_alpha_t = torch.sqrt(1 - self.alphas_cumprod[t_batch])[:, None, None]
-                        pred_x0 = (x_t_guided - sqrt_one_minus_alpha_t * model_output) / sqrt_alpha_t
-                    else:
-                        raise NotImplementedError(f"Guidance not implemented for {self.prediction_type}")
-                    
-                    # 反归一化pred_x0
-                    pred_x0_denorm = torch.zeros_like(pred_x0)
-                    pred_x0_denorm[:, :, :2] = pred_x0[:, :, :2] * 20.0
-                    pred_x0_denorm[:, :, 2:] = pred_x0[:, :, 2:]
-                    
-                    # 计算capsize cost（batch处理）
-                    costs = []
-                    for i in range(num_samples):
-                        try:
-                            # 构建完整轨迹
-                            start_fixed = start_pose[0, :2] * 20.0  # 反归一化起点
-                            start_angle = torch.atan2(start_pose[0, 2], start_pose[0, 3])
-                            start_3d = torch.cat([start_fixed, start_angle.unsqueeze(0)])
-                            
-                            goal_fixed = goal_pose[0, :2] * 20.0
-                            goal_angle = torch.atan2(goal_pose[0, 2], goal_pose[0, 3])
-                            goal_3d = torch.cat([goal_fixed, goal_angle.unsqueeze(0)])
-                            
-                            predicted_angles = torch.atan2(
-                                pred_x0_denorm[i, :, 2], 
-                                pred_x0_denorm[i, :, 3]
-                            )
-                            predicted_traj_3d = torch.stack([
-                                pred_x0_denorm[i, :, 0],
-                                pred_x0_denorm[i, :, 1],
-                                predicted_angles
-                            ], dim=1)
-                            
-                            full_traj = torch.cat([
-                                start_3d.unsqueeze(0),
-                                predicted_traj_3d,
-                                goal_3d.unsqueeze(0)
-                            ], dim=0)
-                            
-                            # 计算cost
-                            # 检查cost_map的形状并正确处理
-                            if cost_map.dim() == 4:
-                                # 形状是 (B, H, W, D)，需要转为 (D, H, W)
-                                stability_cost_map = cost_map[i].permute(2, 0, 1)
-                            else:
-                                # 形状是 (B, num_layers, max_anchors)
-                                stability_cost_map = cost_map[i].permute(2, 0, 1)
-                            
-                            optimizer = TrajectoryOptimizerSE2(
-                                full_traj.detach(),
-                                stability_cost_map,
-                                map_info,
-                                device=device
-                            )
-                            cost = optimizer.cost_on_poses(full_traj)
-                            
-                            if not (torch.isnan(cost) or torch.isinf(cost)):
-                                costs.append(cost)
-                        except Exception as e:
-                            pass
-                    
-                    if len(costs) > 0:
-                        total_cost = torch.stack(costs).mean()
-                        
-                        # 计算梯度
-                        grad = torch.autograd.grad(total_cost, x_t_guided, retain_graph=False)[0]
-                        
-                        # 梯度裁剪（避免过大的扰动）
-                        grad_norm = torch.norm(grad)
-                        if grad_norm > 1.0:
-                            grad = grad / grad_norm
-                        
-                        # 应用引导：沿着降低cost的方向调整x_t
-                        x_t = x_t - guidance_scale * grad.detach()
-                        
-                        # if step_idx % 10 == 0:
-                        #     print(f"  Step {step_idx}/{len(time_steps)}: t={t}, cost={total_cost.item():.4e}, "
-                        #           f"grad_norm={grad_norm.item():.4e}")
-            
-            # 执行标准DDIM步骤（使用可能被引导调整过的x_t）
-            with torch.no_grad():
-                x_t = self.p_sample(map_input, x_t, t_batch, start_pose_expanded, goal_pose_expanded)
-        
-        # 最终裁剪和归一化
-        x_t[:, :, :2] = torch.clamp(x_t[:, :, :2], -1.0, 1.0)
-        sin_cos = x_t[:, :, 2:4]
-        norm = torch.sqrt(sin_cos[:, :, 0]**2 + sin_cos[:, :, 1]**2).unsqueeze(-1) + 1e-8
-        x_t[:, :, 2:4] = sin_cos / norm
-        
-        # print("✓ Guided sampling completed\n")
-        
-        return x_t
-
-    def freeze_for_stage2(self):
-        """
-        阶段2：简化训练策略（已移除cross-attention）
-        
-        现在所有参数都参与训练，阶段1和阶段2没有本质区别
-        仅作为接口保留，方便后续扩展
-        """
-        print("\n" + "="*70)
-        print("阶段2：继续全参数训练")
-        print("="*70)
-        
-        # 全参数训练
-        for param in self.parameters():
-            param.requires_grad = True
-        
-        # 统计参数
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.parameters())
-        
-        print(f"\n参数统计：")
-        print(f"  总参数: {total:,}")
-        print(f"  训练参数: {trainable:,} ({100*trainable/total:.2f}%)")
-        print(f"\n训练模式：全参数训练")
-        print("="*70 + "\n")
-    
-    def unfreeze_for_stage1(self):
-        """阶段1：全参数训练"""
-        for param in self.parameters():
-            param.requires_grad = True
-        print("✓ 阶段1：全参数训练模式")
-    
-    def get_trainable_parameters(self):
-        """返回当前可训练的参数（用于优化器）"""
-        return [p for p in self.parameters() if p.requires_grad]
-
 
 

@@ -6,6 +6,7 @@ import skimage.morphology as skim
 import io
 
 import numpy as np
+import torch
 
 #from ompl import base as ob
 

@@ -37,6 +37,13 @@ class DiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
+        
+        # 关键！AdaLN-Zero 初始化（DiT原论文）
+        # 将adaLN最后一层的权重和偏置初始化为0
+        # 这样训练初期，DiT block 是恒等映射（gate=0导致残差连接被bypass）
+        # 网络可以从简单到复杂逐步学习，避免梯度消失和训练不稳定
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, c):
         """

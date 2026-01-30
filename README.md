@@ -75,6 +75,8 @@ python3 train_uneven.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=d
 python3 train_mamba.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume_stage1_model=data/sim/best_stage1_model.pkl
 
 python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim
+python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2
+python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth
 
 uv run train_mamba.py --batchSize=20 --dataFolder=data/terrain_dataset --fileDir=data/mamba 
 
