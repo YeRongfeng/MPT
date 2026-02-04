@@ -413,143 +413,70 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # 获取模型预测
     model_output = model(map_input, noisy_traj, t, start_normalized, goal_normalized)
     
-    # 步骤1：根据prediction_type和use_flow_matching解析模型输出
+    # 步骤1：根据prediction_type解析模型输出
     prediction_type = getattr(model, 'prediction_type', 'epsilon')
     loss_type = getattr(model, 'loss_type', prediction_type)
-    use_flow_matching = getattr(model, 'use_flow_matching', False)
     
-    if use_flow_matching:
-        # ===== Conditional Flow Matching (OT-CFM) 训练 =====
-        # 
-        # **参考**: Flow Matching for Generative Modeling (Lipman et al. 2023)
-        #           https://arxiv.org/abs/2210.02747
-        # 
-        # **核心思想**：训练条件向量场，推理时使用边际向量场
-        # 
-        # **条件路径** (Optimal Transport, deterministic):
-        #   q_t(x_t|x_0,x_1) = δ(x_t - [(1-t)x_0 + tx_1])
-        #   其中 x_0 ~ p_data (真实轨迹), x_1 ~ p_prior = N(0,I) (噪声), t∈[0,1]
-        # 
-        # **条件向量场**:
-        #   u_t(x_t|x_0,x_1) = d/dt[(1-t)x_0 + tx_1] = x_1 - x_0 (时间无关)
-        # 
-        # **训练目标** (Conditional Flow Matching loss):
-        #   L_CFM(θ) = E_{x_0~p_data, x_1~N(0,I), t~U(0,1)} [||v_θ(x_t,t,cond) - u_t(x_t|x_0,x_1)||²]
-        #   其中 cond = {map, start_pose, goal_pose}
-        # 
-        # **边际向量场** (推理时):
-        #   v_θ(x_t,t,cond) ≈ ∫ u_t(x_t|x_0,x_1) q(x_0,x_1|x_t) dx_0 dx_1
-        # 
-        # **采样** (反向ODE):
-        #   dx/dt = -v_θ(x_t, 1-t, cond), 从 t=1 (噪声) 到 t=0 (数据)
+    # ===== Standard Diffusion训练 =====
+    # 
+    # V-prediction定义（Progressive Distillation / Imagen）：
+    #   给定：x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
+    #   定义：v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+    # 
+    # 从v反推x_0和ε：
+    #   x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
+    #   ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
+    # 
+    # 验证：代入x_t公式
+    #   x_t = √ᾱ_t * (√ᾱ_t * x_t - √(1-ᾱ_t) * v) + √(1-ᾱ_t) * (√ᾱ_t * v + √(1-ᾱ_t) * x_t)
+    #       = ᾱ_t * x_t - √ᾱ_t * √(1-ᾱ_t) * v + √ᾱ_t * √(1-ᾱ_t) * v + (1-ᾱ_t) * x_t
+    #       = x_t ✓
+    
+    # 计算alpha值
+    sqrt_alpha_t = torch.sqrt(model.alphas_cumprod[t])[:, None, None]
+    sqrt_one_minus_alpha_t = torch.sqrt(1 - model.alphas_cumprod[t])[:, None, None]
+    
+    # 根据模型预测类型，计算出 x0, epsilon, v 三者
+    if prediction_type == 'epsilon':
+        # 模型预测噪声 ε
+        pred_epsilon = model_output
+        # 从ε反推x_0: x_0 = (x_t - √(1-ᾱ_t) * ε) / √ᾱ_t
+        pred_x0 = (noisy_traj - sqrt_one_minus_alpha_t * pred_epsilon) / sqrt_alpha_t
+        # 计算v: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+        pred_v = sqrt_alpha_t * pred_epsilon - sqrt_one_minus_alpha_t * pred_x0
         
-        # 将离散时间步归一化到[0,1]
-        t_continuous = t.float() / model.diffusion_steps  # (B,) -> [0, 1]
-        t_continuous = t_continuous[:, None, None]  # (B, 1, 1)
+    elif prediction_type == 'x0':
+        # 模型直接预测 x_0
+        pred_x0 = model_output
+        # 从x_0反推ε: ε = (x_t - √ᾱ_t * x_0) / √(1-ᾱ_t)
+        pred_epsilon = (noisy_traj - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
+        # 计算v: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+        pred_v = sqrt_alpha_t * pred_epsilon - sqrt_one_minus_alpha_t * pred_x0
         
-        # 计算条件向量场目标：u_t(x_t|x_0,x_1) = x_1 - x_0
-        # x_0 = traj_normalized (数据), x_1 = noise (高斯先验)
-        target_velocity = noise - traj_normalized  # (B, n_path, 4)
-        
-        # 模型输出（预测的向量场）
-        if prediction_type == 'v':
-            # 推荐：直接预测向量场
-            pred_velocity = model_output
-            prediction = pred_velocity
-            target = target_velocity
-            
-        elif prediction_type == 'x0':
-            # 预测x_0，然后计算向量场
-            pred_x0 = model_output
-            # 从 x_t = (1-t)*x_0 + t*x_1 反推 x_1 = (x_t - (1-t)*x_0) / t
-            t_safe = torch.clamp(t_continuous, min=1e-5)
-            pred_x1 = (noisy_traj - (1 - t_continuous) * pred_x0) / t_safe
-            pred_velocity = pred_x1 - pred_x0
-            prediction = pred_velocity
-            target = target_velocity
-            
-        elif prediction_type == 'epsilon':
-            # 预测噪声（x_1），然后计算向量场
-            pred_x1 = model_output
-            # 从 x_t = (1-t)*x_0 + t*x_1 反推 x_0 = (x_t - t*x_1) / (1-t)
-            t_safe_inv = torch.clamp(1 - t_continuous, min=1e-5)
-            pred_x0 = (noisy_traj - t_continuous * pred_x1) / t_safe_inv
-            pred_velocity = pred_x1 - pred_x0
-            prediction = pred_velocity
-            target = target_velocity
-            
-        else:
-            raise ValueError(f"Unknown prediction_type for Flow Matching: {prediction_type}")
-        
-        # 计算预测的x0（用于辅助损失）
-        if prediction_type == 'v':
-            # 从向量场反推x_0: v = x_1 - x_0, 且 x_t = (1-t)*x_0 + t*x_1
-            # 联立求解：x_1 = x_0 + v, x_t = (1-t)*x_0 + t*(x_0 + v) = x_0 + t*v
-            # 所以：x_0 = x_t - t*v
-            pred_x0 = noisy_traj - t_continuous * pred_velocity
-        # else: pred_x0已在上面计算
+    elif prediction_type == 'v':
+        # 模型预测 v
+        pred_v = model_output
+        # 从v反推x_0: x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
+        pred_x0 = sqrt_alpha_t * noisy_traj - sqrt_one_minus_alpha_t * pred_v
+        # 从v反推ε: ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
+        pred_epsilon = sqrt_alpha_t * pred_v + sqrt_one_minus_alpha_t * noisy_traj
         
     else:
-        # ===== Standard Diffusion训练 =====
-        # 
-        # V-prediction定义（Progressive Distillation / Imagen）：
-        #   给定：x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
-        #   定义：v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-        # 
-        # 从v反推x_0和ε：
-        #   x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
-        #   ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
-        # 
-        # 验证：代入x_t公式
-        #   x_t = √ᾱ_t * (√ᾱ_t * x_t - √(1-ᾱ_t) * v) + √(1-ᾱ_t) * (√ᾱ_t * v + √(1-ᾱ_t) * x_t)
-        #       = ᾱ_t * x_t - √ᾱ_t * √(1-ᾱ_t) * v + √ᾱ_t * √(1-ᾱ_t) * v + (1-ᾱ_t) * x_t
-        #       = x_t ✓
-        
-        # 计算alpha值
-        sqrt_alpha_t = torch.sqrt(model.alphas_cumprod[t])[:, None, None]
-        sqrt_one_minus_alpha_t = torch.sqrt(1 - model.alphas_cumprod[t])[:, None, None]
-        
-        # 根据模型预测类型，计算出 x0, epsilon, v 三者
-        if prediction_type == 'epsilon':
-            # 模型预测噪声 ε
-            pred_epsilon = model_output
-            # 从ε反推x_0: x_0 = (x_t - √(1-ᾱ_t) * ε) / √ᾱ_t
-            pred_x0 = (noisy_traj - sqrt_one_minus_alpha_t * pred_epsilon) / sqrt_alpha_t
-            # 计算v: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-            pred_v = sqrt_alpha_t * pred_epsilon - sqrt_one_minus_alpha_t * pred_x0
-            
-        elif prediction_type == 'x0':
-            # 模型直接预测 x_0
-            pred_x0 = model_output
-            # 从x_0反推ε: ε = (x_t - √ᾱ_t * x_0) / √(1-ᾱ_t)
-            pred_epsilon = (noisy_traj - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
-            # 计算v: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-            pred_v = sqrt_alpha_t * pred_epsilon - sqrt_one_minus_alpha_t * pred_x0
-            
-        elif prediction_type == 'v':
-            # 模型预测 v
-            pred_v = model_output
-            # 从v反推x_0: x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
-            pred_x0 = sqrt_alpha_t * noisy_traj - sqrt_one_minus_alpha_t * pred_v
-            # 从v反推ε: ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
-            pred_epsilon = sqrt_alpha_t * pred_v + sqrt_one_minus_alpha_t * noisy_traj
-            
-        else:
-            raise ValueError(f"Unknown prediction_type: {prediction_type}. Must be 'epsilon', 'x0', or 'v'")
-        
-        # 根据loss_type选择目标并计算损失
-        if loss_type == 'epsilon':
-            target = noise
-            prediction = pred_epsilon
-        elif loss_type == 'x0':
-            target = traj_normalized
-            prediction = pred_x0
-        elif loss_type == 'v':
-            # 真实的v目标：v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-            target = sqrt_alpha_t * noise - sqrt_one_minus_alpha_t * traj_normalized
-            prediction = pred_v
-        else:
-            raise ValueError(f"Unknown loss_type: {loss_type}. Must be 'epsilon', 'x0', or 'v'")
+        raise ValueError(f"Unknown prediction_type: {prediction_type}. Must be 'epsilon', 'x0', or 'v'")
+    
+    # 根据loss_type选择目标并计算损失
+    if loss_type == 'epsilon':
+        target = noise
+        prediction = pred_epsilon
+    elif loss_type == 'x0':
+        target = traj_normalized
+        prediction = pred_x0
+    elif loss_type == 'v':
+        # 真实的v目标：v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+        target = sqrt_alpha_t * noise - sqrt_one_minus_alpha_t * traj_normalized
+        prediction = pred_v
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}. Must be 'epsilon', 'x0', or 'v'")
     
     # =================== 计算辅助损失 ===================
     # 使用预测的x0（去噪后的轨迹）来计算辅助损失
@@ -1046,8 +973,7 @@ if __name__ == "__main__":
     parser.add_argument('--stage', help="Training stage to start from (1 or 2)", type=int, default=1, choices=[1, 2])
     parser.add_argument('--stage1_epochs', help="Number of epochs for stage 1", type=int, default=70)
     parser.add_argument('--stage2_epochs', help="Number of epochs for stage 2", type=int, default=50)
-    parser.add_argument('--flow_matching', help="Use Flow Matching instead of standard diffusion", action='store_true')
-    parser.add_argument('--prediction_type', help="Model prediction type", type=str, default='v', choices=['epsilon', 'x0', 'v'])
+    # parser.add_argument('--prediction_type', help="Model prediction type", type=str, default='v', choices=['epsilon', 'x0', 'v'])
     args = parser.parse_args()
 
     # 检查数据文件夹
@@ -1079,15 +1005,10 @@ if __name__ == "__main__":
     # 因此增加模型容量以支持所有预测类型
     
     # 从命令行参数获取配置
-    # use_flow_matching = args.flow_matching
     # prediction_type = args.prediction_type
     
-    use_flow_matching = False
     prediction_type = 'x0'  # 'epsilon', 'x0', or 'v'
-    
-    # Flow Matching推荐使用v预测
-    if use_flow_matching and prediction_type != 'v':
-        print(f"⚠ Warning: Flow Matching推荐使用prediction_type='v'，当前为'{prediction_type}'")
+    loss_type = 'x0'  # 'epsilon', 'x0', or 'v'
     
     model_args = dict(
         n_layers=6,  # 6 -> 12 (增加深度)
@@ -1103,25 +1024,18 @@ if __name__ == "__main__":
         n_path_steps=20,  # 不计起点 + 20个中间点 + 不计终点 (使用4维编码: x,y,sin(θ),cos(θ))
         diffusion_steps=50,
         prediction_type=prediction_type,  # 'epsilon', 'x0', or 'v' - 模型输出什么
-        loss_type=prediction_type,  # 与prediction_type保持一致
-        use_flow_matching=use_flow_matching  # True: Flow Matching (ODE), False: Standard Diffusion
+        loss_type=loss_type,  # 与prediction_type保持一致
         # 
-        # 【预测类型组合】
-        #   Standard Diffusion (--flow_matching不设置):
+        # 【预测类型】
         #     --prediction_type=x0: 直接预测，容量要求低但精度受限
         #     --prediction_type=epsilon: DDPM标准，稳定
         #     --prediction_type=v: Stable Diffusion方案，最推荐
-        #   
-        #   Flow Matching (--flow_matching):
-        #     --prediction_type=v: 预测向量场，最自然（推荐）
-        #     --prediction_type=x0: 预测x0但用向量场loss
-        #     --prediction_type=epsilon: 预测噪声但用向量场loss
     )
     
     print("\n" + "="*70)
     print("模型配置")
     print("="*70)
-    print(f"训练方法: {'Flow Matching (ODE)' if use_flow_matching else 'Standard Diffusion (DDIM)'}")
+    print(f"训练方法: Standard Diffusion (DDIM)")
     print(f"预测类型: {prediction_type}")
     print(f"模型层数: {model_args['n_layers']}")
     print(f"注意力头: {model_args['n_heads']}")
@@ -1144,8 +1058,8 @@ if __name__ == "__main__":
     
     # =================== 数据加载 ===================
     # env_list = ["env000004", "env000005"]
-    env_list = ["env000008"]
-    # env_list = ["env000008", "env000009"]
+    # env_list = ["env000008"]
+    env_list = ["env000008", "env000009"]
     
     # =================== 两阶段训练配置 ===================
     # 阶段1配置：注重基础轨迹预测

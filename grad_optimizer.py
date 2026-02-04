@@ -1672,6 +1672,102 @@ class TrajectoryOptimizerSE2:
          
         return total_cost
     
+    def cost_on_dense_trajectory(self, dense_traj):
+        """
+        直接对密集轨迹计算cost（无需插值）
+        用于第二阶段训练，重建后的轨迹已经是密集的
+        
+        Args:
+            dense_traj: (N, 3) tensor - 密集SE(2)轨迹 [x, y, yaw]
+        
+        Returns:
+            total_cost: scalar tensor - 总成本
+        """
+        device = dense_traj.device
+        N = len(dense_traj)
+        
+        # 直接使用密集轨迹，无需插值
+        traj_x = dense_traj[:, 0]
+        traj_y = dense_traj[:, 1]
+        traj_yaw = dense_traj[:, 2]
+        
+        # 计算一阶导数（速度）
+        dx = traj_x[1:] - traj_x[:-1]
+        dy = traj_y[1:] - traj_y[:-1]
+        dyaw = traj_yaw[1:] - traj_yaw[:-1]
+        dyaw = torch.atan2(torch.sin(dyaw), torch.cos(dyaw))  # 归一化角度差
+        
+        # 计算二阶导数（加速度）
+        ddx = dx[1:] - dx[:-1]
+        ddy = dy[1:] - dy[:-1]
+        ddyaw = dyaw[1:] - dyaw[:-1]
+        
+        # ========== 1. Stability Cost（倾覆成本）==========
+        traj_points_world = torch.stack([traj_x, traj_y, traj_yaw], dim=1)  # (N, 3)
+        traj_points_normalized = self.world_to_grid_normalized(traj_points_world)  # (N, 3)
+        
+        xi = torch.clamp(traj_points_normalized[:, 0], 0, self.W - 1 - 1e-4)
+        yi = torch.clamp(traj_points_normalized[:, 1], 0, self.H - 1 - 1e-4)
+        yaw_norm = (traj_points_normalized[:, 2] + np.pi) / (2 * np.pi)
+        zi = torch.clamp(yaw_norm * self.D, 0, self.D - 1 - 1e-4)
+        
+        x0, y0, z0 = xi.long(), yi.long(), zi.long()
+        x1, y1, z1 = torch.clamp(x0 + 1, max=self.W - 1), torch.clamp(y0 + 1, max=self.H - 1), torch.clamp(z0 + 1, max=self.D - 1)
+        
+        xd = xi - x0.float()
+        yd = yi - y0.float()
+        zd = zi - z0.float()
+        
+        c000 = self.occupancy_map[z0, y0, x0]
+        c001 = self.occupancy_map[z0, y0, x1]
+        c010 = self.occupancy_map[z0, y1, x0]
+        c011 = self.occupancy_map[z0, y1, x1]
+        c100 = self.occupancy_map[z1, y0, x0]
+        c101 = self.occupancy_map[z1, y0, x1]
+        c110 = self.occupancy_map[z1, y1, x0]
+        c111 = self.occupancy_map[z1, y1, x1]
+        
+        c00 = c000 * (1 - xd) + c001 * xd
+        c01 = c010 * (1 - xd) + c011 * xd
+        c10 = c100 * (1 - xd) + c101 * xd
+        c11 = c110 * (1 - xd) + c111 * xd
+        
+        c0 = c00 * (1 - yd) + c01 * yd
+        c1 = c10 * (1 - yd) + c11 * yd
+        
+        stability_costs = c0 * (1 - zd) + c1 * zd
+        
+        J_stability = stability_costs.mean()
+        
+        # ========== 2. Smoothness Cost（平滑性）==========
+        # 位置平滑（二阶导数的平方）
+        J_pos_smooth = (ddx ** 2 + ddy ** 2).mean()
+        
+        # 角度平滑
+        J_yaw_smooth = (ddyaw ** 2).mean()
+        
+        J_smoothness = J_pos_smooth + 0.5 * J_yaw_smooth
+        
+        # ========== 3. Goal Cost（目标接近度）==========
+        # 注意：这里假设终点是[-10.0, 0.0]，实际应该从batch中获取
+        # 在训练时需要传入真实的goal_pose
+        final_pos = traj_points_world[-1, :2]
+        # 使用一个默认值，实际使用时应该传入真实goal
+        # J_goal = 0.0  # 如果不需要goal cost可以设为0
+        
+        # ========== 组合总cost ==========
+        lambda_stability = 1.0
+        lambda_smoothness = 0.05
+        # lambda_goal = 0.1
+        
+        total_cost = (
+            lambda_stability * J_stability +
+            lambda_smoothness * J_smoothness
+            # + lambda_goal * J_goal
+        )
+        
+        return total_cost
+    
     def cost_on_poses(self, ctrl_poses):
         """
         直接对外部提供的控制点(ctrl_poses: [N,3])计算代价，
@@ -2444,7 +2540,7 @@ if __name__ == "__main__":
     dataFolder = '/home/yrf/MPT/data/sim_dataset/val'
     # dataset = UnevenPathDataLoader(env_list, dataFolder)
     dataset = UnevenPathDataLoader(env_list, dataFolder, True)
-    path_index = 0
+    path_index = 40
     sample = dataset[path_index]
     if sample is None:
         raise ValueError(f"Sample at index {path_index} is invalid.")
@@ -2486,7 +2582,7 @@ if __name__ == "__main__":
     # best = False
     # stage = 1
     # epoch = 39
-    stage = 2
+    stage = 1
     epoch = 24
 
     modelFolder = 'data/sim'

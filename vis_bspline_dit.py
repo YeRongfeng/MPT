@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import json
 
 from dit.Models import PathDiffusionTransformer
+from dit.BSplineModels import BSplineInterpolator, BSplineDiffusionTransformer
 from dataLoader_uneven import get_encoder_input, receptive_field
 from eval_model_uneven import getHashTable, get_patch
 import torch
@@ -29,187 +30,74 @@ diffusion_step = 50
 
 def spline_interpolate(control_points, num_samples=100):
     """
-    使用三次自然样条对控制点进行插值，生成平滑轨迹
+    使用B样条对控制点进行插值，生成平滑轨迹
     
     Args:
         control_points: 样条控制点，形状为(num_control_points, 3)，包含[x, y, yaw]
         num_samples: 插值生成的轨迹点数量，默认100
     
     Returns:
-        插值后的轨迹点，形状为(num_samples, 3)，保证经过所有控制点
+        插值后的轨迹点，形状为(num_samples, 3)
     """
     if control_points is None or len(control_points) < 2:
         print("Insufficient control points for spline interpolation")
         return None
     
     num_control = len(control_points)
+    device = torch.device('cpu')
     
-    # 生成控制点参数（均匀参数化）
-    t_control = np.linspace(0, 1, num_control)
+    # 转换为torch张量
+    control_points_torch = torch.from_numpy(control_points).float().to(device)
+    
     # 生成采样点参数
-    t_samples = np.linspace(0, 1, num_samples)
+    t_samples = torch.linspace(0, 1, num_samples, device=device)
     
     # 分开处理xy坐标和yaw角
-    x_control = control_points[:, 0]
-    y_control = control_points[:, 1]
-    yaw_control = control_points[:, 2]
+    # 对x, y使用B样条插值
+    x_control = control_points_torch[:, 0].unsqueeze(0).unsqueeze(-1)  # (1, n_control, 1)
+    y_control = control_points_torch[:, 1].unsqueeze(0).unsqueeze(-1)  # (1, n_control, 1)
     
-    # 对x, y使用三次样条插值
-    x_interpolated = _evaluate_scalar_spline(x_control, t_samples, t_control)
-    y_interpolated = _evaluate_scalar_spline(y_control, t_samples, t_control)
+    x_interpolated = BSplineInterpolator.evaluate_bspline(x_control, t_samples, degree=3).squeeze()  # (num_samples,)
+    y_interpolated = BSplineInterpolator.evaluate_bspline(y_control, t_samples, degree=3).squeeze()  # (num_samples,)
     
-    # 对yaw进行周期性感知的样条插值
-    yaw_interpolated = _evaluate_yaw_spline(yaw_control, t_samples, t_control)
+    # 对yaw进行周期性感知的B样条插值
+    yaw_control = control_points_torch[:, 2]
+    yaw_interpolated = _evaluate_yaw_bspline(yaw_control, t_samples)
     
     # 组合结果
-    trajectory = np.column_stack([x_interpolated, y_interpolated, yaw_interpolated])
+    trajectory = np.column_stack([
+        x_interpolated.numpy(), 
+        y_interpolated.numpy(), 
+        yaw_interpolated.numpy()
+    ])
     
     return trajectory
 
-def _solve_natural_cubic_M(y_values, t_control):
+def _evaluate_yaw_bspline(yaw_control, t_samples):
     """
-    求解自然三次样条的二阶导数 M
-    使用三对角矩阵算法（Thomas algorithm）
+    对yaw角进行周期性感知的B样条插值
     
     Args:
-        y_values: 控制点的y值，形状为(N,)
-        t_control: 控制点的参数，形状为(N,)
+        yaw_control: 控制点的yaw角，形状为(N,) torch.Tensor
+        t_samples: 采样点的参数，形状为(M,) torch.Tensor
     
     Returns:
-        二阶导数M，形状为(N,)
-    """
-    N = len(y_values)
-    if N < 2:
-        return np.zeros(N)
-    
-    # 构建三对角系统 A*M = b
-    # 自然边界条件：M[0] = M[-1] = 0
-    h = np.diff(t_control)  # 根据实际参数计算间隔
-    h = np.clip(h, 1e-6, None)  # 避免除零
-    
-    # 构建对角线
-    diag = 2 * (h[:-1] + h[1:])
-    diag = np.concatenate([[1], diag, [1]])  # 边界条件
-    
-    # 构建上下对角线
-    upper = np.concatenate([[0], h[1:], [0]])
-    lower = np.concatenate([[0], h[:-1], [0]])
-    
-    # 构建右侧向量
-    b = np.zeros(N)
-    for i in range(1, N - 1):
-        b[i] = 6 * ((y_values[i + 1] - y_values[i]) / h[i] - 
-                    (y_values[i] - y_values[i - 1]) / h[i - 1])
-    
-    # 边界条件（自然样条）
-    b[0] = 0
-    b[-1] = 0
-    
-    # 使用 Thomas 算法求解三对角系统
-    M = _solve_tridiagonal(lower, diag, upper, b)
-    
-    return M
-
-def _solve_tridiagonal(lower, diag, upper, b):
-    """
-    使用 Thomas 算法求解三对角线性系统
-    
-    Args:
-        lower: 下对角线
-        diag: 主对角线
-        upper: 上对角线
-        b: 右侧向量
-    
-    Returns:
-        解向量 x
-    """
-    N = len(b)
-    c_prime = np.zeros(N - 1)
-    d_prime = np.zeros(N)
-    x = np.zeros(N)
-    
-    # 前向消元
-    c_prime[0] = upper[0] / diag[0]
-    d_prime[0] = b[0] / diag[0]
-    
-    for i in range(1, N - 1):
-        denom = diag[i] - lower[i] * c_prime[i - 1]
-        c_prime[i] = upper[i] / denom
-        d_prime[i] = (b[i] - lower[i] * d_prime[i - 1]) / denom
-    
-    d_prime[-1] = (b[-1] - lower[-1] * d_prime[-2]) / (diag[-1] - lower[-1] * c_prime[-2])
-    
-    # 回代
-    x[-1] = d_prime[-1]
-    for i in range(N - 2, -1, -1):
-        x[i] = d_prime[i] - c_prime[i] * x[i + 1]
-    
-    return x
-
-def _evaluate_scalar_spline(y_control, t_eval, t_control):
-    """
-    对一维标量序列进行三次样条插值
-    
-    Args:
-        y_control: 控制点的y值，形状为(N,)
-        t_eval: 评估点的参数，形状为(M,)
-        t_control: 控制点的参数，形状为(N,)
-    
-    Returns:
-        插值后的y值，形状为(M,)
-    """
-    N = len(y_control)
-    M_values = _solve_natural_cubic_M(y_control, t_control)  # 传入 t_control
-    
-    h = np.diff(t_control)
-    h = np.clip(h, 1e-6, None)  # 避免除零
-    
-    # 找到每个评估点所在的区间
-    idx = np.searchsorted(t_control[1:], t_eval, side='left')
-    idx = np.clip(idx, 0, N - 2)
-    
-    # 获取区间端点
-    t_k = t_control[idx]
-    t_k1 = t_control[idx + 1]
-    h_k = h[idx]
-    dt = t_eval - t_k
-    
-    y_k = y_control[idx]
-    y_k1 = y_control[idx + 1]
-    M_k = M_values[idx]
-    M_k1 = M_values[idx + 1]
-    
-    # 三次样条插值公式
-    term1 = M_k * (t_k1 - t_eval)**3 / (6 * h_k)
-    term2 = M_k1 * dt**3 / (6 * h_k)
-    term3 = (y_k - M_k * h_k**2 / 6) * (t_k1 - t_eval) / h_k
-    term4 = (y_k1 - M_k1 * h_k**2 / 6) * dt / h_k
-    
-    S = term1 + term2 + term3 + term4
-    
-    return S
-
-def _evaluate_yaw_spline(yaw_control, t_eval, t_control):
-    """
-    对yaw角进行周期性感知的三次样条插值
-    
-    Args:
-        yaw_control: 控制点的yaw角，形状为(N,)
-        t_eval: 评估点的参数，形状为(M,)
-        t_control: 控制点的参数，形状为(N,)
-    
-    Returns:
-        插值后的yaw角，形状为(M,)，规范化到[-pi, pi]
+        插值后的yaw角，形状为(M,) torch.Tensor，规范化到[-pi, pi]
     """
     # 展开角度序列，消除周期性跳跃
     yaw_unwrapped = _unwrap_angles(yaw_control)
     
-    # 对展开后的角度进行标量样条插值
-    yaw_interpolated_unwrapped = _evaluate_scalar_spline(yaw_unwrapped, t_eval, t_control)
+    # 对展开后的角度进行B样条插值
+    yaw_unwrapped_expanded = yaw_unwrapped.unsqueeze(0).unsqueeze(-1)  # (1, N, 1)
+    yaw_interpolated_unwrapped = BSplineInterpolator.evaluate_bspline(
+        yaw_unwrapped_expanded, t_samples, degree=3
+    ).squeeze()  # (M,)
     
     # 将插值结果重新规范化到 [-π, π]
-    yaw_interpolated = np.arctan2(np.sin(yaw_interpolated_unwrapped), 
-                                   np.cos(yaw_interpolated_unwrapped))
+    yaw_interpolated = torch.atan2(
+        torch.sin(yaw_interpolated_unwrapped), 
+        torch.cos(yaw_interpolated_unwrapped)
+    )
     
     return yaw_interpolated
 
@@ -218,72 +106,61 @@ def _unwrap_angles(angles):
     展开角度序列，消除周期性跳跃
     
     Args:
-        angles: 角度序列，形状为(N,)
+        angles: 角度序列，形状为(N,) torch.Tensor
     
     Returns:
-        展开后的角度序列，形状为(N,)
+        展开后的角度序列，形状为(N,) torch.Tensor
     """
     if len(angles) <= 1:
-        return angles.copy()
+        return angles.clone()
     
-    unwrapped = np.zeros_like(angles)
+    unwrapped = torch.zeros_like(angles)
     unwrapped[0] = angles[0]
     
     for i in range(1, len(angles)):
         diff = angles[i] - angles[i-1]
         # 规范化角度差到 [-π, π]
-        diff = np.arctan2(np.sin(diff), np.cos(diff))
+        diff = torch.atan2(torch.sin(diff), torch.cos(diff))
         unwrapped[i] = unwrapped[i-1] + diff
     
     return unwrapped
 
 def generate_paths(model, map_input, start_point, goal_point, num_paths=5):
     """
-    生成完整路径（绝对坐标版本，使用sin/cos编码）
+    生成完整路径（B样条控制点版本）
     
     Args:
-        model: 训练好的PathDiffusionTransformer
-        map_input: (1, 6, H, W) 已包含起点/终点嵌入的地图
-        start_point: (3,) [x, y, yaw] 起点坐标（真实坐标）
-        goal_point: (3,) [x, y, yaw] 终点坐标（真实坐标）
+        model: 训练好的BSplineDiffusionTransformer
+        map_input: (1, 3, H, W) 地图输入
+        start_point: (3,) [x, y, yaw] 起点坐标
+        goal_point: (3,) [x, y, yaw] 终点坐标
         num_paths: 生成路径数量
     Returns:
         middle_paths: (num_paths, 20, 3) 中间20个点的绝对坐标 [x, y, theta]
     """
     model.eval()
     
-    # 归一化起点终点并转换为4维 (x, y, sin(θ), cos(θ))
-    start_normalized = torch.zeros(4, device=start_point.device)
-    start_normalized[:2] = start_point[:2] / 20.0  # x,y归一化
-    start_normalized[2] = torch.sin(start_point[2])  # sin(θ)
-    start_normalized[3] = torch.cos(start_point[2])  # cos(θ)
-    start_normalized[:2] = torch.clamp(start_normalized[:2], -1.0, 1.0)
-    start_normalized = start_normalized.unsqueeze(0)  # (1, 4)
+    # 将起终点转换为tensor
+    start_pose = start_point.unsqueeze(0) if start_point.dim() == 1 else start_point  # (1, 3)
+    goal_pose = goal_point.unsqueeze(0) if goal_point.dim() == 1 else goal_point  # (1, 3)
     
-    goal_normalized = torch.zeros(4, device=goal_point.device)
-    goal_normalized[:2] = goal_point[:2] / 20.0
-    goal_normalized[2] = torch.sin(goal_point[2])  # sin(θ)
-    goal_normalized[3] = torch.cos(goal_point[2])  # cos(θ)
-    goal_normalized[:2] = torch.clamp(goal_normalized[:2], -1.0, 1.0)
-    goal_normalized = goal_normalized.unsqueeze(0)  # (1, 4)
-    
-    # 生成中间20个点（4维编码）
+    # 生成多条轨迹
+    trajectories = []
     with torch.no_grad():
-        normalized_traj = model.sample(
-            map_input,
-            start_normalized,
-            goal_normalized,
-            num_samples=num_paths,
-            ddim_steps=diffusion_step
-        )  # (num_paths, 20, 4) - 归一化的4维编码
+        for _ in range(num_paths):
+            # 使用ddim_sample生成一条轨迹
+            traj = model.ddim_sample(
+                map_input,
+                start_pose,
+                goal_pose,
+                ddim_steps=diffusion_step
+            )  # (1, 20, 3)
+            trajectories.append(traj.squeeze(0))  # (20, 3)
     
-    # 反归一化到真实坐标 (x, y, theta)
-    traj_denorm = torch.zeros(num_paths, 20, 3, device=normalized_traj.device)
-    traj_denorm[:, :, :2] = normalized_traj[:, :, :2] * 20.0  # x,y: [-1,1] → [-20,20]
-    # 从sin/cos恢复角度
-    traj_denorm[:, :, 2] = torch.atan2(normalized_traj[:, :, 2], normalized_traj[:, :, 3])  # θ ∈ [-π, π]
+    # 堆叠所有轨迹
+    trajectories = torch.stack(trajectories, dim=0)  # (num_paths, 20, 3)
     
-    return traj_denorm.cpu().numpy()  # (num_paths, 20, 3)
+    return trajectories.cpu().numpy()  # (num_paths, 20, 3)
 
 # Define the network
 device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -378,26 +255,35 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTrajs=None, out
                              head_width=0.08, head_length=0.12, fc=color, ec=color, 
                              zorder=4, alpha=alphas[traj_idx])
     else:
+        # Ground Truth 轨迹绘制
+        # trajectory 应该是 (22, 3)：起点 + 20中间点 + 终点
+        
         # 如果启用样条插值，先对真实轨迹进行插值处理
         if use_bezier_interpolate:
+            # GT轨迹已经包含起点和终点，直接使用完整的22个点进行插值
             trajectory_smooth = spline_interpolate(trajectory, num_samples=100)
             if trajectory_smooth is not None:
                 trajectory_to_plot = trajectory_smooth
             else:
                 trajectory_to_plot = trajectory
         else:
+            # 不使用样条插值时，直接使用原始轨迹
             trajectory_to_plot = trajectory
         
         # 绘制真实轨迹线段
         for i in range(trajectory_to_plot.shape[0] - 1):
-            color = plt.cm.rainbow(i / (trajectory_to_plot.shape[0] - 2))  # 使用rainbow颜色映射
-            ax.plot(trajectory_to_plot[i:i+2, 0], trajectory_to_plot[i:i+2, 1], color=color, zorder=3, linewidth=2, marker='o', markersize=1.5)
+            color = plt.cm.rainbow(i / max(1, trajectory_to_plot.shape[0] - 2))  # 使用rainbow颜色映射
+            ax.plot(trajectory_to_plot[i:i+2, 0], trajectory_to_plot[i:i+2, 1], 
+                   color=color, zorder=3, linewidth=2, marker='o', markersize=1.5)
         
         # 绘制真实轨迹的角度箭头（从轨迹数据第三列读取）
+        # 只在中间点绘制箭头，避免与起终点箭头重叠
         arrow_scale = 0.2
-        for i in range(1, trajectory_to_plot.shape[0] - 1):  # 跳过起点和终点，它们单独处理
-            color = plt.cm.rainbow((i-1) / (trajectory_to_plot.shape[0] - 3)) if trajectory_to_plot.shape[0] > 3 else 'green'
-            # color = 'orange'
+        for i in range(1, trajectory_to_plot.shape[0] - 1):  # 跳过起点和终点
+            if trajectory_to_plot.shape[0] > 3:
+                color = plt.cm.rainbow((i-1) / max(1, trajectory_to_plot.shape[0] - 3))
+            else:
+                color = 'green'
             x, y, theta = trajectory_to_plot[i, :]
             ax.arrow(x, y,
                      np.cos(theta) * arrow_scale,
@@ -474,9 +360,11 @@ def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_path
         start_pos = trajectory[0, :]
         goal_pos = trajectory[-1, :]
         
-        # print(f"True_x range: {min(trajectory[:, 0])} to {max(trajectory[:, 0])}")
-        # print(f"True_y range: {min(trajectory[:, 1])} to {max(trajectory[:, 1])}")
-        
+        # print(f"Path {pathNum}: trajectory shape = {trajectory.shape}")  # 调试信息
+        # print(f"  Start (trajectory[0]): {start_pos}")
+        # print(f"  Goal (trajectory[-1]): {goal_pos}")
+        # print(f"  Trajectory first 3 points:\n{trajectory[:3]}")
+        # print(f"  Trajectory last 3 points:\n{trajectory[-3:]}")
         # print(f"True Traj: {trajectory}")
         
         # 获取预测轨迹
@@ -586,29 +474,28 @@ if __name__ == "__main__":
     # ================================================
     
     # =================== 样条插值配置 ===================
-    # True: 使用三次样条插值生成平滑轨迹（100个点，保证经过所有控制点）
+    # True: 使用B样条插值生成平滑轨迹（100个点）
     # False: 直接使用控制点连接（默认，更快）
-    use_bezier_interpolate = True  # 启用样条插值
-    # use_bezier_interpolate = False  # 禁用样条插值
+    use_bezier_interpolate = True  # 启用B样条插值
+    # use_bezier_interpolate = False  # 禁用B样条插值
     # ==================================================
-    # 注意：变量名保持为 use_bezier_interpolate 以兼容现有代码，实际使用样条插值
 
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     envType_list = ['env000008']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    save_path = 'predictions'
+    save_path = 'bspline_vis'
 
-    modelFolder = 'data/sim'
+    modelFolder = 'data/bspline'
     modelFile = osp.join(modelFolder, f'model_params.json')
     model_param = json.load(open(modelFile))
 
-    model = PathDiffusionTransformer(**model_param['model_args'])
+    model = BSplineDiffusionTransformer(**model_param['model_args'])
     _ = model.to(device)
 
     # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
     
     if best:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_model.pth'))
+        checkpoint = torch.load(osp.join(modelFolder, f'best_stage{stage}.pth'))
         print(f"Loaded best stage {stage} model.")
     else:
         checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_stage{stage}_epoch_{epoch}.pth'))
@@ -649,7 +536,7 @@ if __name__ == "__main__":
     for env in envType_list:
         print(f"Evaluating environment: {env}")
         print(f"Generating {num_pred_paths} trajectory sample(s) per scene")
-        print(f"Spline interpolation: {'Enabled' if use_bezier_interpolate else 'Disabled'}")
+        print(f"B-spline interpolation: {'Enabled' if use_bezier_interpolate else 'Disabled'}")
 
         # 绘制多组轨迹对比图
         plot_elevation_map(path_index_list, env, save_path, num_pred_paths=num_pred_paths, use_bezier_interpolate=use_bezier_interpolate)

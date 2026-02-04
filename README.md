@@ -78,6 +78,10 @@ python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data
 python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2
 python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth
 
+python3 train_polynomial_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/polynomial
+
+python3 train_bspline_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/bspline
+
 uv run train_mamba.py --batchSize=20 --dataFolder=data/terrain_dataset --fileDir=data/mamba 
 
 # 正常的两阶段训练

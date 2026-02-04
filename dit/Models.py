@@ -515,26 +515,16 @@ class PathDiffusionTransformer(nn.Module):
     
     def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, 
                  pad_idx, dropout, n_position, train_shape, 
-                 n_path_steps=20, diffusion_steps=50, prediction_type='epsilon', loss_type=None,
-                 use_flow_matching=False):
+                 n_path_steps=20, diffusion_steps=50, prediction_type='epsilon', loss_type=None):
         """
         Args:
             prediction_type: 'epsilon' (预测噪声), 'x0' (预测原始数据), 或 'v' (预测velocity)
             loss_type: 'epsilon', 'x0', 或 'v' - 损失函数的目标类型，如果为None则与prediction_type相同
-            use_flow_matching: bool - 是否使用Flow Matching而非标准Diffusion
-                Flow Matching特点：
-                - 使用线性插值路径：x_t = (1-t)*x_0 + t*noise
-                - 训练目标是向量场：v_t = x_0 - noise（从noise指向x_0的方向）
-                - 采样使用ODE solver（更高效）
         """
         super().__init__()
         
         self.prediction_type = prediction_type
         self.loss_type = loss_type if loss_type is not None else prediction_type
-        self.use_flow_matching = use_flow_matching
-        
-        if use_flow_matching and prediction_type != 'v':
-            print(f"⚠ Warning: Flow Matching通常使用prediction_type='v'（向量场），当前为'{prediction_type}'")
         
         # ========== 地图CNN特征提取（保留原架构）==========
         self.map_fe = nn.Sequential(
@@ -774,32 +764,15 @@ class PathDiffusionTransformer(nn.Module):
         
         Standard Diffusion:
             x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
-        
-        Conditional Flow Matching (OT-CFM):
-            条件路径: q_t(x_t|x_0,x_1) = δ(x_t - [(1-t)x_0 + tx_1])
-            其中：
-            - x_0: 数据（干净轨迹）
-            - x_1: 高斯先验 N(0,I)
-            - t ∈ [0,1]: t=0是数据，t=1是噪声
         """
         if noise is None:
             noise = torch.randn_like(x_start)
         
-        if self.use_flow_matching:
-            # Conditional Flow Matching: OT条件路径（线性插值）
-            # t需要归一化到[0,1]
-            t_continuous = t.float() / self.diffusion_steps  # (B,) -> [0, 1]
-            t_continuous = t_continuous[:, None, None]  # (B, 1, 1)
-            
-            # x_t = (1-t)*x_0 + t*x_1
-            # t=0: x_0 (数据), t=1: x_1 (噪声)
-            return (1 - t_continuous) * x_start + t_continuous * noise
-        else:
-            # Standard Diffusion
-            sqrt_alphas = torch.sqrt(self.alphas_cumprod[t])[:, None, None]
-            sqrt_one_minus_alphas = torch.sqrt(1 - self.alphas_cumprod[t])[:, None, None]
-            
-            return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
+        # Standard Diffusion
+        sqrt_alphas = torch.sqrt(self.alphas_cumprod[t])[:, None, None]
+        sqrt_one_minus_alphas = torch.sqrt(1 - self.alphas_cumprod[t])[:, None, None]
+        
+        return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
     
     @torch.no_grad()
     def p_sample(self, map_input, x_t, t, start_pose, goal_pose):
@@ -810,103 +783,47 @@ class PathDiffusionTransformer(nn.Module):
             - Epsilon prediction: x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
             - X0 prediction: 直接预测 x_0
             - V prediction: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-        
-        Conditional Flow Matching (OT-CFM):
-            - 条件路径：x_t = (1-t)*x_0 + t*x_1, t∈[0,1]
-            - 条件向量场：u_t(x_t|x_0,x_1) = x_1 - x_0（训练目标）
-            - 边际向量场：v_θ(x_t,t,cond)（推理使用）
-            - 采样：从t=1(噪声)到t=0(数据)，反向ODE积分
-            - Euler方法：x_{t-dt} = x_t - v_t * dt（反向走）
         """
         # 获取模型输出
         model_output = self.forward(map_input, x_t, t, start_pose, goal_pose)
         
-        if self.use_flow_matching:
-            # ===== Conditional Flow Matching (CFM) ODE采样 =====
-            # 
-            # 边际向量场: v_θ(x_t, t, cond)
-            # 反向ODE: dx/dt = -v_θ(x_t, 1-t, cond), 从 t=1 (噪声) 到 t=0 (数据)
-            # 离散化 (Euler方法): x_{t-dt} = x_t - v_t * dt
-            # 
-            # 说明：训练时学习条件向量场 u_t(x_t|x_0,x_1) = x_1 - x_0
-            #      推理时使用边际向量场反向积分
-            
-            t_continuous = t.float() / self.diffusion_steps  # 将离散步归一化到[0, 1]
-            dt = 1.0 / self.diffusion_steps  # 时间步长
-            
-            # 边界条件
-            if t[0] == 0:
-                # t=0已经是数据分布，直接返回
-                return x_t
-            
-            # 提取向量场预测
-            if self.prediction_type == 'v':
-                # 直接预测向量场
-                v_t = model_output
-            elif self.prediction_type == 'x0':
-                # 预测x_0，计算向量场
-                pred_x0 = model_output
-                t_safe = torch.clamp(t_continuous[:, None, None], min=1e-5)
-                pred_x1 = (x_t - (1 - t_continuous[:, None, None]) * pred_x0) / t_safe
-                v_t = pred_x1 - pred_x0
-            elif self.prediction_type == 'epsilon':
-                # 预测x_1（噪声），计算向量场
-                pred_x1 = model_output
-                t_safe_inv = torch.clamp(1 - t_continuous[:, None, None], min=1e-5)
-                pred_x0 = (x_t - t_continuous[:, None, None] * pred_x1) / t_safe_inv
-                v_t = pred_x1 - pred_x0
-            else:
-                raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
-            
-            # Euler积分（反向）：x_{t-dt} = x_t - v_t * dt
-            # 注意：这里是减法，因为向量场指向噪声，我们要反向走到数据
-            x_prev = x_t - v_t * dt
-            
-            # 裁剪位置坐标
-            x_prev[:, :, :2] = torch.clamp(x_prev[:, :, :2], -1.0, 1.0)
-            
-            return x_prev
-            
+        # ===== Standard Diffusion (DDIM)采样 =====
+        # 提取alpha值
+        alpha_t = self.alphas_cumprod[t][:, None, None]
+        sqrt_alpha_t = torch.sqrt(alpha_t)
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        
+        # 根据prediction_type解析模型输出
+        if self.prediction_type == 'epsilon':
+            pred_noise = model_output
+            pred_x0 = (x_t - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
+        elif self.prediction_type == 'x0':
+            pred_x0 = model_output
+            pred_noise = (x_t - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
+        elif self.prediction_type == 'v':
+            # V-prediction: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+            # 从v反推：
+            #   x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
+            #   ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
+            pred_v = model_output
+            pred_x0 = sqrt_alpha_t * x_t - sqrt_one_minus_alpha_t * pred_v
+            pred_noise = sqrt_alpha_t * pred_v + sqrt_one_minus_alpha_t * x_t
         else:
-            # ===== Standard Diffusion (DDIM)采样 =====
-            # 提取alpha值
-            alpha_t = self.alphas_cumprod[t][:, None, None]
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
-            
-            # 根据prediction_type解析模型输出
-            if self.prediction_type == 'epsilon':
-                pred_noise = model_output
-                pred_x0 = (x_t - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
-            elif self.prediction_type == 'x0':
-                pred_x0 = model_output
-                pred_noise = (x_t - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
-            elif self.prediction_type == 'v':
-                # V-prediction: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-                # 从v反推：
-                #   x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
-                #   ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
-                pred_v = model_output
-                pred_x0 = sqrt_alpha_t * x_t - sqrt_one_minus_alpha_t * pred_v
-                pred_noise = sqrt_alpha_t * pred_v + sqrt_one_minus_alpha_t * x_t
-            else:
-                raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
-            
-            # 裁剪位置坐标
-            pred_x0[:, :, :2] = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)
-            
-            # 最后一步直接返回x_0
-            if t[0] == 0:
-                return pred_x0
-            
-            # DDIM公式：x_{t-1} = √ᾱ_{t-1} * x_0 + √(1-ᾱ_{t-1}) * ε
-            alpha_prev = self.alphas_cumprod[t-1][:, None, None]
-            sqrt_alpha_prev = torch.sqrt(alpha_prev)
-            sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_prev)
-            
-            x_prev = sqrt_alpha_prev * pred_x0 + sqrt_one_minus_alpha_prev * pred_noise
-            
-            return x_prev
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
+        
+        # 裁剪位置坐标
+        pred_x0[:, :, :2] = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)
+        
+        # 最后一步直接返回x_0
+        if t[0] == 0:
+            return pred_x0
+        
+        # DDIM公式：x_{t-1} = √ᾱ_{t-1} * x_0 + √(1-ᾱ_{t-1}) * ε
+        alpha_prev = self.alphas_cumprod[t-1][:, None, None]
+        sqrt_alpha_prev = torch.sqrt(alpha_prev)
+        sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_prev)
+        
+        x_prev = sqrt_alpha_prev * pred_x0 + sqrt_one_minus_alpha_prev * pred_noise
         
         return x_prev
     
@@ -1258,6 +1175,5 @@ class PathDiffusionTransformer(nn.Module):
     def get_trainable_parameters(self):
         """返回当前可训练的参数（用于优化器）"""
         return [p for p in self.parameters() if p.requires_grad]
-
 
 
