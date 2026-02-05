@@ -27,25 +27,29 @@ from ESDF3d_atpoint import compute_esdf_batch
 from grad_optimizer import TrajectoryOptimizerSE2
 from dit.Models import PathDiffusionTransformer
 
-def compute_timestep_weight(t, T, k=2.0):
+def compute_timestep_weight(t_normalized, k=1.0):
     """
-    计算时间步权重：w(t) = (1 - t/T)^k
+    计算时间步权重（适配新参数化）
+    
+    新参数化下，t_normalized从1（纯数据）到0（纯噪声）
+    我们希望模型更关注干净数据区域（t_normalized接近1）
     
     Args:
-        t: 当前时间步 (tensor, shape: (B,))
-        T: 总时间步数 (int)
-        k: 衰减指数，越大则对晚期时间步的偏好越强
+        t_normalized: (B,) 归一化的时间步，范围[0, 1]
+            - t=1.0: 纯数据（最重要）
+            - t=0.0: 纯噪声（相对不重要）
+        k: 加权指数，越大则对干净数据区域的偏好越强
     
     Returns:
         weight: (B,) 时间步权重，范围[0, 1]
     
-    例子：
-        t=0 (最晚期): w = 1.0 (最高权重)
-        t=T/2 (中期): w = 0.25 (k=2时)
-        t=T (最早期): w = 0.0 (最低权重)
+    例子（k=1.0）：
+        t=1.0 (纯数据): w = 1.0 (最高权重)
+        t=0.5 (中等): w = 0.5
+        t=0.0 (纯噪声): w = 0.0 (最低权重)
     """
-    normalized_t = t.float() / T
-    weight = (1.0 - normalized_t) ** k
+    # w(t) = t^k，让模型更关注干净数据区域
+    weight = t_normalized ** k
     return weight
 
 def compute_smoothness_loss(trajectory, include_angle=False, threshold=None):
@@ -401,8 +405,12 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     goal_normalized[:, 3] = torch.cos(goal_pose[:, 2])  # cos(θ)
     goal_normalized[:, :2] = torch.clamp(goal_normalized[:, :2], -1.0, 1.0)
     
-    # 采样时间步和噪声
-    t = torch.randint(0, model.diffusion_steps, (B,), device=device)
+    # 改进的时间步采样策略（参考文生图模型）
+    # 使用sigmoid正态分布采样，避免极端时间步，提高训练稳定性
+    if hasattr(model, 'module'):  # DataParallel
+        t = model.module.sample_timesteps(B, device=device)
+    else:
+        t = model.sample_timesteps(B, device=device)
     
     # 生成噪声（不裁剪，保持标准正态分布）
     noise = torch.randn_like(traj_normalized)
@@ -417,49 +425,54 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     prediction_type = getattr(model, 'prediction_type', 'epsilon')
     loss_type = getattr(model, 'loss_type', prediction_type)
     
-    # ===== Standard Diffusion训练 =====
+    # ===== 新参数化训练 =====
     # 
-    # V-prediction定义（Progressive Distillation / Imagen）：
-    #   给定：x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
-    #   定义：v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+    # 新扩散参数化（时间t线性插值）：
+    #   加噪过程：z = t * x + (1 - t) * e
+    #   速度定义：v = (x - z) / (1 - t)
     # 
-    # 从v反推x_0和ε：
-    #   x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
-    #   ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
+    # 三种预测类型的关系：
+    #   1. 预测噪声 epsilon: x = (z - (1-t)*e) / t
+    #   2. 预测数据 x0: 直接得到 x
+    #   3. 预测速度 v: x = z + (1-t)*v
     # 
-    # 验证：代入x_t公式
-    #   x_t = √ᾱ_t * (√ᾱ_t * x_t - √(1-ᾱ_t) * v) + √(1-ᾱ_t) * (√ᾱ_t * v + √(1-ᾱ_t) * x_t)
-    #       = ᾱ_t * x_t - √ᾱ_t * √(1-ᾱ_t) * v + √ᾱ_t * √(1-ᾱ_t) * v + (1-ᾱ_t) * x_t
-    #       = x_t ✓
+    # 从任一预测可以推导其他两个：
+    #   - 从 x 和 z 可得 e = (z - t*x) / (1-t)
+    #   - 从 x 和 z 可得 v = (x - z) / (1-t)
     
-    # 计算alpha值
-    sqrt_alpha_t = torch.sqrt(model.alphas_cumprod[t])[:, None, None]
-    sqrt_one_minus_alpha_t = torch.sqrt(1 - model.alphas_cumprod[t])[:, None, None]
+    # 获取归一化的时间步 t (0到1)
+    device = noisy_traj.device
+    if hasattr(model, 'module'):  # DataParallel
+        t_normalized = model.module.timesteps_normalized[t][:, None, None]
+        t_eps = model.module.t_eps
+    else:
+        t_normalized = model.timesteps_normalized[t][:, None, None]
+        t_eps = model.t_eps
     
     # 根据模型预测类型，计算出 x0, epsilon, v 三者
     if prediction_type == 'epsilon':
-        # 模型预测噪声 ε
+        # 模型预测噪声 e
         pred_epsilon = model_output
-        # 从ε反推x_0: x_0 = (x_t - √(1-ᾱ_t) * ε) / √ᾱ_t
-        pred_x0 = (noisy_traj - sqrt_one_minus_alpha_t * pred_epsilon) / sqrt_alpha_t
-        # 计算v: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-        pred_v = sqrt_alpha_t * pred_epsilon - sqrt_one_minus_alpha_t * pred_x0
+        # 从e反推x: x = (z - (1-t)*e) / t
+        pred_x0 = (noisy_traj - (1 - t_normalized) * pred_epsilon) / torch.clamp(t_normalized, min=t_eps)
+        # 计算v: v = (x - z) / (1-t)
+        pred_v = (pred_x0 - noisy_traj) / torch.clamp(1 - t_normalized, min=t_eps)
         
     elif prediction_type == 'x0':
-        # 模型直接预测 x_0
+        # 模型直接预测 x
         pred_x0 = model_output
-        # 从x_0反推ε: ε = (x_t - √ᾱ_t * x_0) / √(1-ᾱ_t)
-        pred_epsilon = (noisy_traj - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
-        # 计算v: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-        pred_v = sqrt_alpha_t * pred_epsilon - sqrt_one_minus_alpha_t * pred_x0
+        # 从x反推e: e = (z - t*x) / (1-t)
+        pred_epsilon = (noisy_traj - t_normalized * pred_x0) / torch.clamp(1 - t_normalized, min=t_eps)
+        # 计算v: v = (x - z) / (1-t)
+        pred_v = (pred_x0 - noisy_traj) / torch.clamp(1 - t_normalized, min=t_eps)
         
     elif prediction_type == 'v':
         # 模型预测 v
         pred_v = model_output
-        # 从v反推x_0: x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
-        pred_x0 = sqrt_alpha_t * noisy_traj - sqrt_one_minus_alpha_t * pred_v
-        # 从v反推ε: ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
-        pred_epsilon = sqrt_alpha_t * pred_v + sqrt_one_minus_alpha_t * noisy_traj
+        # 从v反推x: x = z + (1-t)*v
+        pred_x0 = noisy_traj + (1 - t_normalized) * pred_v
+        # 从x和z反推e: e = (z - t*x) / (1-t)
+        pred_epsilon = (noisy_traj - t_normalized * pred_x0) / torch.clamp(1 - t_normalized, min=t_eps)
         
     else:
         raise ValueError(f"Unknown prediction_type: {prediction_type}. Must be 'epsilon', 'x0', or 'v'")
@@ -472,8 +485,8 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         target = traj_normalized
         prediction = pred_x0
     elif loss_type == 'v':
-        # 真实的v目标：v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-        target = sqrt_alpha_t * noise - sqrt_one_minus_alpha_t * traj_normalized
+        # 真实的v目标：v = (x - z) / (1-t)
+        target = (traj_normalized - noisy_traj) / torch.clamp(1 - t_normalized, min=t_eps)
         prediction = pred_v
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}. Must be 'epsilon', 'x0', or 'v'")
@@ -525,7 +538,19 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         full_traj_denorm = torch.cat([start_denorm, pred_x0_denorm, goal_denorm], dim=1)
     
     if loss_weights['main'] > 0:
-        main_loss = F.mse_loss(prediction, target)
+        # 改进的损失计算（参考文生图模型）
+        # 先对每个样本的空间维度求平均，再对batch求平均
+        # 避免大batch的数值问题和梯度不均匀
+        loss_per_sample = F.mse_loss(prediction, target, reduction='none')  # (B, N, 4)
+        loss_per_sample = loss_per_sample.mean(dim=(1, 2))  # (B,) 先对N和4维度平均
+        
+        # 可选：应用时间步加权（让模型更关注干净数据区域）
+        # 参考文生图模型：w(t) = t^k，对t接近1（干净数据）的样本给更高权重
+        # 如果不需要加权，注释掉下面这行
+        # t_weights = compute_timestep_weight(t_normalized.squeeze(), k=1.0)  # (B,)
+        # loss_per_sample = loss_per_sample * t_weights
+        
+        main_loss = loss_per_sample.mean()  # 标量，再对batch平均
         
         if loss_type == 'epsilon':
             main_loss = main_loss * 0.5  # epsilon损失缩放0.5
@@ -650,16 +675,22 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
             # 预测t-1时刻的x0
             model_output_tm1 = model(map_input, noisy_traj_tm1, t_minus_1, start_normalized, goal_normalized)
             
+            # 获取归一化的时间步
+            if hasattr(model, 'module'):  # DataParallel
+                t_tm1_normalized = model.module.timesteps_normalized[t_minus_1][:, None, None]
+                t_eps = model.module.t_eps
+            else:
+                t_tm1_normalized = model.timesteps_normalized[t_minus_1][:, None, None]
+                t_eps = model.t_eps
+            
             if prediction_type == 'epsilon':
-                sqrt_alpha_tm1 = torch.sqrt(model.alphas_cumprod[t_minus_1])[:, None, None]
-                sqrt_one_minus_alpha_tm1 = torch.sqrt(1 - model.alphas_cumprod[t_minus_1])[:, None, None]
-                pred_x0_tm1 = (noisy_traj_tm1 - sqrt_one_minus_alpha_tm1 * model_output_tm1) / sqrt_alpha_tm1
+                pred_epsilon_tm1 = model_output_tm1
+                pred_x0_tm1 = (noisy_traj_tm1 - (1 - t_tm1_normalized) * pred_epsilon_tm1) / torch.clamp(t_tm1_normalized, min=t_eps)
             elif prediction_type == 'x0':
                 pred_x0_tm1 = model_output_tm1
             elif prediction_type == 'v':
-                sqrt_alpha_tm1 = torch.sqrt(model.alphas_cumprod[t_minus_1])[:, None, None]
-                sqrt_one_minus_alpha_tm1 = torch.sqrt(1 - model.alphas_cumprod[t_minus_1])[:, None, None]
-                pred_x0_tm1 = sqrt_alpha_tm1 * noisy_traj_tm1 - sqrt_one_minus_alpha_tm1 * model_output_tm1
+                pred_v_tm1 = model_output_tm1
+                pred_x0_tm1 = noisy_traj_tm1 + (1 - t_tm1_normalized) * pred_v_tm1
             
             # 时间一致性：t和t-1时刻预测的x0应该接近
             consistency_loss = F.mse_loss(
@@ -1008,7 +1039,7 @@ if __name__ == "__main__":
     # prediction_type = args.prediction_type
     
     prediction_type = 'x0'  # 'epsilon', 'x0', or 'v'
-    loss_type = 'x0'  # 'epsilon', 'x0', or 'v'
+    loss_type = 'v'  # 'epsilon', 'x0', or 'v'
     
     model_args = dict(
         n_layers=6,  # 6 -> 12 (增加深度)
@@ -1063,14 +1094,28 @@ if __name__ == "__main__":
     
     # =================== 两阶段训练配置 ===================
     # 阶段1配置：注重基础轨迹预测
+    # stage1_config = {
+    #     'epochs': args.stage1_epochs,
+    #     'lr_mul': 1e-1,  # 学习率倍增器
+    #     'loss_weights': {
+    #         'main': 1e0,          # 主预测损失
+    #         'smoothness': 1e-5,   # 平滑性损失
+    #         'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
+    #         'angle_smoothness': 1e-2,  # 角度平滑性损失
+    #         'angle_consistency': 0e-6,  # 角度一致性损失(防止倒车)
+    #         'uniformity': 0e-4,   # 均匀性损失（点间距离方差）
+    #         'sincos_norm': 1e-1,   # sin/cos归一化损失（确保sin²+cos²≈1）
+    #         'capsize': 0.0        # 倾覆监督损失（第一阶段不启用）
+    #     }
+    # }
     stage1_config = {
         'epochs': args.stage1_epochs,
         'lr_mul': 1e-1,  # 学习率倍增器
         'loss_weights': {
-            'main': 1e0,          # 主预测损失
-            'smoothness': 1e-5,   # 平滑性损失
+            'main': 1e1,          # 主预测损失
+            'smoothness': 0e-5,   # 平滑性损失
             'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
-            'angle_smoothness': 1e-2,  # 角度平滑性损失
+            'angle_smoothness': 0e-2,  # 角度平滑性损失
             'angle_consistency': 0e-6,  # 角度一致性损失(防止倒车)
             'uniformity': 0e-4,   # 均匀性损失（点间距离方差）
             'sincos_norm': 1e-1,   # sin/cos归一化损失（确保sin²+cos²≈1）

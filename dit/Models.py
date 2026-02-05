@@ -644,30 +644,60 @@ class PathDiffusionTransformer(nn.Module):
         # nn.init.zeros_(self.detail_pred[-1].weight)
         # nn.init.zeros_(self.detail_pred[-1].bias)
         
-        # ========== 扩散参数 ==========
+        # ========== 扩散参数（时间t参数化）==========
         self.n_path_steps = n_path_steps
         self.diffusion_steps = diffusion_steps
         
-        self.register_buffer('betas', self._linear_beta_schedule(diffusion_steps))
-        alphas = 1.0 - self.betas
-        self.register_buffer('alphas_cumprod', torch.cumprod(alphas, dim=0))
+        # 时间步 t 的参数化（不再使用 beta/alpha）
+        # 索引语义与标准DDPM一致：
+        #   - timestep索引 t=0 → t_normalized=1.0 (纯数据)
+        #   - timestep索引 t=T-1 → t_normalized=0.0 (纯噪声)
+        # 加噪公式：z = t_normalized * x + (1 - t_normalized) * e
+        #   - t=0: z = 1*x + 0*e = x (纯数据)
+        #   - t=T-1: z = 0*x + 1*e = e (纯噪声)
+        self.register_buffer('timesteps_normalized', torch.linspace(1, 0, diffusion_steps))
+        
+        # 防止除零的小常数（v-loss需要更大的值避免数值不稳定）
+        # 参考文生图模型：当t接近1时，(1-t)可能非常小，导致v的计算梯度爆炸
+        # t_eps=0.05确保分母不会太小，避免数值问题
+        self.t_eps = 0.05
+        
+        # 时间步采样策略参数（用于训练时的智能采样）
+        # P_mean=-0.8：偏向较小的时间步（更接近干净数据的区域）
+        # P_std=0.8：控制采样的分散程度
+        self.register_buffer('t_sample_mean', torch.tensor(-0.8))
+        self.register_buffer('t_sample_std', torch.tensor(0.8))
     
-    def _linear_beta_schedule(self, timesteps):
+    def sample_timesteps(self, n: int, device=None):
         """
-        线性调度：对路径规划任务更稳定
+        智能时间步采样策略（参考文生图模型）
+        
+        使用sigmoid正态分布采样，避免极端值：
+        - 正态分布采样 → sigmoid映射到(0,1) → 转换为timestep索引
+        - P_mean=-0.8偏向较小时间步（接近干净数据）
+        - 避免t→0和t→1的极端情况
+        
+        Args:
+            n: 采样数量
+            device: 设备
+        
+        Returns:
+            timestep_indices: (n,) 时间步索引
         """
-        beta_start = 0.0001
-        beta_end = 0.02
-        return torch.linspace(beta_start, beta_end, timesteps)
-    
-    def _cosine_beta_schedule(self, timesteps, s=0.008):
-        """余弦调度"""
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)
+        if device is None:
+            device = self.timesteps_normalized.device
+        
+        # 正态分布采样
+        z = torch.randn(n, device=device) * self.t_sample_std + self.t_sample_mean
+        # sigmoid映射到(0,1)
+        t_continuous = torch.sigmoid(z)
+        # 转换为timestep索引（注意：t_normalized从1到0，所以需要反向映射）
+        # t_continuous=0 → 索引T-1 (纯噪声)
+        # t_continuous=1 → 索引0 (纯数据)
+        timestep_indices = ((1 - t_continuous) * (self.diffusion_steps - 1)).long()
+        timestep_indices = torch.clamp(timestep_indices, 0, self.diffusion_steps - 1)
+        
+        return timestep_indices
     
     def forward(self, map_input, noisy_path, timestep, start_pose, goal_pose):
         """
@@ -762,52 +792,78 @@ class PathDiffusionTransformer(nn.Module):
         """
         前向过程（训练时使用）
         
-        Standard Diffusion:
-            x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
+        新参数化：
+            z = t * x + (1 - t) * e
+            其中 t ∈ [0, 1]：
+                t=0: z = e (纯噪声)
+                t=1: z = x (纯数据)
         """
         if noise is None:
             noise = torch.randn_like(x_start)
         
-        # Standard Diffusion
-        sqrt_alphas = torch.sqrt(self.alphas_cumprod[t])[:, None, None]
-        sqrt_one_minus_alphas = torch.sqrt(1 - self.alphas_cumprod[t])[:, None, None]
+        # 获取归一化的时间步 t (0到1)
+        t_normalized = self.timesteps_normalized[t][:, None, None]  # (B, 1, 1)
         
-        return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
+        # 线性插值：z = t * x + (1 - t) * e
+        z = t_normalized * x_start + (1 - t_normalized) * noise
+        
+        return z
+    
+    def compute_velocity(self, x_pred, z, t):
+        """
+        从预测的 x_pred 计算速度 v
+        
+        v = (x_pred - z) / (1 - t)
+        
+        Args:
+            x_pred: (B, N, 4) - 网络预测的 x
+            z: (B, N, 4) - 加噪后的轨迹
+            t: (B,) - 时间步索引
+        
+        Returns:
+            v_pred: (B, N, 4) - 预测的速度
+        """
+        # 获取归一化的时间步 t (0到1)
+        t_normalized = self.timesteps_normalized[t][:, None, None]  # (B, 1, 1)
+        
+        # v = (x_pred - z) / (1 - t)
+        v_pred = (x_pred - z) / torch.clamp(1 - t_normalized, min=self.t_eps)
+        
+        return v_pred
     
     @torch.no_grad()
     def p_sample(self, map_input, x_t, t, start_pose, goal_pose):
         """
-        单步去噪/采样
+        单步去噪/采样（新参数化）
         
-        Standard Diffusion (DDIM):
-            - Epsilon prediction: x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
-            - X0 prediction: 直接预测 x_0
-            - V prediction: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
+        新参数化 (DDIM):
+            z_t = t * x + (1-t) * e
+            z_{t-1} = t_{prev} * x_pred + (1-t_{prev}) * e
+        
+        Args:
+            map_input: (B, 3, H, W) 输入地图
+            x_t: (B, n_path_steps, 4) 当前时刻的加噪轨迹
+            t: (B,) 当前时间步
+            start_pose: (B, 4) 起点
+            goal_pose: (B, 4) 终点
         """
         # 获取模型输出
         model_output = self.forward(map_input, x_t, t, start_pose, goal_pose)
         
-        # ===== Standard Diffusion (DDIM)采样 =====
-        # 提取alpha值
-        alpha_t = self.alphas_cumprod[t][:, None, None]
-        sqrt_alpha_t = torch.sqrt(alpha_t)
-        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        # 获取归一化的时间步
+        t_normalized = self.timesteps_normalized[t][:, None, None]
         
         # 根据prediction_type解析模型输出
         if self.prediction_type == 'epsilon':
-            pred_noise = model_output
-            pred_x0 = (x_t - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
+            pred_epsilon = model_output
+            pred_x0 = (x_t - (1 - t_normalized) * pred_epsilon) / torch.clamp(t_normalized, min=self.t_eps)
         elif self.prediction_type == 'x0':
             pred_x0 = model_output
-            pred_noise = (x_t - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
+            pred_epsilon = (x_t - t_normalized * pred_x0) / torch.clamp(1 - t_normalized, min=self.t_eps)
         elif self.prediction_type == 'v':
-            # V-prediction: v = √ᾱ_t * ε - √(1-ᾱ_t) * x_0
-            # 从v反推：
-            #   x_0 = √ᾱ_t * x_t - √(1-ᾱ_t) * v
-            #   ε = √ᾱ_t * v + √(1-ᾱ_t) * x_t
             pred_v = model_output
-            pred_x0 = sqrt_alpha_t * x_t - sqrt_one_minus_alpha_t * pred_v
-            pred_noise = sqrt_alpha_t * pred_v + sqrt_one_minus_alpha_t * x_t
+            pred_x0 = x_t + (1 - t_normalized) * pred_v
+            pred_epsilon = (x_t - t_normalized * pred_x0) / torch.clamp(1 - t_normalized, min=self.t_eps)
         else:
             raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
         
@@ -818,12 +874,9 @@ class PathDiffusionTransformer(nn.Module):
         if t[0] == 0:
             return pred_x0
         
-        # DDIM公式：x_{t-1} = √ᾱ_{t-1} * x_0 + √(1-ᾱ_{t-1}) * ε
-        alpha_prev = self.alphas_cumprod[t-1][:, None, None]
-        sqrt_alpha_prev = torch.sqrt(alpha_prev)
-        sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_prev)
-        
-        x_prev = sqrt_alpha_prev * pred_x0 + sqrt_one_minus_alpha_prev * pred_noise
+        # DDIM公式：z_{t-1} = t_{prev} * x_pred + (1-t_{prev}) * e
+        t_prev_normalized = self.timesteps_normalized[t-1][:, None, None]
+        x_prev = t_prev_normalized * pred_x0 + (1 - t_prev_normalized) * pred_epsilon
         
         return x_prev
     
@@ -872,48 +925,60 @@ class PathDiffusionTransformer(nn.Module):
         
         # 定义单步更新函数（用于梯度检查点）
         def ddim_step(x_in, t_val):
-            """单步DDIM更新（可以被checkpoint包装）"""
-            t_batch = torch.full((B,), t_val, device=device, dtype=torch.long)
+            """
+            单步DDIM更新（ODE形式，新参数化）
             
-            # 调用模型前向传播（保持梯度）
-            model_output = self.forward(map_input, x_in, t_batch, start_pose, goal_pose)
+            新参数化的DDIM更新：
+                z_t = t * x + (1-t) * e
+                预测 x_pred，然后更新 z_{t-1}
             
-            # 提取alpha值
-            alpha_t = self.alphas_cumprod[t_val]
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+            Args:
+                x_in: (B, N, 4) - 当前时刻的轨迹 z_t
+                t_val: int - 当前时间步
             
-            # 根据prediction_type解析模型输出
+            Returns:
+                x_out: (B, N, 4) - 去噪后的轨迹 z_{t-1}
+            """
+            # 创建时间步tensor
+            t_tensor = torch.full((B,), t_val, device=device, dtype=torch.long)
+            
+            # 模型预测（保持梯度）
+            model_output = self.forward(map_input, x_in, t_tensor, start_pose, goal_pose)
+            
+            # 获取归一化的时间步
+            t_norm = self.timesteps_normalized[t_val]
+            t_prev_norm = self.timesteps_normalized[t_val - 1] if t_val > 0 else torch.tensor(1.0, device=device)
+            
+            # 根据prediction_type解析输出
             if self.prediction_type == 'epsilon':
-                pred_noise = model_output
-                pred_x0 = (x_in - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
+                # 网络预测噪声 e，反推 x_pred = (z - (1-t)*e) / t
+                pred_epsilon = model_output
+                pred_x0 = (x_in - (1 - t_norm) * pred_epsilon) / torch.clamp(t_norm, min=self.t_eps)
             elif self.prediction_type == 'x0':
+                # 网络直接预测 x
                 pred_x0 = model_output
-                pred_noise = (x_in - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
+                pred_epsilon = (x_in - t_norm * pred_x0) / torch.clamp(1 - t_norm, min=self.t_eps)
             elif self.prediction_type == 'v':
+                # 网络预测速度 v = (x - z) / (1-t)
                 pred_v = model_output
-                pred_x0 = sqrt_alpha_t * x_in - sqrt_one_minus_alpha_t * pred_v
-                pred_noise = sqrt_one_minus_alpha_t * x_in + sqrt_alpha_t * pred_v
+                pred_x0 = x_in + (1 - t_norm) * pred_v
+                pred_epsilon = (x_in - t_norm * pred_x0) / torch.clamp(1 - t_norm, min=self.t_eps)
             else:
                 raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
             
             # 裁剪位置坐标到归一化范围 [-1, 1]（避免in-place操作）
-            # 使用torch.cat重新组合，而不是切片赋值
             pred_x0_pos_clamped = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)  # (B, N, 2)
             pred_x0_angle = pred_x0[:, :, 2:4]  # (B, N, 2)
             pred_x0 = torch.cat([pred_x0_pos_clamped, pred_x0_angle], dim=2)  # (B, N, 4)
             
-            # 如果是最后一步，直接返回 x_0
+            # DDIM去噪
             if t_val == 0:
-                return pred_x0
+                # 最后一步直接返回 pred_x0
+                x_out = pred_x0
+            else:
+                # DDIM更新：z_{t-1} = t_{prev} * x_pred + (1 - t_{prev}) * e
+                x_out = t_prev_norm * pred_x0 + (1 - t_prev_norm) * pred_epsilon
             
-            # DDIM公式：计算 x_{t-1}（ODE更新）
-            alpha_prev = self.alphas_cumprod[t_val-1]
-            sqrt_alpha_prev = torch.sqrt(alpha_prev)
-            sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_prev)
-            
-            # x_{t-1} = √ᾱ_{t-1} * pred_x0 + √(1-ᾱ_{t-1}) * pred_ε
-            x_out = sqrt_alpha_prev * pred_x0 + sqrt_one_minus_alpha_prev * pred_noise
             return x_out
         
         # 迭代ODE采样（保持梯度连接）
