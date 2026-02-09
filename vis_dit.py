@@ -391,10 +391,10 @@ if __name__ == "__main__":
     epoch = 4
     stage = 1
     
-    ema = True
-    # ema = False
-    ema_decay = 0.99
-    # ema_decay = 0.999
+    # ema = True
+    ema = False
+    # ema_decay = 0.99
+    ema_decay = 0.999
     
     # =================== 多轨迹配置 ===================
     # 设置为1: 只生成单条轨迹（确定性预测）

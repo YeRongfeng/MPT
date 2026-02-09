@@ -720,7 +720,6 @@ class PathDiffusionTransformer(nn.Module):
         # 使用logit-normal分布，避免t=0和t=1的极端值
         self.register_buffer('t_sample_mean', torch.tensor(-0.8))  # logit空间的均值
         self.register_buffer('t_sample_std', torch.tensor(0.8))   # logit空间的标准差
-        self.register_buffer('t_uniform_prob', torch.tensor(0.1))   # logit空间的均匀采样概率比例
     
     def sample_timesteps(self, n: int, device=None):
         """
@@ -740,16 +739,10 @@ class PathDiffusionTransformer(nn.Module):
         if device is None:
             device = self.t_sample_mean.device
         
-        selector = torch.rand(n, device=device)
-        
         # logit-normal分布采样
         z = torch.randn(n, device=device) * self.t_sample_std + self.t_sample_mean
-        t_logit_normal = torch.sigmoid(z)
-        # 均匀采样
-        t_uniform = torch.rand(n, device=device)
-        
-        # 混合采样
-        t_continuous = torch.where(selector < self.t_uniform_prob, t_uniform, t_logit_normal)
+        # sigmoid映射到(0,1)，自然避免极端值
+        t_continuous = torch.sigmoid(z)
         
         # 可选：进一步限制范围，避免数值问题
         t_continuous = torch.clamp(t_continuous, min=1e-5, max=1.0 - 1e-5)
