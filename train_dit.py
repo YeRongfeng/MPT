@@ -511,24 +511,46 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # ===== Rectified Flow加噪: z_t = (1-t) * x_0 + t * x_1 =====
     noisy_cp, noise_cp = model.q_sample(middle_cp_normalized, t, noise_cp)  # (B, 24, 2)
     
-    # 获取模型预测：输出(B, 24, 2) = 速度场预测 v_θ
+    # 获取模型预测：输出(B, 24, 2)
     model_output = model(map_input, noisy_cp, t, start_normalized, goal_normalized)
-    
-    # ===== Rectified Flow损失: 速度匹配 =====
-    # 真实速度场（常数）: v = x_1 - x_0 = noise_cp - middle_cp_normalized
-    target_velocity = noise_cp - middle_cp_normalized  # (B, 24, 2)
-    
-    # 模型预测速度: v_θ = model_output
-    pred_velocity = model_output  # (B, 24, 2)
-    
-    # MSE损失: ||v_θ - v||^2
-    main_loss = F.mse_loss(pred_velocity, target_velocity)
+    # ===== 统一计算真值用于 Loss (在循环外或采样后直接计算) =====
+    target_v = noise_cp - middle_cp_normalized  # v = epsilon - x0
+    t_eps = 1e-6
+
+    # ===== 修改 prediction_type 逻辑 =====
+    if prediction_type == 'epsilon':
+        pred_epsilon = model_output
+        # x0 = (z_t - t*eps) / (1-t)
+        pred_x0 = (noisy_cp - t.view(-1,1,1) * pred_epsilon) / (1 - t.view(-1,1,1) + t_eps)
+        pred_v = pred_epsilon - pred_x0 # 因为 v = eps - x0
+        
+    elif prediction_type == 'x0':
+        pred_x0 = model_output
+        # eps = (z_t - (1-t)*x0) / t
+        pred_epsilon = (noisy_cp - (1 - t.view(-1,1,1)) * pred_x0) / (t.view(-1,1,1) + t_eps)
+        pred_v = pred_epsilon - pred_x0
+        
+    elif prediction_type == 'v':
+        pred_v = model_output
+        # 根据 z_t = x0 + t*v -> x0 = z_t - t*v
+        pred_x0 = noisy_cp - t.view(-1,1,1) * pred_v
+        # eps = v + x0
+        pred_epsilon = pred_v + pred_x0
+
+    # ===== 修改 loss_type 逻辑 =====
+    if loss_type == 'epsilon':
+        main_loss = F.mse_loss(pred_epsilon, noise_cp)
+    elif loss_type == 'x0':
+        main_loss = F.mse_loss(pred_x0, middle_cp_normalized)
+    elif loss_type == 'v':
+        # 这里的真值应该是 epsilon - x0，而不是代码中复杂的除法
+        main_loss = F.mse_loss(pred_v, target_v)
     
     # =================== 计算辅助损失（可选） ===================
     # 注意：由于我们现在只预测控制点，辅助损失的计算需要先重建轨迹
     
     # 初始化所有损失为零tensor（保持梯度连接）
-    dummy_loss = pred_velocity.sum() * 0.0
+    dummy_loss = pred_v.sum() * 0.0
     smoothness_loss = dummy_loss.clone()
     curvature_loss = dummy_loss.clone()
     angle_smoothness_loss = dummy_loss.clone()

@@ -917,7 +917,17 @@ class PathDiffusionTransformer(nn.Module):
             
             # 预测速度场 v_θ(z_t, t)
             # 模型输出即为速度预测（Rectified Flow: v = x_1 - x_0）
-            v_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
+            if self.prediction_type == 'v':
+                v_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
+            elif self.prediction_type == 'x0':
+                x0_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
+                # 计算速度场 v = x_1 - x_0
+                v_pred = (z - x0_pred) / t_curr
+            elif self.prediction_type == 'epsilon':
+                noise_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
+                # 计算速度场 v = (x_1 - x_0) = (z - x_0) / t
+                x0_pred = z - t_curr * noise_pred
+                v_pred = (z - x0_pred) / t_curr
             
             # Euler步进：z_{t+dt} = z_t + dt * v
             z = z + dt * v_pred
@@ -940,29 +950,6 @@ class PathDiffusionTransformer(nn.Module):
     
     @torch.no_grad()
     def sample_heun(self, map_input, start_pose, goal_pose, num_steps=None, reconstruct_trajectory=True, num_traj_points=100):
-        """
-        二阶Heun ODE求解器（改进的Euler方法）
-        
-        Heun方法（预测-校正）：
-            1. 预测：z_pred = z_t + dt * v_θ(z_t, t)
-            2. 校正：z_{t+dt} = z_t + dt * (v_θ(z_t, t) + v_θ(z_pred, t+dt)) / 2
-        
-        相比Euler方法，Heun使用两次函数评估，精度更高。
-        
-        Args:
-            map_input: (B, 3, H, W) 输入地图
-            start_pose: (B, 4) 起点
-            goal_pose: (B, 4) 终点
-            num_steps: ODE求解步数（默认使用self.diffusion_steps）
-            reconstruct_trajectory: 是否使用B样条重建完整轨迹
-            num_traj_points: 重建轨迹的点数
-        
-        Returns:
-            如果 reconstruct_trajectory=True:
-                full_traj: (B, num_traj_points, 2) 完整轨迹
-            否则:
-                control_points: (B, n_path_steps+2, 2) 控制点（含起终点）
-        """
         if num_steps is None:
             num_steps = self.diffusion_steps
         
@@ -975,34 +962,66 @@ class PathDiffusionTransformer(nn.Module):
         # 时间步划分：从t=1到t=0
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
         
+        # 定义一个辅助函数来计算速度 v，避免重复代码
+        def get_velocity(z_in, t_scalar):
+            # 将标量 t 扩展为 batch
+            t_batch = torch.full((B,), t_scalar, device=device)
+            
+            # 模型前向
+            model_out = self.forward(map_input, z_in, t_batch, start_pose, goal_pose)
+            
+            if self.prediction_type == 'v':
+                return model_out
+            
+            elif self.prediction_type == 'x0':
+                # v = (z_t - x_0) / t
+                # 【关键修复】：处理 t 接近 0 的情况，防止除以零爆炸
+                if t_scalar < 1e-5:
+                    return None # 标记无法计算
+                return (z_in - model_out) / t_scalar
+                
+            elif self.prediction_type == 'epsilon':
+                # x0 = z - t * eps
+                # v = (z - x0) / t = eps
+                # 实际上 Rectified Flow 中如果预测 eps，eps 本身不太等同于 v (v = x1 - x0)，
+                # 但根据你之前的代码逻辑推导：
+                x0_pred = z_in - t_scalar * model_out
+                if t_scalar < 1e-5:
+                    return None
+                return (z_in - x0_pred) / t_scalar
+            return model_out
+
         # ODE积分（从t=1到t=0）
         for i in range(num_steps):
             t_curr = timesteps[i]
             t_next = timesteps[i + 1]
             dt = t_next - t_curr  # 负数
             
-            # 当前时间步
-            t_curr_batch = torch.full((B,), t_curr, device=device)
-            t_next_batch = torch.full((B,), t_next, device=device)
+            # 1. 第一次评估：v1 = v(z_curr, t_curr)
+            v1 = get_velocity(z, t_curr)
             
-            # 第一次评估：v_θ(z_t, t)
-            v1 = self.forward(map_input, z, t_curr_batch, start_pose, goal_pose)
+            # 理论上 t_curr 从 1.0 开始，不会是 0，除非一开始就是 0
+            if v1 is None: v1 = torch.zeros_like(z) 
             
-            # Euler预测步
+            # 2. Euler 预测步
             z_pred = z + dt * v1
             
-            # 第二次评估：v_θ(z_pred, t+dt)
-            v2 = self.forward(map_input, z_pred, t_next_batch, start_pose, goal_pose)
+            # 3. 第二次评估：v2 = v(z_pred, t_next)
+            # 【关键修复】：这里不能直接调 forward，必须转换！
+            v2 = get_velocity(z_pred, t_next)
             
-            # Heun校正：平均两次速度
-            z = z + dt * (v1 + v2) / 2
+            # 4. Heun 校正
+            # 如果是最后一步 (t_next == 0)，无法计算 v2 (除以零)，则退化为 Euler
+            if v2 is None:
+                z = z + dt * v1  # 最后一步仅使用 Euler
+            else:
+                z = z + dt * (v1 + v2) / 2 # Heun
         
         # 组装完整控制点
         start_xy = start_pose[:, :2].unsqueeze(1)
         goal_xy = goal_pose[:, :2].unsqueeze(1)
         control_points = torch.cat([start_xy, z, goal_xy], dim=1)
         
-        # 可选：B样条重建
         if reconstruct_trajectory:
             full_traj = reconstruct_from_control_points(
                 control_points,

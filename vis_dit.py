@@ -391,8 +391,8 @@ if __name__ == "__main__":
     epoch = 4
     stage = 1
     
-    # ema = True
-    ema = False
+    ema = True
+    # ema = False
     # ema_decay = 0.99
     ema_decay = 0.999
     
@@ -409,8 +409,8 @@ if __name__ == "__main__":
     # =================== ODE求解器配置 ===================
     # 'euler': 一阶Euler方法（快速，但精度较低）
     # 'heun': 二阶Heun方法（较慢，但精度更高）
-    # solver = 'heun'  # 推荐：精度更高
-    solver = 'euler'  # 可选：速度更快
+    solver = 'heun'  # 推荐：精度更高
+    # solver = 'euler'  # 可选：速度更快
     # ==================================================
     
     # =================== 样条插值配置 ===================
@@ -423,7 +423,7 @@ if __name__ == "__main__":
 
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000012']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000010']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     save_path = 'predictions'
 
     modelFolder = 'data/sim'
