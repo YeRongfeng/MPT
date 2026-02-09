@@ -1341,9 +1341,9 @@ class UnevenPathDataLoader(Dataset):
         # 2. 加载路径数据
         with open(path_file, 'rb') as f:
             path_data = pickle.load(f)
-        valid = path_data['valid']  # 是否有效路径
-        if not valid:
-            return None  # 如果路径无效，返回None    
+        # valid = path_data['valid']  # 是否有效路径
+        # if not valid:
+        #     return None  # 如果路径无效，返回None    
         
         trajectory = path_data['path']  # [N+2, 3]
         

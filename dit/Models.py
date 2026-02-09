@@ -50,8 +50,80 @@ from transformer.Layers import EncoderLayer, DecoderLayer, PoseWiseEncoderLayer
 from einops.layers.torch import Rearrange
 from einops import rearrange
 
+# B样条工具
+from bspline_utils import (
+    fit_bspline_least_squares,
+    reconstruct_from_control_points,
+    DifferentiableBSpline
+)
+
 
 import math
+
+
+class TrajDiTBlock(nn.Module):
+    """
+    路径规划专用DiT Block，支持Cross-Attention
+    结构:
+        Input (Path Tokens)
+            |
+        AdaLN (Time, Start, Goal) -> Norm
+            |
+        Self-Attention (路径点之间的平滑性/几何关系)
+            |
+        AdaLN -> Norm
+            |
+        Cross-Attention (路径点 查询 地图特征 -> 避障)
+            |
+        AdaLN -> Norm
+            |
+        Feed Forward
+            |
+        Output
+    """
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+            super().__init__()
+            self.n_heads = n_heads
+            self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+            self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+            self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+            self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+            self.norm3 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+            self.ffn = nn.Sequential(
+                    nn.Linear(d_model, d_ff),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_ff, d_model),
+                    nn.Dropout(dropout)
+            )
+            self.adaLN_modulation = nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(d_model, 9 * d_model, bias=True)
+            )
+            nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, map_feat, c):
+            params = self.adaLN_modulation(c).chunk(9, dim=-1)
+            (shift_msa, scale_msa, gate_msa, 
+                shift_mca, scale_mca, gate_mca, 
+                shift_mlp, scale_mlp, gate_mlp) = params
+            # 1. Self-Attention
+            x_norm = self.norm1(x)
+            x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+            attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
+            x = x + gate_msa.unsqueeze(1) * attn_out
+            # 2. Cross-Attention
+            x_norm = self.norm2(x)
+            x_norm = x_norm * (1 + scale_mca.unsqueeze(1)) + shift_mca.unsqueeze(1)
+            attn_out, _ = self.cross_attn(x_norm, map_feat, map_feat)
+            x = x + gate_mca.unsqueeze(1) * attn_out
+            # 3. FFN
+            x_norm = self.norm3(x)
+            x_norm = x_norm * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+            ffn_out = self.ffn(x_norm)
+            x = x + gate_mlp.unsqueeze(1) * ffn_out
+            return x
 
 
 class DiTBlock(nn.Module):
@@ -496,28 +568,31 @@ class UnevenTransformer(Transformer):
 class PathDiffusionTransformer(nn.Module):
     """
     基于DiT架构的路径扩散模型（从UnevenTransformer改造）
-    
+    【控制点语义】
+    - 完整B样条：26个控制点 = 起点(1) + 中间点(24) + 终点(1)
+    - 起点/终点：固定的，由start_pose和goal_pose决定
+    - n_path_steps=24：网络预测的中间控制点数量（不包含起终点）
     【架构设计】
     原始UnevenTransformer：地图 → CNN → Transformer blocks → 预测头
     改造为扩散模型：地图+噪声路径 → CNN特征提取 → token融合 → DiT blocks(时间步条件) → 噪声预测
-    
-    【核心改动】
-    1. 输入增加：噪声路径 x_t
-    2. Transformer blocks → DiT blocks（增加时间步条件）
-    3. 输出改为：预测噪声 ε
-    
+    dit_blocks基于TrajDiTBlock实现，支持Cross-Attention融合地图特征
     【训练目标】
-    - 损失：MSE(pred_noise, true_noise)
-    
+    - 损失：MSE(pred, true)
+    - 预测空间：噪声ε、原始数据x0、velocity v
+    依据prediction_type和loss_type设定
+    当前主要以x0预测+v损失为主
     【采样】
-    - DDIM采样
+    - ode采样(Euler或Heun)
+    当前采样基于rectified flow方法实现，后续可拓展为meanflow，再进一步修改为pixelMeanFlow
     """
     
     def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, 
                  pad_idx, dropout, n_position, train_shape, 
-                 n_path_steps=20, diffusion_steps=50, prediction_type='epsilon', loss_type=None):
+                 n_path_steps=24, diffusion_steps=50, prediction_type='epsilon', loss_type=None):
         """
         Args:
+            n_path_steps: 中间控制点数量（默认24，不包含起终点）
+                         完整B样条需要26=1(起点)+24(中间)+1(终点)个控制点
             prediction_type: 'epsilon' (预测噪声), 'x0' (预测原始数据), 或 'v' (预测velocity)
             loss_type: 'epsilon', 'x0', 或 'v' - 损失函数的目标类型，如果为None则与prediction_type相同
         """
@@ -559,39 +634,26 @@ class PathDiffusionTransformer(nn.Module):
         self.position_enc = PositionalEncoding(d_model, n_position=n_position, train_shape=train_shape)
         self.dropout = nn.Dropout(p=dropout)
         
-        # ========== 地图全局pooling ==========
-        self.map_pool = nn.AdaptiveAvgPool2d((1, 1))  # (B, D, H, W) -> (B, D, 1, 1)
-        
         # ========== 条件融合MLP ==========
-        # 将时间步、地图特征和起点终点融合
-        self.condition_mlp = nn.Sequential(
-            nn.Linear(d_model * 3, d_model * 4),  # 3 = time + map + start_goal
+        # 将时间步、起点和终点融合为全局条件
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(d_model * 3, d_model * 4),  # 3 = time + start + goal
             nn.GELU(),
             nn.Linear(d_model * 4, d_model)
         )
         
-        # ========== 起点终点编码（改进：分开处理）==========
-        # 关键改进1：起点和终点独立编码，保持语义清晰
-        self.start_embedder = nn.Sequential(
-            nn.Linear(4, d_model),  # start(x,y,sin(θ),cos(θ)) - 4维角度编码
+        # ========== 起点终点编码（用于条件调制）==========
+        # 将起点和终点编码为条件向量（不作为独立tokens）
+        self.pose_embedder = nn.Sequential(
+            nn.Linear(4, d_model),  # (x,y,cos(θ),sin(θ)) - 4维角度编码
             nn.GELU(),
             nn.Linear(d_model, d_model)
-        )
-        self.goal_embedder = nn.Sequential(
-            nn.Linear(4, d_model),  # goal(x,y,sin(θ),cos(θ)) - 4维角度编码
-            nn.GELU(),
-            nn.Linear(d_model, d_model)
-        )
-        # 关键改进2：学习起点终点的关系（方向、距离等）
-        self.start_goal_fusion = nn.Sequential(
-            nn.Linear(d_model * 2, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model)
         )
         
         # ========== 路径Patchify ==========
+        # 关键改进：输入只有2维(x,y)控制点，不包含theta
         self.path_patchify = nn.Sequential(
-            nn.Linear(4, d_model // 2),  # 4维输入: (x,y,sin(θ),cos(θ))
+            nn.Linear(2, d_model // 2),  # 2维输入: (x,y) 控制点
             nn.GELU(),
             nn.Linear(d_model // 2, d_model)
         )
@@ -604,15 +666,14 @@ class PathDiffusionTransformer(nn.Module):
         # ========== 时间步嵌入 ==========
         self.time_embedder = TimestepEmbedder(d_model)
         
-        # ========== 改进的DiT Blocks ==========
-        # 标准DiT架构：Self-Attention + FFN + AdaLN调制
+        # ========== 改进的DiT Blocks（带Cross-Attention） ========== 
         self.dit_blocks = nn.ModuleList([
-            DiTBlock(
+            TrajDiTBlock(
                 d_model=d_model,
                 n_heads=n_heads, 
-                d_ff=d_model * 4,  # FFN hidden dim (DiT标准设置)
+                d_ff=d_inner,
                 dropout=dropout
-            ) 
+            )
             for _ in range(n_layers)
         ])
         
@@ -628,583 +689,405 @@ class PathDiffusionTransformer(nn.Module):
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 4)  # (x, y, sin, cos)
+            nn.Linear(d_model // 2, 2)  # (x, y)
         )
         
-        # # 细节预测头（用于精细化调整主预测）- 简化为两层
-        # detail_in_dim = d_model + 4  # DiT特征 + 主预测的完整4维
+        # # 细节预测头（用于精细化调整主预测）
+        # detail_in_dim = d_model + 2  # DiT特征 + 主预测的完整2维
         # self.detail_pred = nn.Sequential(
         #     nn.Linear(detail_in_dim, d_model // 2),
         #     nn.GELU(),
         #     nn.Dropout(dropout),
-        #     nn.Linear(d_model // 2, 4)  # 输出增量 (dx, dy, d_sin, d_cos)
+        #     nn.Linear(d_model // 2, 3)  # 输出增量 (dx, dy， theta)
         # )
         
         # # Zero初始化细节预测头
         # nn.init.zeros_(self.detail_pred[-1].weight)
         # nn.init.zeros_(self.detail_pred[-1].bias)
         
-        # ========== 扩散参数（时间t参数化）==========
+        # ========== Rectified Flow 连续时间参数化 ==========
         self.n_path_steps = n_path_steps
-        self.diffusion_steps = diffusion_steps
+        self.diffusion_steps = diffusion_steps  # 仅用于采样步数，不再作为离散索引
         
-        # 时间步 t 的参数化（不再使用 beta/alpha）
-        # 索引语义与标准DDPM一致：
-        #   - timestep索引 t=0 → t_normalized=1.0 (纯数据)
-        #   - timestep索引 t=T-1 → t_normalized=0.0 (纯噪声)
-        # 加噪公式：z = t_normalized * x + (1 - t_normalized) * e
-        #   - t=0: z = 1*x + 0*e = x (纯数据)
-        #   - t=T-1: z = 0*x + 1*e = e (纯噪声)
-        self.register_buffer('timesteps_normalized', torch.linspace(1, 0, diffusion_steps))
-        
-        # 防止除零的小常数（v-loss需要更大的值避免数值不稳定）
-        # 参考文生图模型：当t接近1时，(1-t)可能非常小，导致v的计算梯度爆炸
-        # t_eps=0.05确保分母不会太小，避免数值问题
-        self.t_eps = 0.05
+        # Rectified Flow 时间语义：
+        #   t=0: z_0 = x_0 (纯数据)
+        #   t=1: z_1 = x_1 (纯噪声)
+        # 加噪公式：z_t = (1-t) * x_0 + t * x_1
+        # 速度场：v_t = x_1 - x_0 (直线路径)
+        # ODE: dz/dt = v_θ(z_t, t)
         
         # 时间步采样策略参数（用于训练时的智能采样）
-        # P_mean=-0.8：偏向较小的时间步（更接近干净数据的区域）
-        # P_std=0.8：控制采样的分散程度
-        self.register_buffer('t_sample_mean', torch.tensor(-0.8))
-        self.register_buffer('t_sample_std', torch.tensor(0.8))
+        # 使用logit-normal分布，避免t=0和t=1的极端值
+        self.register_buffer('t_sample_mean', torch.tensor(0.0))  # logit空间的均值
+        self.register_buffer('t_sample_std', torch.tensor(1.0))   # logit空间的标准差
     
     def sample_timesteps(self, n: int, device=None):
         """
-        智能时间步采样策略（参考文生图模型）
+        连续时间步采样策略（Rectified Flow）
         
-        使用sigmoid正态分布采样，避免极端值：
-        - 正态分布采样 → sigmoid映射到(0,1) → 转换为timestep索引
-        - P_mean=-0.8偏向较小时间步（接近干净数据）
-        - 避免t→0和t→1的极端情况
+        使用logit-normal分布采样，避免t→0和t→1的极端值：
+        - 正态分布采样 → sigmoid映射到(0,1) → 连续时间 t ∈ (0,1)
+        - 避免t=0和t=1的数值不稳定问题
         
         Args:
             n: 采样数量
             device: 设备
         
         Returns:
-            timestep_indices: (n,) 时间步索引
+            t_continuous: (n,) 连续时间 t ∈ (0, 1)
         """
         if device is None:
-            device = self.timesteps_normalized.device
+            device = self.t_sample_mean.device
         
-        # 正态分布采样
+        # logit-normal分布采样
         z = torch.randn(n, device=device) * self.t_sample_std + self.t_sample_mean
-        # sigmoid映射到(0,1)
+        # sigmoid映射到(0,1)，自然避免极端值
         t_continuous = torch.sigmoid(z)
-        # 转换为timestep索引（注意：t_normalized从1到0，所以需要反向映射）
-        # t_continuous=0 → 索引T-1 (纯噪声)
-        # t_continuous=1 → 索引0 (纯数据)
-        timestep_indices = ((1 - t_continuous) * (self.diffusion_steps - 1)).long()
-        timestep_indices = torch.clamp(timestep_indices, 0, self.diffusion_steps - 1)
         
-        return timestep_indices
+        # 可选：进一步限制范围，避免数值问题
+        t_continuous = torch.clamp(t_continuous, min=1e-5, max=1.0 - 1e-5)
+        
+        return t_continuous
     
     def forward(self, map_input, noisy_path, timestep, start_pose, goal_pose):
         """
-        扩散模型前向传播（改造自UnevenTransformer）
+        扩散模型前向传播（解耦数据流版本）- Rectified Flow
+        
+        【数据流架构】
+        1. Path Tokens (x): 作为Query在DiT主干中流动并不断更新
+        2. Map Tokens: 作为Key/Value在Cross-Attention中被查询（保持不变）
+        3. Condition (c): Time + Start + Goal 融合后通过AdaLN调制每一层
         
         Args:
             map_input: (B, 3, H, W) 输入地图
-            noisy_path: (B, n_path_steps, 4) 加噪后的路径 x_t (x,y,sin(θ),cos(θ))
-            timestep: (B,) 扩散时间步 t ∈ [0, diffusion_steps-1]
-            start_pose: (B, 4) 起点坐标 (x,y,sin(θ),cos(θ)) - 已归一化
-            goal_pose: (B, 4) 终点坐标 (x,y,sin(θ),cos(θ)) - 已归一化
+            noisy_path: (B, n_path_steps, 2) 加噪后的中间控制点 x_t (x,y)
+                       n_path_steps=24，不包含起终点
+            timestep: (B,) 连续时间步 t ∈ [0, 1]
+                     t=0: 纯数据, t=1: 纯噪声
+            start_pose: (B, 4) 起点坐标 (x,y,cos(θ),sin(θ)) - 已归一化
+            goal_pose: (B, 4) 终点坐标 (x,y,cos(θ),sin(θ)) - 已归一化
             
         Returns:
-            model_output: (B, n_path_steps, 4) 
-                - 如果 prediction_type='epsilon': 预测的噪声 ε
-                - 如果 prediction_type='x0': 预测的原始数据 x_0 (x,y,sin(θ),cos(θ))
+            model_output: (B, n_path_steps, 2) 预测的速度场 v = x_1 - x_0
         """
         B = map_input.shape[0]
         
-        # ========== 步骤1：CNN提取地图特征 ==========
+        # ========== 1. 编码地图 (Context) ==========
         map_feat = self.map_fe(map_input)  # (B, D, Hf, Wf)
         conv_map_shape = map_feat.shape[-2:]
         map_tokens = self.reorder_dims(map_feat)  # (B, N_map, D)
         
-        # 添加位置编码
+        # 添加位置编码（地图的空间位置信息）
         map_tokens = self.position_enc(
             map_tokens, 
             conv_shape=conv_map_shape if not self.training else None
         )
+        # Map tokens作为KV，不需要Dropout和LayerNorm（在Block内部处理）
         
-        # ========== 步骤2：起点终点作为独立tokens（改进）==========
-        # 关键改进：显式地将起点终点加入序列，而非仅作为条件
-        c_start = self.start_embedder(start_pose).unsqueeze(1)  # (B, 1, D)
-        c_goal = self.goal_embedder(goal_pose).unsqueeze(1)     # (B, 1, D)
+        # ========== 2. 编码路径 + 起终点 (Query Sequence) ==========
+        # 2.1 编码中间路径点 (B, N, D)
+        path_tokens = self.path_patchify(noisy_path)
+        # 添加 Learnable Position Embedding (仅针对中间路径点)
+        path_tokens = path_tokens + self.path_pos_embed  # (B, N, D)
         
-        # ========== 步骤3：路径Patchify ==========
-        path_tokens = self.path_patchify(noisy_path)  # (B, n_path_steps, D)
-        path_tokens = path_tokens + self.path_pos_embed
+        # 2.2 编码起终点 (B, 1, D)
+        # 使用 pose_embedder 提取 x,y,cos,sin 特征
+        start_token = self.pose_embedder(start_pose).unsqueeze(1)
+        goal_token = self.pose_embedder(goal_pose).unsqueeze(1)
         
-        # ========== 步骤4：融合所有tokens（改进）==========
-        # 关键改进：序列变为 [起点, 终点, 地图tokens, 路径tokens]
-        # 这样路径可以直接attend到起点/终点，不仅仅是通过条件调制
-        combined_tokens = torch.cat([
-            c_start,      # [B, 1, D] - 起点token
-            c_goal,       # [B, 1, D] - 终点token  
-            map_tokens,   # [B, N_map, D] - 地图空间tokens
-            path_tokens   # [B, n_path_steps, D] - 路径tokens
-        ], dim=1)  # (B, 2+N_map+n_path_steps, D)
+        # 【关键修改】拼接顺序: [Start, Path, Goal] -> (B, N+2, D)
+        # 注意：这里不再对 combined 整体加 pos_embed，因为 path_pos_embed 已经加在中间了
+        # Start/Goal 本身就是绝对位置信息，不需要额外的序列位置编码
+        combined_tokens = torch.cat([start_token, path_tokens, goal_token], dim=1)
         
-        # 正确顺序：LayerNorm → Dropout
+        # 2.3 预处理
+        # 建议先 Norm 再进入 Block，保证分布一致性
         combined_tokens = self.layer_norm(combined_tokens)
         combined_tokens = self.dropout(combined_tokens)
         
-        # ========== 步骤5：全局条件（用于DiT调制）==========
-        c_time = self.time_embedder(timestep)  # (B, D) - 时间步条件
-        map_global = self.map_pool(map_feat).squeeze(-1).squeeze(-1)  # (B, D) - 地图全局特征
+        # ========== 3. 编码条件 (Condition) ==========
+        t_emb = self.time_embedder(timestep)      # (B, D) - 时间步
+        s_emb = self.pose_embedder(start_pose)    # (B, D) - 起点
+        g_emb = self.pose_embedder(goal_pose)     # (B, D) - 终点
         
-        # 起点终点的关系特征（方向、距离等）
-        c_start_flat = c_start.squeeze(1)  # (B, D)
-        c_goal_flat = c_goal.squeeze(1)    # (B, D)
-        c_start_goal = self.start_goal_fusion(torch.cat([c_start_flat, c_goal_flat], dim=-1))  # (B, D)
+        # 融合所有全局条件 -> (B, D)
+        cond = self.cond_mlp(torch.cat([t_emb, s_emb, g_emb], dim=-1))
+        # cond = t_emb  # 仅使用时间步作为条件
         
-        # 【阶段1】基础条件：时间 + 地图 + 起点终点关系
-        c = self.condition_mlp(torch.cat([c_time, map_global, c_start_goal], dim=-1))  # (B, D)
+        # ========== 4. DiT Blocks（解耦数据流） ==========
+        # x (Query): combined tokens，在主干中不断更新
+        # map_tokens (Key/Value): 地图tokens，保持不变，提供环境信息
+        # cond: 全局条件，通过AdaLN调制每一层
+        x = combined_tokens
+        for block in self.dit_blocks:
+            x = block(x, map_tokens, cond)
+            
+        x = self.layer_norm(x)  # 最后LayerNorm
         
-        # ========== 步骤6：DiT Blocks ==========
-        # 标准DiT架构：所有tokens通过self-attention交互
-        
-        for dit_block in self.dit_blocks:
-            combined_tokens = dit_block(x=combined_tokens, c=c)
-        
-        # ========== 步骤7：预测头 ==========
-        # 序列结构：[起点(1), 终点(1), 地图(N_map), 路径(n_path_steps)]
-        # 只取最后n_path_steps个tokens作为路径预测
-        path_tokens_out = combined_tokens[:, -(self.n_path_steps):, :]  # (B, n_path_steps, D)
-        
-        # 主预测头：粗略预测
-        main_output = self.main_pred(path_tokens_out)  # (B, n_path_steps, 4)
-        
-        # # 细节预测头：基于主预测和DiT特征的精细化增量
-        # detail_input = torch.cat([path_tokens_out, main_output], dim=-1)  # (B, n_path_steps, D+4)
-        # detail_output = self.detail_pred(detail_input)  # (B, n_path_steps, 4) - 增量
-        
-        # # 最终输出 = 主预测 + 细节增量
-        # model_output = main_output + detail_output  # (B, n_path_steps, 4)
-        
-        model_output = main_output
+        # ========== 5. 输出预测 ==========
+        middle_feats = x[:, 1:-1, :]  # 提取中间控制点特征，去掉起终点 (B, n_path_steps, D)
+        model_output = self.main_pred(middle_feats)  # (B, n_path_steps, 2)
         
         return model_output
     
     def q_sample(self, x_start, t, noise=None):
         """
-        前向过程（训练时使用）
+        Rectified Flow 前向加噪过程
         
-        新参数化：
-            z = t * x + (1 - t) * e
-            其中 t ∈ [0, 1]：
-                t=0: z = e (纯噪声)
-                t=1: z = x (纯数据)
+        直线插值（Rectified Flow核心）：
+            z_t = (1-t) * x_0 + t * x_1
+            
+        其中：
+            x_0: 真实数据（t=0时为纯数据）
+            x_1: 噪声（t=1时为纯噪声）
+            t ∈ [0, 1]：连续时间
+        
+        速度场（常数，沿直线）：
+            v = x_1 - x_0
+        
+        Args:
+            x_start: (B, N, D) 真实数据 x_0
+            t: (B,) 连续时间 t ∈ [0, 1]
+            noise: (B, N, D) 噪声 x_1，如果为None则随机生成
+        
+        Returns:
+            z_t: (B, N, D) 加噪数据
+            noise: (B, N, D) 使用的噪声（用于计算损失）
         """
         if noise is None:
             noise = torch.randn_like(x_start)
         
-        # 获取归一化的时间步 t (0到1)
-        t_normalized = self.timesteps_normalized[t][:, None, None]  # (B, 1, 1)
+        # 扩展时间维度以匹配数据形状
+        t = t.view(-1, 1, 1)  # (B, 1, 1)
         
-        # 线性插值：z = t * x + (1 - t) * e
-        z = t_normalized * x_start + (1 - t_normalized) * noise
+        # Rectified Flow: z_t = (1-t) * x_0 + t * x_1
+        z_t = (1 - t) * x_start + t * noise
         
-        return z
-    
-    def compute_velocity(self, x_pred, z, t):
-        """
-        从预测的 x_pred 计算速度 v
-        
-        v = (x_pred - z) / (1 - t)
-        
-        Args:
-            x_pred: (B, N, 4) - 网络预测的 x
-            z: (B, N, 4) - 加噪后的轨迹
-            t: (B,) - 时间步索引
-        
-        Returns:
-            v_pred: (B, N, 4) - 预测的速度
-        """
-        # 获取归一化的时间步 t (0到1)
-        t_normalized = self.timesteps_normalized[t][:, None, None]  # (B, 1, 1)
-        
-        # v = (x_pred - z) / (1 - t)
-        v_pred = (x_pred - z) / torch.clamp(1 - t_normalized, min=self.t_eps)
-        
-        return v_pred
+        return z_t, noise
     
     @torch.no_grad()
-    def p_sample(self, map_input, x_t, t, start_pose, goal_pose):
+    def sample_euler(self, map_input, start_pose, goal_pose, num_steps=None, reconstruct_trajectory=True, num_traj_points=100):
         """
-        单步去噪/采样（新参数化）
+        一阶Euler ODE求解器（Rectified Flow采样）
         
-        新参数化 (DDIM):
-            z_t = t * x + (1-t) * e
-            z_{t-1} = t_{prev} * x_pred + (1-t_{prev}) * e
+        ODE求解：
+            dz/dt = v_θ(z_t, t)
+            
+        Euler方法（一阶）：
+            z_{t+dt} = z_t + dt * v_θ(z_t, t)
+        
+        在Rectified Flow中：
+            - 模型直接预测速度场 v = x_1 - x_0
+            - ODE从 t=1 (纯噪声) 积分到 t=0 (纯数据)
         
         Args:
             map_input: (B, 3, H, W) 输入地图
-            x_t: (B, n_path_steps, 4) 当前时刻的加噪轨迹
-            t: (B,) 当前时间步
-            start_pose: (B, 4) 起点
-            goal_pose: (B, 4) 终点
-        """
-        # 获取模型输出
-        model_output = self.forward(map_input, x_t, t, start_pose, goal_pose)
-        
-        # 获取归一化的时间步
-        t_normalized = self.timesteps_normalized[t][:, None, None]
-        
-        # 根据prediction_type解析模型输出
-        if self.prediction_type == 'epsilon':
-            pred_epsilon = model_output
-            pred_x0 = (x_t - (1 - t_normalized) * pred_epsilon) / torch.clamp(t_normalized, min=self.t_eps)
-        elif self.prediction_type == 'x0':
-            pred_x0 = model_output
-            pred_epsilon = (x_t - t_normalized * pred_x0) / torch.clamp(1 - t_normalized, min=self.t_eps)
-        elif self.prediction_type == 'v':
-            pred_v = model_output
-            pred_x0 = x_t + (1 - t_normalized) * pred_v
-            pred_epsilon = (x_t - t_normalized * pred_x0) / torch.clamp(1 - t_normalized, min=self.t_eps)
-        else:
-            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
-        
-        # 裁剪位置坐标
-        pred_x0[:, :, :2] = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)
-        
-        # 最后一步直接返回x_0
-        if t[0] == 0:
-            return pred_x0
-        
-        # DDIM公式：z_{t-1} = t_{prev} * x_pred + (1-t_{prev}) * e
-        t_prev_normalized = self.timesteps_normalized[t-1][:, None, None]
-        x_prev = t_prev_normalized * pred_x0 + (1 - t_prev_normalized) * pred_epsilon
-        
-        return x_prev
-    
-    def differentiable_sample(self, map_input, start_pose, goal_pose, ddim_steps=50, use_checkpoint=True):
-        """
-        可微分的DDIM采样（ODE方法，保持梯度连接）
-        
-        **原理**：
-        DDIM本质上是概率流ODE (Probability Flow ODE)：
-            dx/dt = -0.5 * β(t) * [x + (1-α(t)) * ∇_x log p(x)]
-        
-        在离散化后，ODE更新是确定性的且完全可微：
-            x_{t-1} = √ᾱ_{t-1} * pred_x0 + √(1-ᾱ_{t-1}) * pred_ε
-        
-        与标准采样的区别：
-        1. 不使用 @torch.no_grad()，保持梯度图
-        2. 使用模型的forward()而非p_sample()（后者有@torch.no_grad装饰器）
-        3. 手动实现DDIM更新逻辑，确保所有操作都可微
-        
-        **显存优化**：
-        使用梯度检查点(gradient checkpointing)减少显存占用：
-        - 前向传播时不保存中间激活值
-        - 反向传播时重新计算需要的激活值
-        - 显存消耗从O(n)降到O(1)，但计算量增加约2倍
-        
-        Args:
-            map_input: (B, 3, H, W) 输入地图
-            start_pose: (B, 4) 起点坐标 (x,y,sin(θ),cos(θ)) (已归一化)
-            goal_pose: (B, 4) 终点坐标 (x,y,sin(θ),cos(θ)) (已归一化)
-            ddim_steps: DDIM步数（默认50，与标准采样一致）
-            use_checkpoint: 是否使用梯度检查点节省显存（默认True）
+            start_pose: (B, 4) 起点 (x,y,cos,sin)
+            goal_pose: (B, 4) 终点 (x,y,cos,sin)
+            num_steps: ODE求解步数（默认使用self.diffusion_steps）
+            reconstruct_trajectory: 是否使用B样条重建完整轨迹
+            num_traj_points: 重建轨迹的点数（如果reconstruct_trajectory=True）
         
         Returns:
-            x_0: (B, n_path_steps, 4) 采样得到的轨迹（保持梯度）
+            如果 reconstruct_trajectory=True:
+                full_traj: (B, num_traj_points, 2) 完整轨迹
+            否则:
+                control_points: (B, n_path_steps+2, 2) 控制点（含起终点）
         """
+        if num_steps is None:
+            num_steps = self.diffusion_steps
+        
         device = map_input.device
         B = map_input.shape[0]
         
-        # 从标准正态分布初始化 (4维: x,y,sin(θ),cos(θ))
-        # detach噪声以避免在反向传播时计算噪声的梯度（只需要模型参数的梯度）
-        x_t = torch.randn(B, self.n_path_steps, 4, device=device).detach()
+        # 初始化：t=1时为纯噪声
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
         
-        # DDIM时间步调度
-        step_size = max(1, self.diffusion_steps // ddim_steps)
-        time_steps = list(range(self.diffusion_steps-1, 0, -step_size)) + [0]
+        # 时间步划分：从t=1到t=0
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
         
-        # 定义单步更新函数（用于梯度检查点）
-        def ddim_step(x_in, t_val):
-            """
-            单步DDIM更新（ODE形式，新参数化）
+        # ODE积分（从t=1到t=0）
+        for i in range(num_steps):
+            t_curr = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_next - t_curr  # 负数，因为从1到0
             
-            新参数化的DDIM更新：
-                z_t = t * x + (1-t) * e
-                预测 x_pred，然后更新 z_{t-1}
+            # 当前时间步（扩展到batch）
+            t_batch = torch.full((B,), t_curr, device=device)
             
-            Args:
-                x_in: (B, N, 4) - 当前时刻的轨迹 z_t
-                t_val: int - 当前时间步
+            # 预测速度场 v_θ(z_t, t)
+            # 模型输出即为速度预测（Rectified Flow: v = x_1 - x_0）
+            v_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
             
-            Returns:
-                x_out: (B, N, 4) - 去噪后的轨迹 z_{t-1}
-            """
-            # 创建时间步tensor
-            t_tensor = torch.full((B,), t_val, device=device, dtype=torch.long)
-            
-            # 模型预测（保持梯度）
-            model_output = self.forward(map_input, x_in, t_tensor, start_pose, goal_pose)
-            
-            # 获取归一化的时间步
-            t_norm = self.timesteps_normalized[t_val]
-            t_prev_norm = self.timesteps_normalized[t_val - 1] if t_val > 0 else torch.tensor(1.0, device=device)
-            
-            # 根据prediction_type解析输出
-            if self.prediction_type == 'epsilon':
-                # 网络预测噪声 e，反推 x_pred = (z - (1-t)*e) / t
-                pred_epsilon = model_output
-                pred_x0 = (x_in - (1 - t_norm) * pred_epsilon) / torch.clamp(t_norm, min=self.t_eps)
-            elif self.prediction_type == 'x0':
-                # 网络直接预测 x
-                pred_x0 = model_output
-                pred_epsilon = (x_in - t_norm * pred_x0) / torch.clamp(1 - t_norm, min=self.t_eps)
-            elif self.prediction_type == 'v':
-                # 网络预测速度 v = (x - z) / (1-t)
-                pred_v = model_output
-                pred_x0 = x_in + (1 - t_norm) * pred_v
-                pred_epsilon = (x_in - t_norm * pred_x0) / torch.clamp(1 - t_norm, min=self.t_eps)
-            else:
-                raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
-            
-            # 裁剪位置坐标到归一化范围 [-1, 1]（避免in-place操作）
-            pred_x0_pos_clamped = torch.clamp(pred_x0[:, :, :2], -1.0, 1.0)  # (B, N, 2)
-            pred_x0_angle = pred_x0[:, :, 2:4]  # (B, N, 2)
-            pred_x0 = torch.cat([pred_x0_pos_clamped, pred_x0_angle], dim=2)  # (B, N, 4)
-            
-            # DDIM去噪
-            if t_val == 0:
-                # 最后一步直接返回 pred_x0
-                x_out = pred_x0
-            else:
-                # DDIM更新：z_{t-1} = t_{prev} * x_pred + (1 - t_{prev}) * e
-                x_out = t_prev_norm * pred_x0 + (1 - t_prev_norm) * pred_epsilon
-            
-            return x_out
+            # Euler步进：z_{t+dt} = z_t + dt * v
+            z = z + dt * v_pred
         
-        # 迭代ODE采样（保持梯度连接）
-        for i, t in enumerate(time_steps):
-            if use_checkpoint:
-                # 使用梯度检查点减少显存（以计算时间换空间）
-                x_t = torch.utils.checkpoint.checkpoint(
-                    ddim_step, x_t, t, use_reentrant=False
-                )
-            else:
-                # 标准前向传播（占用更多显存）
-                x_t = ddim_step(x_t, t)
+        # 组装完整控制点（起点 + 中间点 + 终点）
+        start_xy = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
+        control_points = torch.cat([start_xy, z, goal_xy], dim=1)  # (B, n_path_steps+2, 2)
         
-        # 最终处理（避免in-place操作）
-        # 裁剪位置坐标
-        x_t_pos_clamped = torch.clamp(x_t[:, :, :2], -1.0, 1.0)  # (B, N, 2)
-        
-        # 归一化sin/cos部分，确保 sin²+cos² = 1
-        sin_cos = x_t[:, :, 2:4]  # (B, n_path_steps, 2)
-        norm = torch.sqrt(sin_cos[:, :, 0]**2 + sin_cos[:, :, 1]**2).unsqueeze(-1) + 1e-8
-        sin_cos_normalized = sin_cos / norm  # (B, N, 2)
-        
-        # 拼接最终结果
-        x_t = torch.cat([x_t_pos_clamped, sin_cos_normalized], dim=2)  # (B, N, 4)
-        
-        return x_t
+        # 可选：B样条重建完整轨迹
+        if reconstruct_trajectory:
+            full_traj = reconstruct_from_control_points(
+                control_points, 
+                num_points=num_traj_points, 
+                degree=3
+            )
+            return full_traj
+        else:
+            return control_points
     
     @torch.no_grad()
-    def sample(self, map_input, start_pose, goal_pose, num_samples=5, ddim_steps=50):
+    def sample_heun(self, map_input, start_pose, goal_pose, num_steps=None, reconstruct_trajectory=True, num_traj_points=100):
         """
-        DDIM加速采样（改进版：起点终点作为显式tokens）
-        使用4维角度编码: (x, y, sin(θ), cos(θ))
+        二阶Heun ODE求解器（改进的Euler方法）
+        
+        Heun方法（预测-校正）：
+            1. 预测：z_pred = z_t + dt * v_θ(z_t, t)
+            2. 校正：z_{t+dt} = z_t + dt * (v_θ(z_t, t) + v_θ(z_pred, t+dt)) / 2
+        
+        相比Euler方法，Heun使用两次函数评估，精度更高。
+        
+        Args:
+            map_input: (B, 3, H, W) 输入地图
+            start_pose: (B, 4) 起点
+            goal_pose: (B, 4) 终点
+            num_steps: ODE求解步数（默认使用self.diffusion_steps）
+            reconstruct_trajectory: 是否使用B样条重建完整轨迹
+            num_traj_points: 重建轨迹的点数
+        
+        Returns:
+            如果 reconstruct_trajectory=True:
+                full_traj: (B, num_traj_points, 2) 完整轨迹
+            否则:
+                control_points: (B, n_path_steps+2, 2) 控制点（含起终点）
+        """
+        if num_steps is None:
+            num_steps = self.diffusion_steps
+        
+        device = map_input.device
+        B = map_input.shape[0]
+        
+        # 初始化：t=1时为纯噪声
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        
+        # 时间步划分：从t=1到t=0
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+        
+        # ODE积分（从t=1到t=0）
+        for i in range(num_steps):
+            t_curr = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_next - t_curr  # 负数
+            
+            # 当前时间步
+            t_curr_batch = torch.full((B,), t_curr, device=device)
+            t_next_batch = torch.full((B,), t_next, device=device)
+            
+            # 第一次评估：v_θ(z_t, t)
+            v1 = self.forward(map_input, z, t_curr_batch, start_pose, goal_pose)
+            
+            # Euler预测步
+            z_pred = z + dt * v1
+            
+            # 第二次评估：v_θ(z_pred, t+dt)
+            v2 = self.forward(map_input, z_pred, t_next_batch, start_pose, goal_pose)
+            
+            # Heun校正：平均两次速度
+            z = z + dt * (v1 + v2) / 2
+        
+        # 组装完整控制点
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        control_points = torch.cat([start_xy, z, goal_xy], dim=1)
+        
+        # 可选：B样条重建
+        if reconstruct_trajectory:
+            full_traj = reconstruct_from_control_points(
+                control_points,
+                num_points=num_traj_points,
+                degree=3
+            )
+            return full_traj
+        else:
+            return control_points
+    
+    
+    @torch.no_grad()
+    def sample(self, map_input, start_pose, goal_pose, num_samples=5, num_steps=50, 
+               solver='heun', reconstruct_trajectory=True, num_traj_points=100):
+        """
+        Rectified Flow采样（使用ODE求解器）
+        
+        【完整B样条】26个控制点 = 起点(1) + 中间点(24) + 终点(1)
+        - 网络预测：24个中间控制点
+        - 固定条件：起点和终点
+        - B样条重建：拼接成26个控制点后重建轨迹
         
         Args:
             map_input: (1, 3, H, W) 输入地图（3通道：normal_x, normal_y, normal_z）
-            start_pose: (1, 4) 起点坐标 (x,y,sin(θ),cos(θ)) (已归一化)
-            goal_pose: (1, 4) 终点坐标 (x,y,sin(θ),cos(θ)) (已归一化)
+            start_pose: (1, 4) 起点坐标 (x,y,cos(θ),sin(θ)) (已归一化)
+            goal_pose: (1, 4) 终点坐标 (x,y,cos(θ),sin(θ)) (已归一化)
             num_samples: 采样数量
-            ddim_steps: DDIM步数
+            num_steps: ODE求解步数
+            solver: ODE求解器类型 ('euler' 或 'heun')
+            reconstruct_trajectory: 是否从控制点重建轨迹（默认True）
+            num_traj_points: 重建后的轨迹点数（默认100）
+            
+        Returns:
+            如果reconstruct_trajectory=True: 
+                (num_samples, num_traj_points, 2) - 重建的轨迹(x,y)
+            如果reconstruct_trajectory=False: 
+                (num_samples, n_path_steps+2, 2) - 完整控制点(包含起终点)
         """
         device = map_input.device
-        map_input = map_input.expand(num_samples, -1, -1, -1)
-        start_pose = start_pose.expand(num_samples, -1)
-        goal_pose = goal_pose.expand(num_samples, -1)
         
-        # 从标准正态分布初始化 (4维: x,y,sin(θ),cos(θ))
-        x_t = torch.randn(num_samples, self.n_path_steps, 4, device=device)
+        # 扩展batch维度
+        map_input_batch = map_input.expand(num_samples, -1, -1, -1)
+        start_pose_batch = start_pose.expand(num_samples, -1)
+        goal_pose_batch = goal_pose.expand(num_samples, -1)
         
-        # DDIM时间步调度
-        step_size = max(1, self.diffusion_steps // ddim_steps)
-        time_steps = list(range(self.diffusion_steps-1, 0, -step_size)) + [0]
-        
-        for t in time_steps:
-            t_batch = torch.full((num_samples,), t, device=device, dtype=torch.long)
-            x_t = self.p_sample(map_input, x_t, t_batch, start_pose, goal_pose)
-        
-        # 最终裁剪位置坐标到归一化范围 [-1, 1]
-        x_t[:, :, :2] = torch.clamp(x_t[:, :, :2], -1.0, 1.0)
-        
-        # 归一化sin/cos部分，确保 sin²+cos² = 1（只在推理/采样时，修正数值误差）
-        sin_cos = x_t[:, :, 2:4]  # (num_samples, n_path_steps, 2)
-        norm = torch.sqrt(sin_cos[:, :, 0]**2 + sin_cos[:, :, 1]**2).unsqueeze(-1) + 1e-8  # (B, N, 1)
-        x_t[:, :, 2:4] = sin_cos / norm  # 投影到单位圆
-        
-        return x_t
-    
-    def guided_sample(self, map_input, start_pose, goal_pose, cost_map, map_info, 
-                      num_samples=5, ddim_steps=50, guidance_scale=0.1, 
-                      guidance_start_step=0.5):
-        """
-        带Capsize Cost引导的DDIM采样
-        
-        在采样过程中注入capsize loss的梯度，引导生成更安全的轨迹
-        
-        Args:
-            map_input: (1, 3, H, W) 输入地图
-            start_pose: (1, 4) 起点 (x,y,sin(θ),cos(θ)) 已归一化
-            goal_pose: (1, 4) 终点 (x,y,sin(θ),cos(θ)) 已归一化
-            cost_map: (1, num_layers, max_anchors) 稳定性代价地图
-            map_info: dict 地图配置信息
-            num_samples: 采样数量
-            ddim_steps: DDIM步数
-            guidance_scale: 引导强度 (建议0.05-0.2)
-            guidance_start_step: 开始引导的时间点比例 (0.0-1.0，建议0.3-0.7)
-        """
-        from grad_optimizer import TrajectoryOptimizerSE2
-        
-        device = map_input.device
-        map_input = map_input.expand(num_samples, -1, -1, -1)
-        start_pose_expanded = start_pose.expand(num_samples, -1)
-        goal_pose_expanded = goal_pose.expand(num_samples, -1)
-        
-        # 扩展cost_map到batch（保持4D形状）
-        if cost_map.dim() == 4:
-            cost_map = cost_map.expand(num_samples, -1, -1, -1)
+        # 选择ODE求解器
+        if solver == 'euler':
+            result = self.sample_euler(
+                map_input_batch, 
+                start_pose_batch, 
+                goal_pose_batch,
+                num_steps=num_steps,
+                reconstruct_trajectory=False,  # 先获取控制点
+            )
+        elif solver == 'heun':
+            result = self.sample_heun(
+                map_input_batch,
+                start_pose_batch,
+                goal_pose_batch,
+                num_steps=num_steps,
+                reconstruct_trajectory=False,  # 先获取控制点
+            )
         else:
-            cost_map = cost_map.expand(num_samples, -1, -1)
+            raise ValueError(f"Unknown solver: {solver}. Choose 'euler' or 'heun'.")
         
-        # 从标准正态分布初始化
-        x_t = torch.randn(num_samples, self.n_path_steps, 4, device=device)
+        # result: (num_samples, n_path_steps+2, 2) - 包含起终点的控制点
+        control_points_normalized = torch.clamp(result, -1.0, 1.0)
         
-        # DDIM时间步调度
-        step_size = max(1, self.diffusion_steps // ddim_steps)
-        time_steps = list(range(self.diffusion_steps-1, 0, -step_size)) + [0]
+        if not reconstruct_trajectory:
+            return control_points_normalized
         
-        # 确定开始引导的步骤索引
-        guidance_start_idx = int(len(time_steps) * guidance_start_step)
+        # 反归一化控制点: [-1,1] -> [-20,20]
+        control_points_denorm = control_points_normalized * 20.0
         
-        # print(f"\n🎯 Guided Sampling: steps={ddim_steps}, guidance_scale={guidance_scale}, "
-        #       f"start_step={guidance_start_step} (step {guidance_start_idx}/{len(time_steps)})")
+        # 使用B样条重建轨迹
+        bspline_layer = DifferentiableBSpline(
+            num_control_points=self.n_path_steps + 2,  # 26个控制点
+            num_output_points=num_traj_points,
+            degree=3
+        ).to(device)
+        reconstructed_traj = bspline_layer(control_points_denorm)
         
-        for step_idx, t in enumerate(time_steps):
-            t_batch = torch.full((num_samples,), t, device=device, dtype=torch.long)
-            
-            # 是否应用引导（只在低噪声阶段）
-            apply_guidance = (step_idx >= guidance_start_idx) and (guidance_scale > 0)
-            
-            if apply_guidance:
-                # 需要梯度的采样步骤
-                x_t_guided = x_t.clone().detach().requires_grad_(True)
-                
-                # 获取pred_x0（需要在梯度上下文中）
-                with torch.enable_grad():
-                    # 前向传播获取模型输出
-                    model_output = self.forward(
-                        map_input, x_t_guided, t_batch, 
-                        start_pose_expanded, goal_pose_expanded
-                    )
-                    
-                    # 计算pred_x0（假设prediction_type='x0'）
-                    if self.prediction_type == 'x0':
-                        pred_x0 = model_output
-                    elif self.prediction_type == 'epsilon':
-                        sqrt_alpha_t = torch.sqrt(self.alphas_cumprod[t_batch])[:, None, None]
-                        sqrt_one_minus_alpha_t = torch.sqrt(1 - self.alphas_cumprod[t_batch])[:, None, None]
-                        pred_x0 = (x_t_guided - sqrt_one_minus_alpha_t * model_output) / sqrt_alpha_t
-                    else:
-                        raise NotImplementedError(f"Guidance not implemented for {self.prediction_type}")
-                    
-                    # 反归一化pred_x0
-                    pred_x0_denorm = torch.zeros_like(pred_x0)
-                    pred_x0_denorm[:, :, :2] = pred_x0[:, :, :2] * 20.0
-                    pred_x0_denorm[:, :, 2:] = pred_x0[:, :, 2:]
-                    
-                    # 计算capsize cost（batch处理）
-                    costs = []
-                    for i in range(num_samples):
-                        try:
-                            # 构建完整轨迹
-                            start_fixed = start_pose[0, :2] * 20.0  # 反归一化起点
-                            start_angle = torch.atan2(start_pose[0, 2], start_pose[0, 3])
-                            start_3d = torch.cat([start_fixed, start_angle.unsqueeze(0)])
-                            
-                            goal_fixed = goal_pose[0, :2] * 20.0
-                            goal_angle = torch.atan2(goal_pose[0, 2], goal_pose[0, 3])
-                            goal_3d = torch.cat([goal_fixed, goal_angle.unsqueeze(0)])
-                            
-                            predicted_angles = torch.atan2(
-                                pred_x0_denorm[i, :, 2], 
-                                pred_x0_denorm[i, :, 3]
-                            )
-                            predicted_traj_3d = torch.stack([
-                                pred_x0_denorm[i, :, 0],
-                                pred_x0_denorm[i, :, 1],
-                                predicted_angles
-                            ], dim=1)
-                            
-                            full_traj = torch.cat([
-                                start_3d.unsqueeze(0),
-                                predicted_traj_3d,
-                                goal_3d.unsqueeze(0)
-                            ], dim=0)
-                            
-                            # 计算cost
-                            # 检查cost_map的形状并正确处理
-                            if cost_map.dim() == 4:
-                                # 形状是 (B, H, W, D)，需要转为 (D, H, W)
-                                stability_cost_map = cost_map[i].permute(2, 0, 1)
-                            else:
-                                # 形状是 (B, num_layers, max_anchors)
-                                stability_cost_map = cost_map[i].permute(2, 0, 1)
-                            
-                            optimizer = TrajectoryOptimizerSE2(
-                                full_traj.detach(),
-                                stability_cost_map,
-                                map_info,
-                                device=device
-                            )
-                            cost = optimizer.cost_on_poses(full_traj)
-                            
-                            if not (torch.isnan(cost) or torch.isinf(cost)):
-                                costs.append(cost)
-                        except Exception as e:
-                            pass
-                    
-                    if len(costs) > 0:
-                        total_cost = torch.stack(costs).mean()
-                        
-                        # 计算梯度
-                        grad = torch.autograd.grad(total_cost, x_t_guided, retain_graph=False)[0]
-                        
-                        # 梯度裁剪（避免过大的扰动）
-                        grad_norm = torch.norm(grad)
-                        if grad_norm > 1.0:
-                            grad = grad / grad_norm
-                        
-                        # 应用引导：沿着降低cost的方向调整x_t
-                        x_t = x_t - guidance_scale * grad.detach()
-                        
-                        # if step_idx % 10 == 0:
-                        #     print(f"  Step {step_idx}/{len(time_steps)}: t={t}, cost={total_cost.item():.4e}, "
-                        #           f"grad_norm={grad_norm.item():.4e}")
-            
-            # 执行标准DDIM步骤（使用可能被引导调整过的x_t）
-            with torch.no_grad():
-                x_t = self.p_sample(map_input, x_t, t_batch, start_pose_expanded, goal_pose_expanded)
-        
-        # 最终裁剪和归一化
-        x_t[:, :, :2] = torch.clamp(x_t[:, :, :2], -1.0, 1.0)
-        sin_cos = x_t[:, :, 2:4]
-        norm = torch.sqrt(sin_cos[:, :, 0]**2 + sin_cos[:, :, 1]**2).unsqueeze(-1) + 1e-8
-        x_t[:, :, 2:4] = sin_cos / norm
-        
-        # print("✓ Guided sampling completed\n")
-        
-        return x_t
+        return reconstructed_traj  # (num_samples, num_traj_points, 2)
+
+    
 
     def freeze_for_stage2(self):
         """

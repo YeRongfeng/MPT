@@ -18,6 +18,8 @@ import json
 dataset_path = 'data/sim_dataset/train'
 # dataset_path = 'data/sim_dataset/val'
 
+is_dense = True  # 数据集是否为密集采样轨迹
+
 def spline_interpolate(control_points, num_samples=100):
     """
     使用三次自然样条对控制点进行插值，生成平滑轨迹
@@ -270,18 +272,21 @@ def plot_all_trajectories(envType, save_path='predictions'):
     
     # 遍历所有轨迹文件
     successful_plots = 0
+    cnt = 0
     for traj_file in traj_files:
+        # cnt += 1
+        # if cnt % 50 == 0:
+        #     break  # 仅绘制前50条轨迹以防图像过于拥挤
         try:
             traj_path = osp.join(envFolder, traj_file)
             with open(traj_path, 'rb') as f:
                 traj_data = pickle.load(f)
                 trajectory = traj_data['path']  # [N, 3] - 这些是控制点
             
-            # 使用三次样条插值生成平滑轨迹（100个点）
-            trajectory_smooth = spline_interpolate(trajectory, num_samples=100)
-            
-            if trajectory_smooth is None:
-                # 如果插值失败，使用原始轨迹
+            # 如果轨迹不是密集采样，使用三次样条插值生成平滑轨迹（100个点）
+            if is_dense is not True:
+                trajectory_smooth = spline_interpolate(trajectory, num_samples=100)
+            else:
                 trajectory_smooth = trajectory
             
             start_pos = trajectory_smooth[0, :]
@@ -416,7 +421,7 @@ def plot_trajectory_heatmap(envType, save_path='predictions', grid_size=100):
     print(f"Saved: {save_file}")
 
 if __name__ == "__main__":
-    envType = 'env000008'  # 指定环境
+    envType = 'env000012'  # 指定环境
     save_path = 'predictions'
     
     print(f"Visualizing dataset for environment: {envType}")

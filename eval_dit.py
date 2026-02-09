@@ -44,18 +44,18 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=1, devic
     """
     model.eval()
     
-    # 归一化起点终点并转换为4维 (x, y, sin(θ), cos(θ))
+    # 归一化起点终点并转换为4维 (x, y, cos(θ), sin(θ))
     start_normalized = torch.zeros(4, device=device)
     start_normalized[:2] = start_point[:2] / 20.0  # x,y归一化
-    start_normalized[2] = torch.sin(start_point[2])  # sin(θ)
-    start_normalized[3] = torch.cos(start_point[2])  # cos(θ)
+    start_normalized[2] = torch.cos(start_point[2])  # cos(θ)
+    start_normalized[3] = torch.sin(start_point[2])  # sin(θ)
     start_normalized[:2] = torch.clamp(start_normalized[:2], -1.0, 1.0)
     start_normalized = start_normalized.unsqueeze(0)  # (1, 4)
     
     goal_normalized = torch.zeros(4, device=device)
     goal_normalized[:2] = goal_point[:2] / 20.0
-    goal_normalized[2] = torch.sin(goal_point[2])  # sin(θ)
-    goal_normalized[3] = torch.cos(goal_point[2])  # cos(θ)
+    goal_normalized[2] = torch.cos(goal_point[2])  # cos(θ)
+    goal_normalized[3] = torch.sin(goal_point[2])  # sin(θ)
     goal_normalized[:2] = torch.clamp(goal_normalized[:2], -1.0, 1.0)
     goal_normalized = goal_normalized.unsqueeze(0)  # (1, 4)
     
@@ -94,8 +94,8 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=1, devic
     # 反归一化到真实坐标 (x, y, theta)
     traj_denorm = torch.zeros(num_paths, 20, 3, device=normalized_traj.device)
     traj_denorm[:, :, :2] = normalized_traj[:, :, :2] * 20.0  # x,y: [-1,1] → [-20,20]
-    # 从sin/cos恢复角度
-    traj_denorm[:, :, 2] = torch.atan2(normalized_traj[:, :, 2], normalized_traj[:, :, 3])  # θ ∈ [-π, π]
+    # 从cos/sin恢复角度: atan2(sin, cos)
+    traj_denorm[:, :, 2] = torch.atan2(normalized_traj[:, :, 3], normalized_traj[:, :, 2])  # θ ∈ [-π, π]
     
     return traj_denorm.cpu().numpy(), inference_time  # (num_paths, 20, 3), float
 

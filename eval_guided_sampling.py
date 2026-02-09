@@ -94,13 +94,13 @@ def main():
         # 归一化
         start_normalized = torch.zeros(1, 4, device=device)
         start_normalized[0, :2] = start_pose[:2] / 20.0
-        start_normalized[0, 2] = torch.sin(start_pose[2])
-        start_normalized[0, 3] = torch.cos(start_pose[2])
+        start_normalized[0, 2] = torch.cos(start_pose[2])  # cos(θ)
+        start_normalized[0, 3] = torch.sin(start_pose[2])  # sin(θ)
         
         goal_normalized = torch.zeros(1, 4, device=device)
         goal_normalized[0, :2] = goal_pose[:2] / 20.0
-        goal_normalized[0, 2] = torch.sin(goal_pose[2])
-        goal_normalized[0, 3] = torch.cos(goal_pose[2])
+        goal_normalized[0, 2] = torch.cos(goal_pose[2])  # cos(θ)
+        goal_normalized[0, 3] = torch.sin(goal_pose[2])  # sin(θ)
         
         map_input = torch.stack([nx, ny, nz], dim=0).unsqueeze(0)
         yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=36)
@@ -115,7 +115,7 @@ def main():
         
         traj_std_denorm = torch.zeros(20, 3, device=device)
         traj_std_denorm[:, :2] = traj_std[:, :2] * 20.0
-        traj_std_denorm[:, 2] = torch.atan2(traj_std[:, 2], traj_std[:, 3])
+        traj_std_denorm[:, 2] = torch.atan2(traj_std[:, 3], traj_std[:, 2])  # atan2(sin, cos)
         
         traj_std_full = torch.cat([
             start_pose.unsqueeze(0),
@@ -134,7 +134,7 @@ def main():
         
         traj_guided_denorm = torch.zeros(20, 3, device=device)
         traj_guided_denorm[:, :2] = traj_guided[:, :2] * 20.0
-        traj_guided_denorm[:, 2] = torch.atan2(traj_guided[:, 2], traj_guided[:, 3])
+        traj_guided_denorm[:, 2] = torch.atan2(traj_guided[:, 3], traj_guided[:, 2])  # atan2(sin, cos)
         
         traj_guided_full = torch.cat([
             start_pose.unsqueeze(0),

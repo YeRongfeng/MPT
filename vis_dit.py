@@ -27,263 +27,97 @@ dataset_path = 'data/sim_dataset/val'
 
 diffusion_step = 50
 
-def spline_interpolate(control_points, num_samples=100):
+def generate_paths(model, map_input, start_point, goal_point, num_paths=5, 
+                   reconstruct_trajectory=True, num_traj_points=100, solver='heun'):
     """
-    使用三次自然样条对控制点进行插值，生成平滑轨迹
-    
-    Args:
-        control_points: 样条控制点，形状为(num_control_points, 3)，包含[x, y, yaw]
-        num_samples: 插值生成的轨迹点数量，默认100
-    
-    Returns:
-        插值后的轨迹点，形状为(num_samples, 3)，保证经过所有控制点
-    """
-    if control_points is None or len(control_points) < 2:
-        print("Insufficient control points for spline interpolation")
-        return None
-    
-    num_control = len(control_points)
-    
-    # 生成控制点参数（均匀参数化）
-    t_control = np.linspace(0, 1, num_control)
-    # 生成采样点参数
-    t_samples = np.linspace(0, 1, num_samples)
-    
-    # 分开处理xy坐标和yaw角
-    x_control = control_points[:, 0]
-    y_control = control_points[:, 1]
-    yaw_control = control_points[:, 2]
-    
-    # 对x, y使用三次样条插值
-    x_interpolated = _evaluate_scalar_spline(x_control, t_samples, t_control)
-    y_interpolated = _evaluate_scalar_spline(y_control, t_samples, t_control)
-    
-    # 对yaw进行周期性感知的样条插值
-    yaw_interpolated = _evaluate_yaw_spline(yaw_control, t_samples, t_control)
-    
-    # 组合结果
-    trajectory = np.column_stack([x_interpolated, y_interpolated, yaw_interpolated])
-    
-    return trajectory
-
-def _solve_natural_cubic_M(y_values, t_control):
-    """
-    求解自然三次样条的二阶导数 M
-    使用三对角矩阵算法（Thomas algorithm）
-    
-    Args:
-        y_values: 控制点的y值，形状为(N,)
-        t_control: 控制点的参数，形状为(N,)
-    
-    Returns:
-        二阶导数M，形状为(N,)
-    """
-    N = len(y_values)
-    if N < 2:
-        return np.zeros(N)
-    
-    # 构建三对角系统 A*M = b
-    # 自然边界条件：M[0] = M[-1] = 0
-    h = np.diff(t_control)  # 根据实际参数计算间隔
-    h = np.clip(h, 1e-6, None)  # 避免除零
-    
-    # 构建对角线
-    diag = 2 * (h[:-1] + h[1:])
-    diag = np.concatenate([[1], diag, [1]])  # 边界条件
-    
-    # 构建上下对角线
-    upper = np.concatenate([[0], h[1:], [0]])
-    lower = np.concatenate([[0], h[:-1], [0]])
-    
-    # 构建右侧向量
-    b = np.zeros(N)
-    for i in range(1, N - 1):
-        b[i] = 6 * ((y_values[i + 1] - y_values[i]) / h[i] - 
-                    (y_values[i] - y_values[i - 1]) / h[i - 1])
-    
-    # 边界条件（自然样条）
-    b[0] = 0
-    b[-1] = 0
-    
-    # 使用 Thomas 算法求解三对角系统
-    M = _solve_tridiagonal(lower, diag, upper, b)
-    
-    return M
-
-def _solve_tridiagonal(lower, diag, upper, b):
-    """
-    使用 Thomas 算法求解三对角线性系统
-    
-    Args:
-        lower: 下对角线
-        diag: 主对角线
-        upper: 上对角线
-        b: 右侧向量
-    
-    Returns:
-        解向量 x
-    """
-    N = len(b)
-    c_prime = np.zeros(N - 1)
-    d_prime = np.zeros(N)
-    x = np.zeros(N)
-    
-    # 前向消元
-    c_prime[0] = upper[0] / diag[0]
-    d_prime[0] = b[0] / diag[0]
-    
-    for i in range(1, N - 1):
-        denom = diag[i] - lower[i] * c_prime[i - 1]
-        c_prime[i] = upper[i] / denom
-        d_prime[i] = (b[i] - lower[i] * d_prime[i - 1]) / denom
-    
-    d_prime[-1] = (b[-1] - lower[-1] * d_prime[-2]) / (diag[-1] - lower[-1] * c_prime[-2])
-    
-    # 回代
-    x[-1] = d_prime[-1]
-    for i in range(N - 2, -1, -1):
-        x[i] = d_prime[i] - c_prime[i] * x[i + 1]
-    
-    return x
-
-def _evaluate_scalar_spline(y_control, t_eval, t_control):
-    """
-    对一维标量序列进行三次样条插值
-    
-    Args:
-        y_control: 控制点的y值，形状为(N,)
-        t_eval: 评估点的参数，形状为(M,)
-        t_control: 控制点的参数，形状为(N,)
-    
-    Returns:
-        插值后的y值，形状为(M,)
-    """
-    N = len(y_control)
-    M_values = _solve_natural_cubic_M(y_control, t_control)  # 传入 t_control
-    
-    h = np.diff(t_control)
-    h = np.clip(h, 1e-6, None)  # 避免除零
-    
-    # 找到每个评估点所在的区间
-    idx = np.searchsorted(t_control[1:], t_eval, side='left')
-    idx = np.clip(idx, 0, N - 2)
-    
-    # 获取区间端点
-    t_k = t_control[idx]
-    t_k1 = t_control[idx + 1]
-    h_k = h[idx]
-    dt = t_eval - t_k
-    
-    y_k = y_control[idx]
-    y_k1 = y_control[idx + 1]
-    M_k = M_values[idx]
-    M_k1 = M_values[idx + 1]
-    
-    # 三次样条插值公式
-    term1 = M_k * (t_k1 - t_eval)**3 / (6 * h_k)
-    term2 = M_k1 * dt**3 / (6 * h_k)
-    term3 = (y_k - M_k * h_k**2 / 6) * (t_k1 - t_eval) / h_k
-    term4 = (y_k1 - M_k1 * h_k**2 / 6) * dt / h_k
-    
-    S = term1 + term2 + term3 + term4
-    
-    return S
-
-def _evaluate_yaw_spline(yaw_control, t_eval, t_control):
-    """
-    对yaw角进行周期性感知的三次样条插值
-    
-    Args:
-        yaw_control: 控制点的yaw角，形状为(N,)
-        t_eval: 评估点的参数，形状为(M,)
-        t_control: 控制点的参数，形状为(N,)
-    
-    Returns:
-        插值后的yaw角，形状为(M,)，规范化到[-pi, pi]
-    """
-    # 展开角度序列，消除周期性跳跃
-    yaw_unwrapped = _unwrap_angles(yaw_control)
-    
-    # 对展开后的角度进行标量样条插值
-    yaw_interpolated_unwrapped = _evaluate_scalar_spline(yaw_unwrapped, t_eval, t_control)
-    
-    # 将插值结果重新规范化到 [-π, π]
-    yaw_interpolated = np.arctan2(np.sin(yaw_interpolated_unwrapped), 
-                                   np.cos(yaw_interpolated_unwrapped))
-    
-    return yaw_interpolated
-
-def _unwrap_angles(angles):
-    """
-    展开角度序列，消除周期性跳跃
-    
-    Args:
-        angles: 角度序列，形状为(N,)
-    
-    Returns:
-        展开后的角度序列，形状为(N,)
-    """
-    if len(angles) <= 1:
-        return angles.copy()
-    
-    unwrapped = np.zeros_like(angles)
-    unwrapped[0] = angles[0]
-    
-    for i in range(1, len(angles)):
-        diff = angles[i] - angles[i-1]
-        # 规范化角度差到 [-π, π]
-        diff = np.arctan2(np.sin(diff), np.cos(diff))
-        unwrapped[i] = unwrapped[i-1] + diff
-    
-    return unwrapped
-
-def generate_paths(model, map_input, start_point, goal_point, num_paths=5):
-    """
-    生成完整路径（绝对坐标版本，使用sin/cos编码）
+    生成完整路径（使用B样条控制点重建）- Rectified Flow版本
     
     Args:
         model: 训练好的PathDiffusionTransformer
-        map_input: (1, 6, H, W) 已包含起点/终点嵌入的地图
+        map_input: (1, 3, H, W) 地图输入
         start_point: (3,) [x, y, yaw] 起点坐标（真实坐标）
         goal_point: (3,) [x, y, yaw] 终点坐标（真实坐标）
         num_paths: 生成路径数量
+        reconstruct_trajectory: 是否从控制点重建轨迹（默认True）
+        num_traj_points: 重建后的轨迹点数（默认100）
+        solver: ODE求解器类型 ('euler' 或 'heun')
     Returns:
-        middle_paths: (num_paths, 20, 3) 中间20个点的绝对坐标 [x, y, theta]
+        trajectories: (num_paths, N, 3) 轨迹 [x, y, theta]
+            - 如果reconstruct_trajectory=True: N=num_traj_points
+            - 如果reconstruct_trajectory=False: N=n_path_steps（控制点数）
     """
     model.eval()
     
-    # 归一化起点终点并转换为4维 (x, y, sin(θ), cos(θ))
+    # 归一化起点终点并转换为4维 (x, y, cos(θ), sin(θ))
     start_normalized = torch.zeros(4, device=start_point.device)
     start_normalized[:2] = start_point[:2] / 20.0  # x,y归一化
-    start_normalized[2] = torch.sin(start_point[2])  # sin(θ)
-    start_normalized[3] = torch.cos(start_point[2])  # cos(θ)
+    start_normalized[2] = torch.cos(start_point[2])  # cos(θ)
+    start_normalized[3] = torch.sin(start_point[2])  # sin(θ)
     start_normalized[:2] = torch.clamp(start_normalized[:2], -1.0, 1.0)
     start_normalized = start_normalized.unsqueeze(0)  # (1, 4)
     
     goal_normalized = torch.zeros(4, device=goal_point.device)
     goal_normalized[:2] = goal_point[:2] / 20.0
-    goal_normalized[2] = torch.sin(goal_point[2])  # sin(θ)
-    goal_normalized[3] = torch.cos(goal_point[2])  # cos(θ)
+    goal_normalized[2] = torch.cos(goal_point[2])  # cos(θ)
+    goal_normalized[3] = torch.sin(goal_point[2])  # sin(θ)
     goal_normalized[:2] = torch.clamp(goal_normalized[:2], -1.0, 1.0)
     goal_normalized = goal_normalized.unsqueeze(0)  # (1, 4)
     
-    # 生成中间20个点（4维编码）
+    # 从Rectified Flow采样轨迹（只有x,y）
     with torch.no_grad():
-        normalized_traj = model.sample(
+        sampled_traj_xy = model.sample(
             map_input,
             start_normalized,
             goal_normalized,
             num_samples=num_paths,
-            ddim_steps=diffusion_step
-        )  # (num_paths, 20, 4) - 归一化的4维编码
+            num_steps=diffusion_step,  # 使用新参数名
+            solver=solver,  # 选择ODE求解器
+            reconstruct_trajectory=reconstruct_trajectory,
+            num_traj_points=num_traj_points
+        )  # (num_paths, N, 2) - 只有(x,y)，已经是真实坐标（非归一化）
     
-    # 反归一化到真实坐标 (x, y, theta)
-    traj_denorm = torch.zeros(num_paths, 20, 3, device=normalized_traj.device)
-    traj_denorm[:, :, :2] = normalized_traj[:, :, :2] * 20.0  # x,y: [-1,1] → [-20,20]
-    # 从sin/cos恢复角度
-    traj_denorm[:, :, 2] = torch.atan2(normalized_traj[:, :, 2], normalized_traj[:, :, 3])  # θ ∈ [-π, π]
+    # 从xy坐标计算theta（通过差分计算切向量）
+    def compute_theta_from_xy(traj_xy):
+        """
+        从轨迹的xy坐标计算theta角度
+        Args:
+            traj_xy: (N, 2) 轨迹的xy坐标
+        Returns:
+            theta: (N,) 每个点的切向角度
+        """
+        N = traj_xy.shape[0]
+        theta = np.zeros(N)
+        
+        # 中心差分
+        for i in range(1, N-1):
+            dx = traj_xy[i+1, 0] - traj_xy[i-1, 0]
+            dy = traj_xy[i+1, 1] - traj_xy[i-1, 1]
+            theta[i] = np.arctan2(dy, dx)
+        
+        # 边界点用前向/后向差分
+        dx = traj_xy[1, 0] - traj_xy[0, 0]
+        dy = traj_xy[1, 1] - traj_xy[0, 1]
+        theta[0] = np.arctan2(dy, dx)
+        
+        dx = traj_xy[-1, 0] - traj_xy[-2, 0]
+        dy = traj_xy[-1, 1] - traj_xy[-2, 1]
+        theta[-1] = np.arctan2(dy, dx)
+        
+        return theta
     
-    return traj_denorm.cpu().numpy()  # (num_paths, 20, 3)
+    # 转换为numpy并添加theta维度
+    sampled_traj_xy_np = sampled_traj_xy.cpu().numpy()  # (num_paths, N, 2)
+    
+    trajectories = []
+    for i in range(num_paths):
+        traj_xy = sampled_traj_xy_np[i]  # (N, 2)
+        theta = compute_theta_from_xy(traj_xy)  # (N,)
+        traj_full = np.column_stack([traj_xy, theta])  # (N, 3)
+        trajectories.append(traj_full)
+    
+    trajectories = np.stack(trajectories, axis=0)  # (num_paths, N, 3)
+    
+    return trajectories
 
 # Define the network
 device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -332,26 +166,12 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTrajs=None, out
         
         # 绘制每条预测轨迹
         for traj_idx, predTraj in enumerate(predTrajs):
-            # 如果启用样条插值，先对轨迹进行插值处理
-            if use_bezier_interpolate:
-                # 补足起点和终点形成完整控制点
-                full_traj = np.vstack((start_pos, predTraj, goal_pos))  # (N+2, 3)
-                # 进行样条插值，生成100个点的平滑轨迹
-                predTraj_smooth = spline_interpolate(full_traj, num_samples=100)
-                if predTraj_smooth is not None:
-                    predTraj_path = predTraj_smooth[:, :2]  # 只取xy坐标
-                    output_dim = predTraj_path.shape[0]
-                else:
-                    # 插值失败，使用原始方法
-                    predTraj_xy = np.array([[point[0], point[1]] for point in predTraj])
-                    predTraj_path = np.vstack((start_pos[:2], predTraj_xy, goal_pos[:2]))
-                    output_dim = predTraj_path.shape[0]
-            else:
-                # 将predTraj从(x,y,theta)格式转换为只包含(x,y)的格式用于绘制路径
-                predTraj_xy = np.array([[point[0], point[1]] for point in predTraj])
-                # 先为预测轨迹补足起点和终点，只使用x,y坐标
-                predTraj_path = np.vstack((start_pos[:2], predTraj_xy, goal_pos[:2]))
-                output_dim = predTraj_path.shape[0]  # 已经包括起点和终点
+            # 预测轨迹已经通过sample方法中的B样条重建完成，直接使用
+            # 将predTraj从(x,y,theta)格式转换为只包含(x,y)的格式用于绘制路径
+            predTraj_xy = np.array([[point[0], point[1]] for point in predTraj])
+            # 先为预测轨迹补足起点和终点，只使用x,y坐标
+            predTraj_path = np.vstack((start_pos[:2], predTraj_xy, goal_pos[:2]))
+            output_dim = predTraj_path.shape[0]  # 已经包括起点和终点
             
             # 绘制轨迹线段
             for i in range(output_dim-1):
@@ -378,15 +198,8 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTrajs=None, out
                              head_width=0.08, head_length=0.12, fc=color, ec=color, 
                              zorder=4, alpha=alphas[traj_idx])
     else:
-        # 如果启用样条插值，先对真实轨迹进行插值处理
-        if use_bezier_interpolate:
-            trajectory_smooth = spline_interpolate(trajectory, num_samples=100)
-            if trajectory_smooth is not None:
-                trajectory_to_plot = trajectory_smooth
-            else:
-                trajectory_to_plot = trajectory
-        else:
-            trajectory_to_plot = trajectory
+        # Ground Truth直接绘制，不进行样条插值
+        trajectory_to_plot = trajectory
         
         # 绘制真实轨迹线段
         for i in range(trajectory_to_plot.shape[0] - 1):
@@ -511,15 +324,18 @@ def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_path
                                   map_input=encoder_input.permute(2, 0, 1)[None, :].cuda(),
                                   start_point=torch.tensor(start_pos).float().to(device),
                                   goal_point=torch.tensor(goal_pos).float().to(device),
-                                  num_paths=num_pred_paths  # 生成多条轨迹
-                                 )  # (num_pred_paths, 20, 3)
+                                  num_paths=num_pred_paths,  # 生成多条轨迹
+                                  reconstruct_trajectory=True,  # 从控制点重建轨迹
+                                  num_traj_points=100,  # 重建为100个点
+                                  solver=solver  # 传递求解器类型
+                                 )  # (num_pred_paths, 100, 3) - 100个重建的轨迹点
         
         # 如果只有一条轨迹，squeeze掉第一维
         if num_pred_paths == 1:
-            predTrajs = predTrajs.squeeze(0)  # (20, 3)
-            output_dim = predTrajs.shape[0]
+            predTrajs = predTrajs.squeeze(0)  # (100, 3)
+            output_dim = predTrajs.shape[0]  # 100
         else:
-            output_dim = predTrajs.shape[1]  # 20
+            output_dim = predTrajs.shape[1]  # 100
         
         if num_pred_paths == 1:
             print(f"Predicted Traj: {predTrajs}")
@@ -575,15 +391,27 @@ if __name__ == "__main__":
     epoch = 4
     stage = 1
     
+    # ema = True
+    ema = False
+    # ema_decay = 0.99
+    ema_decay = 0.999
+    
     # =================== 多轨迹配置 ===================
     # 设置为1: 只生成单条轨迹（确定性预测）
     # 设置为>1: 生成多条轨迹（展示扩散模型的多峰性）
     # num_pred_paths = 100  # 每个场景生成100条不同的轨迹
     # num_pred_paths = 20  # 每个场景生成20条不同的轨迹
-    # num_pred_paths = 10  # 每个场景生成5条不同的轨迹
-    num_pred_paths = 5  # 每个场景生成5条不同的轨迹
+    num_pred_paths = 10  # 每个场景生成5条不同的轨迹
+    # num_pred_paths = 5  # 每个场景生成5条不同的轨迹
     # num_pred_paths = 1  # 单条轨迹模式
     # ================================================
+    
+    # =================== ODE求解器配置 ===================
+    # 'euler': 一阶Euler方法（快速，但精度较低）
+    # 'heun': 二阶Heun方法（较慢，但精度更高）
+    # solver = 'heun'  # 推荐：精度更高
+    solver = 'euler'  # 可选：速度更快
+    # ==================================================
     
     # =================== 样条插值配置 ===================
     # True: 使用三次样条插值生成平滑轨迹（100个点，保证经过所有控制点）
@@ -595,7 +423,7 @@ if __name__ == "__main__":
 
     envNum = np.random.randint(0, 99)  # 随机选择环境id
     # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000008']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = ['env000012']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     save_path = 'predictions'
 
     modelFolder = 'data/sim'
@@ -608,8 +436,12 @@ if __name__ == "__main__":
     # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
     
     if best:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_model.pth'))
-        print(f"Loaded best stage {stage} model.")
+        if ema:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_ema_{ema_decay}.pth'))
+            print(f"Loaded best EMA stage {stage} model.")
+        else:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_model.pth'))
+            print(f"Loaded best stage {stage} model.")
     else:
         checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_stage{stage}_epoch_{epoch}.pth'))
         print(f"Loaded stage {stage} model from epoch {epoch}.")
@@ -649,6 +481,7 @@ if __name__ == "__main__":
     for env in envType_list:
         print(f"Evaluating environment: {env}")
         print(f"Generating {num_pred_paths} trajectory sample(s) per scene")
+        print(f"ODE Solver: {solver} ({'1st-order Euler' if solver == 'euler' else '2nd-order Heun'})")
         print(f"Spline interpolation: {'Enabled' if use_bezier_interpolate else 'Disabled'}")
 
         # 绘制多组轨迹对比图
