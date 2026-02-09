@@ -637,9 +637,9 @@ class PathDiffusionTransformer(nn.Module):
         # ========== 条件融合MLP ==========
         # 将时间步、起点和终点融合为全局条件
         self.cond_mlp = nn.Sequential(
-            nn.Linear(d_model * 3, d_model * 4),  # 3 = time + start + goal
+            nn.Linear(d_model * 4, d_model * 5),  # 4 = time + time_r + start + goal
             nn.GELU(),
-            nn.Linear(d_model * 4, d_model)
+            nn.Linear(d_model * 5, d_model)
         )
         
         # ========== 起点终点编码（用于条件调制）==========
@@ -718,8 +718,9 @@ class PathDiffusionTransformer(nn.Module):
         
         # 时间步采样策略参数（用于训练时的智能采样）
         # 使用logit-normal分布，避免t=0和t=1的极端值
-        self.register_buffer('t_sample_mean', torch.tensor(0.0))  # logit空间的均值
-        self.register_buffer('t_sample_std', torch.tensor(1.0))   # logit空间的标准差
+        self.register_buffer('t_sample_mean', torch.tensor(-0.8))  # logit空间的均值
+        self.register_buffer('t_sample_std', torch.tensor(0.8))   # logit空间的标准差
+        self.register_buffer('t_uniform_prob', torch.tensor(0.1))   # logit空间的均匀采样概率比例
     
     def sample_timesteps(self, n: int, device=None):
         """
@@ -739,17 +740,23 @@ class PathDiffusionTransformer(nn.Module):
         if device is None:
             device = self.t_sample_mean.device
         
+        selector = torch.rand(n, device=device)
+        
         # logit-normal分布采样
         z = torch.randn(n, device=device) * self.t_sample_std + self.t_sample_mean
-        # sigmoid映射到(0,1)，自然避免极端值
-        t_continuous = torch.sigmoid(z)
+        t_logit_normal = torch.sigmoid(z)
+        # 均匀采样
+        t_uniform = torch.rand(n, device=device)
+        
+        # 混合采样
+        t_continuous = torch.where(selector < self.t_uniform_prob, t_uniform, t_logit_normal)
         
         # 可选：进一步限制范围，避免数值问题
         t_continuous = torch.clamp(t_continuous, min=1e-5, max=1.0 - 1e-5)
         
         return t_continuous
     
-    def forward(self, map_input, noisy_path, timestep, start_pose, goal_pose):
+    def forward(self, map_input, noisy_path, timestep, timestep_r, start_pose, goal_pose):
         """
         扩散模型前向传播（解耦数据流版本）- Rectified Flow
         
@@ -807,11 +814,13 @@ class PathDiffusionTransformer(nn.Module):
         
         # ========== 3. 编码条件 (Condition) ==========
         t_emb = self.time_embedder(timestep)      # (B, D) - 时间步
+        r_emb = self.time_embedder(timestep_r)      # (B, D) - 时间步
         s_emb = self.pose_embedder(start_pose)    # (B, D) - 起点
         g_emb = self.pose_embedder(goal_pose)     # (B, D) - 终点
         
         # 融合所有全局条件 -> (B, D)
-        cond = self.cond_mlp(torch.cat([t_emb, s_emb, g_emb], dim=-1))
+        # cond = self.cond_mlp(torch.cat([t_emb, s_emb, g_emb], dim=-1))
+        cond = self.cond_mlp(torch.cat([t_emb, r_emb, s_emb, g_emb], dim=-1))
         # cond = t_emb  # 仅使用时间步作为条件
         
         # ========== 4. DiT Blocks（解耦数据流） ==========
@@ -865,8 +874,99 @@ class PathDiffusionTransformer(nn.Module):
         
         return z_t, noise
     
+    def get_velocity(self, z_in, t_scalar, r_scalar, map_input, start_pose, goal_pose):
+        """pMF 专用速度获取函数"""
+        B = z_in.shape[0]
+        device = z_in.device
+        
+        t_batch = torch.full((B,), t_scalar, device=device)
+        r_batch = torch.full((B,), r_scalar, device=device)
+        
+        # 模型前向传播，现在需要传入 t 和 r
+        model_out = self.forward(map_input, z_in, t_batch, r_batch, start_pose, goal_pose)
+        
+        # 统一逻辑：先求 pred_x0
+        if self.prediction_type == 'v':
+            pred_x0 = z_in - t_scalar * model_out
+        elif self.prediction_type == 'x0':
+            pred_x0 = model_out
+        elif self.prediction_type == 'epsilon':
+            pred_x0 = (z_in - t_scalar * model_out) # 基于 Rectified Flow: z = (1-t)x0 + t*eps -> x0 = z - t*eps 是不对的，应该是标准 RF 转换
+            # 建议训练和采样统一使用 x0 prediction 
+        
+        # pMF 采样逻辑：在 ODE 中，我们依然需要瞬时速度场 u = (z - x0) / t
+        if t_scalar < 1e-5:
+            return torch.zeros_like(z_in)
+            
+        v_field = (z_in - pred_x0) / t_scalar
+        return v_field
+    
     @torch.no_grad()
-    def sample_euler(self, map_input, start_pose, goal_pose, num_steps=None, reconstruct_trajectory=True, num_traj_points=100):
+    def sample_pmf_onestep(self, map_input, start_pose, goal_pose):
+        """pMF 核心：单步生成"""
+        device = map_input.device
+        B = map_input.shape[0]
+        
+        # 从纯噪声开始 t=1
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        
+        t_batch = torch.ones(B, device=device)
+        r_batch = torch.zeros(B, device=device) # 目标是 0 
+        
+        # 模型在 pMF 训练下，t=1, r=0 的输出即为修正后的高质量 x0
+        pred_x0 = self.forward(map_input, z, t_batch, r_batch, start_pose, goal_pose)
+        
+        # 组装控制点
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        control_points = torch.cat([start_xy, pred_x0, goal_xy], dim=1)
+        
+        return control_points
+    
+    @torch.no_grad()
+    def sample_pmf_refined(self, map_input, start_pose, goal_pose, 
+                                    refine_steps=3, t_refine_start=0.1):
+        """
+        严谨的连续时间 ODE 采样方案：
+        1. 阶段一：大步长跳跃。从 t=1 跨越到 t=coarse_step_r。
+        2. 阶段二：小步长精修。从 t=coarse_step_r 细化积分到 t=0。
+        这样保证了所有 z 都在同一个连续的 Probability Flow 轨迹上。
+        """
+        device = map_input.device
+        B = map_input.shape[0]
+
+        # --- 初始化 ---
+        z = torch.randn(B, self.n_path_steps, 2, device=device) # t=1
+        
+        # --- 阶段一：Coarse Jump (利用 pMF 的跨步能力) ---
+        t_start = 1.0
+        t_mid = t_refine_start
+        
+        # 调用模型预测从 1.0 到 0.2 的平均速度
+        # 根据 pMF 定义：z_mid = z_1 + (t_mid - t_start) * V(z_1, t=1, r=t_mid)
+        v_coarse = self.get_velocity(z, t_start, t_mid, map_input, start_pose, goal_pose)
+        z = z + (t_mid - t_start) * v_coarse # 注意此时 dt = -0.8
+        
+        # --- 阶段二：Fine-grained Integration (局部细化) ---
+        # 此时 z 已经严格处于 Probability Flow 上的 t=0.2 位置
+        timesteps = torch.linspace(t_mid, 0.0, refine_steps + 1, device=device)
+        
+        for i in range(refine_steps):
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            dt = t_next - t_curr
+            
+            # 保持 r = t_next，每一小步都利用 pMF 修正局部截断误差
+            v_fine = self.get_velocity(z, t_curr, t_next, map_input, start_pose, goal_pose)
+            z = z + dt * v_fine
+            
+        # --- 组装 ---
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        return torch.cat([start_xy, z, goal_xy], dim=1)
+    
+    @torch.no_grad()
+    def sample_euler(self, map_input, start_pose, goal_pose, num_steps=None):
         """
         一阶Euler ODE求解器（Rectified Flow采样）
         
@@ -885,14 +985,9 @@ class PathDiffusionTransformer(nn.Module):
             start_pose: (B, 4) 起点 (x,y,cos,sin)
             goal_pose: (B, 4) 终点 (x,y,cos,sin)
             num_steps: ODE求解步数（默认使用self.diffusion_steps）
-            reconstruct_trajectory: 是否使用B样条重建完整轨迹
-            num_traj_points: 重建轨迹的点数（如果reconstruct_trajectory=True）
         
         Returns:
-            如果 reconstruct_trajectory=True:
-                full_traj: (B, num_traj_points, 2) 完整轨迹
-            否则:
-                control_points: (B, n_path_steps+2, 2) 控制点（含起终点）
+            control_points: (B, n_path_steps+2, 2) 控制点（含起终点）
         """
         if num_steps is None:
             num_steps = self.diffusion_steps
@@ -908,28 +1003,12 @@ class PathDiffusionTransformer(nn.Module):
         
         # ODE积分（从t=1到t=0）
         for i in range(num_steps):
-            t_curr = timesteps[i]
-            t_next = timesteps[i + 1]
-            dt = t_next - t_curr  # 负数，因为从1到0
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            dt = t_next - t_curr
             
-            # 当前时间步（扩展到batch）
-            t_batch = torch.full((B,), t_curr, device=device)
-            
-            # 预测速度场 v_θ(z_t, t)
-            # 模型输出即为速度预测（Rectified Flow: v = x_1 - x_0）
-            if self.prediction_type == 'v':
-                v_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
-            elif self.prediction_type == 'x0':
-                x0_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
-                # 计算速度场 v = x_1 - x_0
-                v_pred = (z - x0_pred) / t_curr
-            elif self.prediction_type == 'epsilon':
-                noise_pred = self.forward(map_input, z, t_batch, start_pose, goal_pose)
-                # 计算速度场 v = (x_1 - x_0) = (z - x_0) / t
-                x0_pred = z - t_curr * noise_pred
-                v_pred = (z - x0_pred) / t_curr
-            
-            # Euler步进：z_{t+dt} = z_t + dt * v
+            # pMF 迭代建议：r 等于下一步的时间
+            v_pred = self.get_velocity(z, t_curr, t_next, map_input, start_pose, goal_pose)
             z = z + dt * v_pred
         
         # 组装完整控制点（起点 + 中间点 + 终点）
@@ -937,19 +1016,10 @@ class PathDiffusionTransformer(nn.Module):
         goal_xy = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
         control_points = torch.cat([start_xy, z, goal_xy], dim=1)  # (B, n_path_steps+2, 2)
         
-        # 可选：B样条重建完整轨迹
-        if reconstruct_trajectory:
-            full_traj = reconstruct_from_control_points(
-                control_points, 
-                num_points=num_traj_points, 
-                degree=3
-            )
-            return full_traj
-        else:
-            return control_points
+        return control_points
     
     @torch.no_grad()
-    def sample_heun(self, map_input, start_pose, goal_pose, num_steps=None, reconstruct_trajectory=True, num_traj_points=100):
+    def sample_heun(self, map_input, start_pose, goal_pose, num_steps=None):
         if num_steps is None:
             num_steps = self.diffusion_steps
         
@@ -962,75 +1032,30 @@ class PathDiffusionTransformer(nn.Module):
         # 时间步划分：从t=1到t=0
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
         
-        # 定义一个辅助函数来计算速度 v，避免重复代码
-        def get_velocity(z_in, t_scalar):
-            # 将标量 t 扩展为 batch
-            t_batch = torch.full((B,), t_scalar, device=device)
-            
-            # 模型前向
-            model_out = self.forward(map_input, z_in, t_batch, start_pose, goal_pose)
-            
-            if self.prediction_type == 'v':
-                return model_out
-            
-            elif self.prediction_type == 'x0':
-                # v = (z_t - x_0) / t
-                # 【关键修复】：处理 t 接近 0 的情况，防止除以零爆炸
-                if t_scalar < 1e-5:
-                    return None # 标记无法计算
-                return (z_in - model_out) / t_scalar
-                
-            elif self.prediction_type == 'epsilon':
-                # x0 = z - t * eps
-                # v = (z - x0) / t = eps
-                # 实际上 Rectified Flow 中如果预测 eps，eps 本身不太等同于 v (v = x1 - x0)，
-                # 但根据你之前的代码逻辑推导：
-                x0_pred = z_in - t_scalar * model_out
-                if t_scalar < 1e-5:
-                    return None
-                return (z_in - x0_pred) / t_scalar
-            return model_out
-
         # ODE积分（从t=1到t=0）
         for i in range(num_steps):
-            t_curr = timesteps[i]
-            t_next = timesteps[i + 1]
-            dt = t_next - t_curr  # 负数
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            dt = t_next - t_curr
             
-            # 1. 第一次评估：v1 = v(z_curr, t_curr)
-            v1 = get_velocity(z, t_curr)
+            # 1. 评估 v1 (r 取 t_next)
+            v1 = self.get_velocity(z, t_curr, t_next, map_input, start_pose, goal_pose)
             
-            # 理论上 t_curr 从 1.0 开始，不会是 0，除非一开始就是 0
-            if v1 is None: v1 = torch.zeros_like(z) 
-            
-            # 2. Euler 预测步
+            # 2. 预测步
             z_pred = z + dt * v1
             
-            # 3. 第二次评估：v2 = v(z_pred, t_next)
-            # 【关键修复】：这里不能直接调 forward，必须转换！
-            v2 = get_velocity(z_pred, t_next)
+            # 3. 评估 v2
+            v2 = self.get_velocity(z_pred, t_next, t_next, map_input, start_pose, goal_pose)
             
-            # 4. Heun 校正
-            # 如果是最后一步 (t_next == 0)，无法计算 v2 (除以零)，则退化为 Euler
-            if v2 is None:
-                z = z + dt * v1  # 最后一步仅使用 Euler
-            else:
-                z = z + dt * (v1 + v2) / 2 # Heun
+            # 4. 校正步
+            z = z + dt * (v1 + v2) / 2
         
         # 组装完整控制点
         start_xy = start_pose[:, :2].unsqueeze(1)
         goal_xy = goal_pose[:, :2].unsqueeze(1)
         control_points = torch.cat([start_xy, z, goal_xy], dim=1)
         
-        if reconstruct_trajectory:
-            full_traj = reconstruct_from_control_points(
-                control_points,
-                num_points=num_traj_points,
-                degree=3
-            )
-            return full_traj
-        else:
-            return control_points
+        return control_points
     
     
     @torch.no_grad()
@@ -1068,24 +1093,28 @@ class PathDiffusionTransformer(nn.Module):
         goal_pose_batch = goal_pose.expand(num_samples, -1)
         
         # 选择ODE求解器
-        if solver == 'euler':
-            result = self.sample_euler(
-                map_input_batch, 
-                start_pose_batch, 
-                goal_pose_batch,
-                num_steps=num_steps,
-                reconstruct_trajectory=False,  # 先获取控制点
-            )
+        if solver == 'pmf_onestep':
+            result = self.sample_pmf_onestep(map_input_batch, 
+                                             start_pose_batch, 
+                                             goal_pose_batch)
+        elif solver == 'pmf_refined':
+            result = self.sample_pmf_refined(map_input_batch, 
+                                             start_pose_batch, 
+                                             goal_pose_batch, 
+                                             refine_steps=num_steps, 
+                                             t_refine_start=0.1)
+        elif solver == 'euler':
+            result = self.sample_euler(map_input_batch, 
+                                       start_pose_batch, 
+                                       goal_pose_batch, 
+                                       num_steps=num_steps)
         elif solver == 'heun':
-            result = self.sample_heun(
-                map_input_batch,
-                start_pose_batch,
-                goal_pose_batch,
-                num_steps=num_steps,
-                reconstruct_trajectory=False,  # 先获取控制点
-            )
+            result = self.sample_heun(map_input_batch, 
+                                      start_pose_batch, 
+                                      goal_pose_batch, 
+                                      num_steps=num_steps)
         else:
-            raise ValueError(f"Unknown solver: {solver}. Choose 'euler' or 'heun'.")
+            raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_onestep', 'euler' or 'heun'.")
         
         # result: (num_samples, n_path_steps+2, 2) - 包含起终点的控制点
         control_points_normalized = torch.clamp(result, -1.0, 1.0)

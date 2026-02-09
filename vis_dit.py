@@ -25,7 +25,7 @@ from relative_motion_utils import relative_motion_to_trajectory
 dataset_path = 'data/sim_dataset/val'
 # dataset_path = 'data/sim_dataset/train'
 
-diffusion_step = 50
+diffusion_step = None
 
 def generate_paths(model, map_input, start_point, goal_point, num_paths=5, 
                    reconstruct_trajectory=True, num_traj_points=100, solver='heun'):
@@ -393,8 +393,8 @@ if __name__ == "__main__":
     
     ema = True
     # ema = False
-    # ema_decay = 0.99
-    ema_decay = 0.999
+    ema_decay = 0.99
+    # ema_decay = 0.999
     
     # =================== 多轨迹配置 ===================
     # 设置为1: 只生成单条轨迹（确定性预测）
@@ -407,10 +407,15 @@ if __name__ == "__main__":
     # ================================================
     
     # =================== ODE求解器配置 ===================
+    # 'pmf_onestep': 一步预测方法（快速）
     # 'euler': 一阶Euler方法（快速，但精度较低）
     # 'heun': 二阶Heun方法（较慢，但精度更高）
-    solver = 'heun'  # 推荐：精度更高
+    # solver = 'pmf_onestep'  # 快速的一步预测方法
+    solver = 'pmf_refined'
     # solver = 'euler'  # 可选：速度更快
+    diffusion_step = 3
+    # solver = 'heun'  # 推荐：精度更高
+    # diffusion_step = 50
     # ==================================================
     
     # =================== 样条插值配置 ===================
@@ -481,7 +486,7 @@ if __name__ == "__main__":
     for env in envType_list:
         print(f"Evaluating environment: {env}")
         print(f"Generating {num_pred_paths} trajectory sample(s) per scene")
-        print(f"ODE Solver: {solver} ({'1st-order Euler' if solver == 'euler' else '2nd-order Heun'})")
+        print(f"ODE Solver: {solver}")
         print(f"Spline interpolation: {'Enabled' if use_bezier_interpolate else 'Disabled'}")
 
         # 绘制多组轨迹对比图
