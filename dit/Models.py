@@ -57,7 +57,6 @@ from bspline_utils import (
     DifferentiableBSpline
 )
 
-
 import math
 
 
@@ -111,12 +110,12 @@ class TrajDiTBlock(nn.Module):
             # 1. Self-Attention
             x_norm = self.norm1(x)
             x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-            attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
+            attn_out, _ = self.self_attn(x_norm, x_norm, x_norm, need_weights=False)
             x = x + gate_msa.unsqueeze(1) * attn_out
             # 2. Cross-Attention
             x_norm = self.norm2(x)
             x_norm = x_norm * (1 + scale_mca.unsqueeze(1)) + shift_mca.unsqueeze(1)
-            attn_out, _ = self.cross_attn(x_norm, map_feat, map_feat)
+            attn_out, _ = self.cross_attn(x_norm, map_feat, map_feat, need_weights=False)
             x = x + gate_mca.unsqueeze(1) * attn_out
             # 3. FFN
             x_norm = self.norm3(x)
@@ -188,7 +187,7 @@ class DiTBlock(nn.Module):
         # Self-attention分支
         x_norm = self.norm1(x)
         x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        x_self, _ = self.self_attn(x_norm, x_norm, x_norm)
+        x_self, _ = self.self_attn(x_norm, x_norm, x_norm, need_weights=False)
         x = x + gate_msa.unsqueeze(1) * x_self
         
         # FFN分支
@@ -269,6 +268,58 @@ class PositionalEncoding(nn.Module):
         # assert x.shape[0]==1, "仅支持单样本推理"  # 原注释：批量推理的限制
         selectIndex = rearrange(self.hashIndex[:conv_shape[0], :conv_shape[1]], 'h w -> (h w)')  # 根据卷积输出形状选择对应的位置编码索引：从左上角开始选择conv_shape大小的区域并展平
         return x + torch.index_select(self.pos_table, dim=1, index=selectIndex)  # 残差连接：将精确选择的位置编码加到输入特征上
+
+
+class MultiScalePositionalEncoding(nn.Module):
+    """
+    动态2D位置编码：支持任意(H, W)的特征图。
+    用于多尺度KV场景（如25x25与12x12并存）。
+    """
+    def __init__(self, d_hid):
+        super().__init__()
+        self.d_hid = d_hid
+
+    def _build_2d_sincos(self, h, w, device, dtype):
+        # 2D sin-cos，优先按4路拆分；若d_hid非4倍数，尾部补零
+        d_quarter = self.d_hid // 4
+        d_used = d_quarter * 4
+
+        y = torch.arange(h, device=device, dtype=dtype)
+        x = torch.arange(w, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        yy = yy.reshape(-1, 1)
+        xx = xx.reshape(-1, 1)
+
+        if d_quarter > 0:
+            div_term = torch.exp(
+                torch.arange(d_quarter, device=device, dtype=dtype) *
+                (-math.log(10000.0) / max(d_quarter, 1))
+            ).unsqueeze(0)  # (1, d_quarter)
+
+            pos_x = xx * div_term
+            pos_y = yy * div_term
+
+            pe = torch.cat([
+                torch.sin(pos_x), torch.cos(pos_x),
+                torch.sin(pos_y), torch.cos(pos_y)
+            ], dim=1)  # (H*W, 4*d_quarter)
+        else:
+            pe = torch.zeros((h * w, 0), device=device, dtype=dtype)
+
+        if d_used < self.d_hid:
+            pad = torch.zeros((h * w, self.d_hid - d_used), device=device, dtype=dtype)
+            pe = torch.cat([pe, pad], dim=1)
+
+        return pe.unsqueeze(0)  # (1, H*W, D)
+
+    def forward(self, x, conv_shape):
+        if conv_shape is None:
+            raise ValueError("MultiScalePositionalEncoding requires conv_shape=(H,W).")
+        h, w = int(conv_shape[0]), int(conv_shape[1])
+        pos = self._build_2d_sincos(h, w, x.device, x.dtype)
+        if x.shape[1] != h * w:
+            raise ValueError(f"Token length mismatch: got {x.shape[1]}, expected {h*w} for conv_shape={conv_shape}.")
+        return x + pos
 
 
 class Encoder(nn.Module):
@@ -600,38 +651,49 @@ class PathDiffusionTransformer(nn.Module):
         
         self.prediction_type = prediction_type
         self.loss_type = loss_type if loss_type is not None else prediction_type
+        # 显存优化：训练时对DiT主干启用梯度检查点
+        self.use_gradient_checkpoint = True
         
-        # ========== 地图CNN特征提取（保留原架构）==========
-        self.map_fe = nn.Sequential(
-            # Block 1
+        # ========== 地图CNN特征提取（多尺度KV）==========
+        self.map_fe_block1 = nn.Sequential(
             nn.Conv2d(3, d_model//8, kernel_size=3, padding=1),
             nn.BatchNorm2d(d_model//8),
             nn.ReLU(),
             nn.MaxPool2d(2),  # 50×50
-            
-            # Block 2
+        )
+
+        self.map_fe_block2 = nn.Sequential(
             nn.Conv2d(d_model//8, d_model//4, kernel_size=3, padding=1),
             nn.BatchNorm2d(d_model//4),
             nn.ReLU(),
             nn.MaxPool2d(2),  # 25×25
-            
-            # Block 3
+        )
+
+        self.map_fe_block3 = nn.Sequential(
             nn.Conv2d(d_model//4, d_model//2, kernel_size=3, padding=1),
             nn.BatchNorm2d(d_model//2),
             nn.ReLU(),
             nn.MaxPool2d(2),  # 12×12
-            
-            # Block 4
+        )
+
+        self.map_fe_block4 = nn.Sequential(
             nn.Conv2d(d_model//2, d_model, kernel_size=3, padding=1),
             nn.BatchNorm2d(d_model),
             nn.ReLU(),
             nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
             nn.BatchNorm2d(d_model),
-            nn.ReLU(),             
+            nn.ReLU(),
+        )
+
+        # 25×25 分支通道对齐到 d_model，用于高分辨率KV
+        self.map_proj_25 = nn.Sequential(
+            nn.Conv2d(d_model//4, d_model, kernel_size=1),
+            nn.BatchNorm2d(d_model),
+            nn.ReLU(),
         )
         
         self.reorder_dims = Rearrange('b c h w -> b (h w) c')
-        self.position_enc = PositionalEncoding(d_model, n_position=n_position, train_shape=train_shape)
+        self.map_position_enc = MultiScalePositionalEncoding(d_model)
         self.dropout = nn.Dropout(p=dropout)
         
         # ========== 条件融合MLP ==========
@@ -685,6 +747,13 @@ class PathDiffusionTransformer(nn.Module):
         # self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
         
         # 主预测头（dit_blocks前已有LayerNorm，无需重复）
+        # self.main_pred = nn.Sequential(
+        #     nn.Linear(d_model, d_model // 2),
+        #     nn.GELU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(d_model // 2, 2)  # (x, y)
+        # )
+        
         self.main_pred = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
@@ -748,7 +817,7 @@ class PathDiffusionTransformer(nn.Module):
         t_continuous = torch.clamp(t_continuous, min=1e-5, max=1.0 - 1e-5)
         
         return t_continuous
-    
+
     def forward(self, map_input, noisy_path, timestep, timestep_r, start_pose, goal_pose):
         """
         扩散模型前向传播（解耦数据流版本）- Rectified Flow
@@ -772,17 +841,17 @@ class PathDiffusionTransformer(nn.Module):
         """
         B = map_input.shape[0]
         
-        # ========== 1. 编码地图 (Context) ==========
-        map_feat = self.map_fe(map_input)  # (B, D, Hf, Wf)
-        conv_map_shape = map_feat.shape[-2:]
-        map_tokens = self.reorder_dims(map_feat)  # (B, N_map, D)
-        
-        # 添加位置编码（地图的空间位置信息）
-        map_tokens = self.position_enc(
-            map_tokens, 
-            conv_shape=conv_map_shape if not self.training else None
-        )
-        # Map tokens作为KV，不需要Dropout和LayerNorm（在Block内部处理）
+        # ========== 1. 编码地图 (Context, 单尺度25x25 KV) ==========
+        feat_50 = self.map_fe_block1(map_input)           # (B, d_model//8, 50, 50)
+        feat_25 = self.map_fe_block2(feat_50)             # (B, d_model//4, 25, 25)
+        feat_12 = self.map_fe_block3(feat_25)             # (B, d_model//2, 12, 12)
+        feat_12 = self.map_fe_block4(feat_12)             # (B, d_model, 12, 12)
+        # feat_25_proj = self.map_proj_25(feat_25)          # (B, d_model, 25, 25)
+
+        # map_tokens = self.reorder_dims(feat_25_proj)      # (B, 625, D)
+        # map_tokens = self.map_position_enc(map_tokens, conv_shape=feat_25_proj.shape[-2:])
+        map_tokens = self.reorder_dims(feat_12)           # (B, 144, D)
+        map_tokens = self.map_position_enc(map_tokens, conv_shape=feat_12.shape[-2:])
         
         # ========== 2. 编码路径 + 起终点 (Query Sequence) ==========
         # 2.1 编码中间路径点 (B, N, D)
@@ -822,15 +891,20 @@ class PathDiffusionTransformer(nn.Module):
         # cond: 全局条件，通过AdaLN调制每一层
         x = combined_tokens
         for block in self.dit_blocks:
-            x = block(x, map_tokens, cond)
+            if self.training and self.use_gradient_checkpoint:
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, map_tokens, cond, use_reentrant=False
+                )
+            else:
+                x = block(x, map_tokens, cond)
             
         x = self.layer_norm(x)  # 最后LayerNorm
         
-        # ========== 5. 输出预测 ==========
+        # ========== 5. 输出预测（单头连续回归） ==========
         middle_feats = x[:, 1:-1, :]  # 提取中间控制点特征，去掉起终点 (B, n_path_steps, D)
         model_output = self.main_pred(middle_feats)  # (B, n_path_steps, 2)
-        
-        return model_output
+        model_output = torch.clamp(model_output, -1.0, 1.0)
+        return model_output  # 返回24个中间控制点
     
     def q_sample(self, x_start, t, noise=None):
         """
@@ -893,6 +967,102 @@ class PathDiffusionTransformer(nn.Module):
             
         v_field = (z_in - pred_x0) / t_scalar
         return v_field
+
+    def get_velocity_tensor(self, z_in, t_scalar, r_scalar, map_input, start_pose, goal_pose):
+        """可微分的速度获取函数（t/r 使用 0-d tensor）"""
+        B = z_in.shape[0]
+        device = z_in.device
+
+        if not torch.is_tensor(t_scalar):
+            t_scalar = torch.tensor(t_scalar, device=device, dtype=z_in.dtype)
+        if not torch.is_tensor(r_scalar):
+            r_scalar = torch.tensor(r_scalar, device=device, dtype=z_in.dtype)
+
+        t_batch = t_scalar.expand(B)
+        r_batch = r_scalar.expand(B)
+
+        model_out = self.forward(map_input, z_in, t_batch, r_batch, start_pose, goal_pose)
+
+        if self.prediction_type == 'v':
+            pred_x0 = z_in - t_scalar * model_out
+        elif self.prediction_type == 'x0':
+            pred_x0 = model_out
+        else:  # 'epsilon'
+            pred_x0 = (z_in - t_scalar * model_out)
+
+        eps = 1e-5
+        v_field = (z_in - pred_x0) / (t_scalar + eps)
+        return v_field
+
+    def sample_differentiable(self, map_input, start_pose, goal_pose, num_steps=3,
+                              solver='pmf_refined', reconstruct_trajectory=True, num_traj_points=100):
+        """
+        可微分采样（用于训练期的梯度回传）。
+
+        Args:
+            map_input: (B, 3, H, W)
+            start_pose: (B, 4) 归一化起点 (x,y,cos,sin)
+            goal_pose: (B, 4) 归一化终点 (x,y,cos,sin)
+        Returns:
+            reconstructed_traj: (B, num_traj_points, 2) 或控制点 (B, n_path_steps+2, 2)
+        """
+        device = map_input.device
+        B = map_input.shape[0]
+
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+
+        if solver == 'pmf_refined':
+            t_start = torch.tensor(1.0, device=device)
+            t_mid = torch.tensor(0.1, device=device)
+
+            v_coarse = self.get_velocity_tensor(z, t_start, t_mid, map_input, start_pose, goal_pose)
+            z = z + (t_mid - t_start) * v_coarse
+
+            timesteps = torch.linspace(t_mid, torch.tensor(0.0, device=device), num_steps + 1, device=device)
+            for i in range(num_steps):
+                t_curr = timesteps[i]
+                t_next = timesteps[i + 1]
+                dt = t_next - t_curr
+                v_fine = self.get_velocity_tensor(z, t_curr, t_next, map_input, start_pose, goal_pose)
+                z = z + dt * v_fine
+        elif solver == 'euler':
+            timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+            for i in range(num_steps):
+                t_curr = timesteps[i]
+                t_next = timesteps[i + 1]
+                dt = t_next - t_curr
+                v_pred = self.get_velocity_tensor(z, t_curr, t_next, map_input, start_pose, goal_pose)
+                z = z + dt * v_pred
+        elif solver == 'heun':
+            timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+            for i in range(num_steps):
+                t_curr = timesteps[i]
+                t_next = timesteps[i + 1]
+                dt = t_next - t_curr
+                v1 = self.get_velocity_tensor(z, t_curr, t_next, map_input, start_pose, goal_pose)
+                z_pred = z + dt * v1
+                v2 = self.get_velocity_tensor(z_pred, t_next, t_next, map_input, start_pose, goal_pose)
+                z = z + dt * (v1 + v2) / 2
+        else:
+            raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_refined', 'euler' or 'heun'.")
+
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        control_points = torch.cat([start_xy, z, goal_xy], dim=1)
+
+        control_points_normalized = torch.clamp(control_points, -1.0, 1.0)
+        control_points_denorm = control_points_normalized * 20.0
+
+        if not reconstruct_trajectory:
+            return control_points_denorm
+
+        bspline_layer = DifferentiableBSpline(
+            num_control_points=self.n_path_steps + 2,
+            num_output_points=num_traj_points,
+            degree=3
+        ).to(device)
+        reconstructed_traj = bspline_layer(control_points_denorm)
+        return reconstructed_traj
     
     @torch.no_grad()
     def sample_pmf_onestep(self, map_input, start_pose, goal_pose):
@@ -920,7 +1090,6 @@ class PathDiffusionTransformer(nn.Module):
     def sample_pmf_refined(self, map_input, start_pose, goal_pose, 
                                     refine_steps=3, t_refine_start=0.1):
         """
-        严谨的连续时间 ODE 采样方案：
         1. 阶段一：大步长跳跃。从 t=1 跨越到 t=coarse_step_r。
         2. 阶段二：小步长精修。从 t=coarse_step_r 细化积分到 t=0。
         这样保证了所有 z 都在同一个连续的 Probability Flow 轨迹上。
@@ -935,13 +1104,13 @@ class PathDiffusionTransformer(nn.Module):
         t_start = 1.0
         t_mid = t_refine_start
         
-        # 调用模型预测从 1.0 到 0.2 的平均速度
+        # 调用模型预测从 1.0 到 0.1 的平均速度
         # 根据 pMF 定义：z_mid = z_1 + (t_mid - t_start) * V(z_1, t=1, r=t_mid)
         v_coarse = self.get_velocity(z, t_start, t_mid, map_input, start_pose, goal_pose)
-        z = z + (t_mid - t_start) * v_coarse # 注意此时 dt = -0.8
+        z = z + (t_mid - t_start) * v_coarse # 注意此时 dt = -0.9
         
         # --- 阶段二：Fine-grained Integration (局部细化) ---
-        # 此时 z 已经严格处于 Probability Flow 上的 t=0.2 位置
+        # 此时 z 已经严格处于 Probability Flow 上的 t=0.1 位置
         timesteps = torch.linspace(t_mid, 0.0, refine_steps + 1, device=device)
         
         for i in range(refine_steps):
@@ -1080,10 +1249,22 @@ class PathDiffusionTransformer(nn.Module):
         """
         device = map_input.device
         
-        # 扩展batch维度
-        map_input_batch = map_input.expand(num_samples, -1, -1, -1)
-        start_pose_batch = start_pose.expand(num_samples, -1)
-        goal_pose_batch = goal_pose.expand(num_samples, -1)
+        # 扩展batch维度（处理任意批大小）
+        # 如果输入批大小为1，使用expand；否则使用repeat然后提取第一个样本
+        batch_size = map_input.shape[0]
+        
+        # 【修复】对每个batch样本生成num_samples个采样
+        # 使用repeat_interleave保证样本顺序：[s1, s1, ..., s1, s2, s2, ..., s2, ...]
+        if num_samples == 1:
+            # 特殊优化：只需1个采样
+            map_input_batch = map_input  # (B, C, H, W)
+            start_pose_batch = start_pose  # (B, 4)
+            goal_pose_batch = goal_pose  # (B, 4)
+        else:
+            # 多采样：为每个样本复制num_samples次（保持顺序）
+            map_input_batch = map_input.repeat_interleave(num_samples, dim=0)  # (B*num_samples, C, H, W)
+            start_pose_batch = start_pose.repeat_interleave(num_samples, dim=0)  # (B*num_samples, 4)
+            goal_pose_batch = goal_pose.repeat_interleave(num_samples, dim=0)  # (B*num_samples, 4)
         
         # 选择ODE求解器
         if solver == 'pmf_onestep':
@@ -1109,14 +1290,14 @@ class PathDiffusionTransformer(nn.Module):
         else:
             raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_onestep', 'euler' or 'heun'.")
         
-        # result: (num_samples, n_path_steps+2, 2) - 包含起终点的控制点
+        # result: (batch_size, n_path_steps+2, 2) 或 (batch_size*num_samples, n_path_steps+2, 2)
         control_points_normalized = torch.clamp(result, -1.0, 1.0)
-        
-        if not reconstruct_trajectory:
-            return control_points_normalized
         
         # 反归一化控制点: [-1,1] -> [-20,20]
         control_points_denorm = control_points_normalized * 20.0
+        
+        if not reconstruct_trajectory:
+            return control_points_denorm
         
         # 使用B样条重建轨迹
         bspline_layer = DifferentiableBSpline(
@@ -1126,7 +1307,7 @@ class PathDiffusionTransformer(nn.Module):
         ).to(device)
         reconstructed_traj = bspline_layer(control_points_denorm)
         
-        return reconstructed_traj  # (num_samples, num_traj_points, 2)
+        return reconstructed_traj  # (batch_size, num_traj_points, 2) 或 (batch_size*num_samples, num_traj_points, 2)
 
     
 

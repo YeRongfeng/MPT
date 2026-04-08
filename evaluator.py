@@ -34,16 +34,19 @@ class TrajectoryEvaluator:
             device: 计算设备
         """
         self.device = torch.device(device)
-        
+        self.map_info = map_info
+
         if occupancy_map is not None:
-            self.occupancy_map = occupancy_map.to(device=self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            occ = self._normalize_map_layout(occupancy_map)
+            self.occupancy_map = occ.to(device=self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
             self.has_map = True
         else:
             self.occupancy_map = None
             self.has_map = False
             
         if yaw_stability_map is not None:
-            self.yaw_stability_map = yaw_stability_map.to(device=self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            stab = self._normalize_map_layout(yaw_stability_map)
+            self.yaw_stability_map = stab.to(device=self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
             self.has_stability_map = True
         else:
             self.yaw_stability_map = None
@@ -53,16 +56,50 @@ class TrajectoryEvaluator:
             self.map_res = map_info['resolution']
             self.map_origin = map_info['origin']  # (x, y, yaw)
             # 优先使用 yaw_stability_map 的形状，如果没有则使用 occupancy_map
-            if yaw_stability_map is not None:
-                self.map_size_pixels = yaw_stability_map.shape
-            elif occupancy_map is not None:
-                self.map_size_pixels = occupancy_map.shape
+            if self.has_stability_map:
+                # 内部统一为 (D, H, W)
+                self.map_size_pixels = tuple(self.yaw_stability_map.shape[-3:])
+            elif self.has_map:
+                # 内部统一为 (D, H, W)
+                self.map_size_pixels = tuple(self.occupancy_map.shape[-3:])
             else:
                 self.map_size_pixels = None
         else:
             self.map_res = None
             self.map_origin = None
             self.map_size_pixels = None
+
+    def _normalize_map_layout(self, map_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        将输入地图统一为 (D, H, W)。
+        支持输入为 (D,H,W) 或 (H,W,D)。
+        """
+        if not isinstance(map_tensor, torch.Tensor):
+            map_tensor = torch.as_tensor(map_tensor)
+
+        if map_tensor.ndim != 3:
+            raise ValueError(f"Expected 3D map tensor, got shape={tuple(map_tensor.shape)}")
+
+        if self.map_info is None:
+            # 无法判断时维持原样（兼容旧行为）
+            return map_tensor
+
+        W, H, D = self.map_info['size']
+        s0, s1, s2 = map_tensor.shape
+
+        # 已是 (D,H,W)
+        if (s0, s1, s2) == (D, H, W):
+            return map_tensor
+
+        # 是 (H,W,D)，转为 (D,H,W)
+        if (s0, s1, s2) == (H, W, D):
+            return map_tensor.permute(2, 0, 1).contiguous()
+
+        # 兜底：如果最后一维看起来是 yaw 维，则按 (H,W,D) 处理
+        if s2 == D:
+            return map_tensor.permute(2, 0, 1).contiguous()
+
+        return map_tensor
     
     def world_to_grid_normalized(self, poses_world: torch.Tensor) -> torch.Tensor:
         """
@@ -192,24 +229,26 @@ class TrajectoryEvaluator:
         
         # 方法1: 基于ESDF的碰撞风险（假设地图存储带符号距离）
         d_safe = 0.15  # 安全距离阈值（米）
-        kalpa = 0.08   # 平滑参数（米）
-        z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
-        collision_risk = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
+        kalpa = 0.7  # 平滑参数（米）
+        # z = (-(esdf_flat - d_safe) / (kalpa + 1e-12))
+        # collision_risk = torch.sigmoid(torch.clamp(z, min=-50.0, max=50.0))
+        alpha = 10.0 
+        collision_risk = torch.nn.functional.softplus(-alpha * (esdf_flat - d_safe)) / alpha
         
         metrics['collision_risk_mean'] = collision_risk.mean().item()
         metrics['collision_risk_max'] = collision_risk.max().item()
         metrics['collision_risk_std'] = collision_risk.std().item()
         
-        # 计算危险点的比例（风险 > 0.5）
-        dangerous_points = (collision_risk > 0.5).sum().float()
-        metrics['dangerous_point_ratio'] = (dangerous_points / len(collision_risk)).item()
+        # 计算危险点的比例（基于ESDF插值结果，距离<=0视为碰撞/危险）
+        dangerous_points = (esdf_flat < 0.0).sum().float()
+        metrics['dangerous_point_ratio'] = (dangerous_points / len(esdf_flat)).item()
         
         # 最小距离
         metrics['min_obstacle_distance'] = esdf_flat.min().item()
         
         return metrics
     
-    def _evaluate_yaw_stability(self, trajectory: torch.Tensor, stability_threshold: float = 0.5, debug: bool = False) -> Dict[str, float]:
+    def _evaluate_yaw_stability(self, trajectory: torch.Tensor, stability_threshold: float = 0., debug: bool = False) -> Dict[str, float]:
         """
         评估轨迹点的yaw稳定性（基于二值化稳定性地图）
         
@@ -255,7 +294,7 @@ class TrajectoryEvaluator:
         stability_sample = F.grid_sample(
             self.yaw_stability_map,
             grid_coords,
-            mode='nearest',  # 改用最近邻插值，保持0/1的二值特性
+            mode='bilinear',  # 改用最近邻插值，保持0/1的二值特性
             padding_mode='border',
             align_corners=True
         )
@@ -329,11 +368,25 @@ class TrajectoryEvaluator:
         metrics['smoothness_y'] = (ay**2).mean().item()
         metrics['smoothness_yaw'] = (ayaw**2).mean().item()
         metrics['smoothness_total'] = ((ax**2 + ay**2 + ayaw**2).mean()).item()
-        
-        # 平滑度的标准差（抖动程度）
-        metrics['jerk_x'] = ax.std().item()
-        metrics['jerk_y'] = ay.std().item()
-        metrics['jerk_yaw'] = ayaw.std().item()
+
+        # jerk 应为加速度的一阶差分（离散时间下 j[k] = a[k+1]-a[k]）
+        # 这里没有显式 dt，按每采样步长为 1 计算离散 jerk 指标。
+        if accelerations.shape[0] >= 2:
+            jerk = accelerations[1:] - accelerations[:-1]  # (K-1, 3)
+            jx, jy, jyaw = jerk[:, 0], jerk[:, 1], jerk[:, 2]
+            # 使用 RMS 作为 jerk 强度指标
+            metrics['jerk_x'] = torch.sqrt((jx**2).mean() + 1e-12).item()
+            metrics['jerk_y'] = torch.sqrt((jy**2).mean() + 1e-12).item()
+            metrics['jerk_yaw'] = torch.sqrt((jyaw**2).mean() + 1e-12).item()
+        else:
+            metrics['jerk_x'] = 0.0
+            metrics['jerk_y'] = 0.0
+            metrics['jerk_yaw'] = 0.0
+
+        # 保留原有“加速度抖动”统计，避免语义混淆
+        metrics['acc_std_x'] = ax.std().item()
+        metrics['acc_std_y'] = ay.std().item()
+        metrics['acc_std_yaw'] = ayaw.std().item()
         
         return metrics
     

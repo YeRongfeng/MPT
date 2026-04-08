@@ -1301,13 +1301,25 @@ class UnevenPathDataLoader(Dataset):
 
     """
 
-    def __init__(self, env_list, dataFolder, compute_stability_map=False):
+    def __init__(
+        self,
+        env_list,
+        dataFolder,
+        compute_stability_map=False,
+        use_precomputed_stability=False,
+        stability_map_filename='stability_map.npz',
+        compute_stability_if_missing=False,
+    ):
         self.num_env = len(env_list)
         self.env_list = env_list
         self.dataFolder = dataFolder
         self.compute_stability_map = compute_stability_map
+        self.use_precomputed_stability = use_precomputed_stability
+        self.stability_map_filename = stability_map_filename
+        self.compute_stability_if_missing = compute_stability_if_missing
         self.env_index = {env_name: i for i, env_name in enumerate(env_list)}
         self.indexDict = []
+        self.env_static_cache = {}  # 每个环境的静态缓存：地图通道/编码输入/stability等
         
         for env_name in env_list:
             env_path = osp.join(dataFolder, env_name)
@@ -1316,27 +1328,81 @@ class UnevenPathDataLoader(Dataset):
             for i in range(len(path_files)):
                 self.indexDict.append((self.env_index[env_name], i))
         
-        stability_info = "(启用stability map计算)" if self.compute_stability_map else "(禁用stability map计算)"
+        if self.compute_stability_map:
+            if self.use_precomputed_stability:
+                stability_info = f"(启用stability map，优先加载预计算文件: {self.stability_map_filename})"
+            else:
+                stability_info = "(启用stability map在线计算)"
+        else:
+            stability_info = "(禁用stability map)"
+
         print(f"不平坦地面数据加载器初始化完成：{self.num_env}个环境，{len(self.indexDict)}个路径样本 {stability_info}")
     
     def __len__(self):
         return len(self.indexDict)
+
+    def _get_env_static_data(self, env_name):
+        """
+        获取环境静态数据（带缓存），避免重复加载同一环境地图。
+        """
+        if env_name in self.env_static_cache:
+            return self.env_static_cache[env_name]
+
+        env_path = osp.join(self.dataFolder, env_name)
+        map_file = osp.join(env_path, 'map.p')
+
+        with open(map_file, 'rb') as f:
+            map_data = pickle.load(f)
+
+        map_tensor = map_data['tensor']
+        elevation = map_tensor[:, :, 0].astype(np.float32)
+        normal_x = map_tensor[:, :, 1].astype(np.float32)
+        normal_y = map_tensor[:, :, 2].astype(np.float32)
+        normal_z = map_tensor[:, :, 3].astype(np.float32)
+
+        encoded_input = np.concatenate((
+            normal_x[:, :, None],
+            normal_y[:, :, None],
+            normal_z[:, :, None]
+        ), axis=2).astype(np.float32)
+
+        env_static = {
+            'elevation': elevation,
+            'normal_x': normal_x,
+            'normal_y': normal_y,
+            'normal_z': normal_z,
+            'encoded_input': encoded_input,
+            'map_shape': map_tensor.shape[:2],
+        }
+
+        if self.compute_stability_map and self.use_precomputed_stability:
+            stability_file = osp.join(env_path, self.stability_map_filename)
+            if osp.exists(stability_file):
+                with np.load(stability_file) as stability_data:
+                    env_static['yaw_stability'] = stability_data['yaw_stability'].astype(np.float32)
+                    env_static['cost_map'] = stability_data['cost_map'].astype(np.float32)
+            elif not self.compute_stability_if_missing:
+                raise FileNotFoundError(
+                    f"预计算stability文件不存在: {stability_file}. "
+                    f"请先离线生成，或设置 compute_stability_if_missing=True 允许回退在线计算。"
+                )
+
+        self.env_static_cache[env_name] = env_static
+        return env_static
     
     def __getitem__(self, idx):
         env_index, path_index = self.indexDict[idx]
         env_name = self.env_list[env_index]
         env_path = osp.join(self.dataFolder, env_name)
-        map_file = osp.join(env_path, 'map.p')
         path_file = osp.join(env_path, f'path_{path_index}.p')
+
+        env_static = self._get_env_static_data(env_name)
         
         # 1. 加载地图数据
-        with open(map_file, 'rb') as f:
-            map_data = pickle.load(f)
-        map_tensor = map_data['tensor']  # [H, W, 4]
-        elevation = map_tensor[:, :, 0]
-        normal_x = map_tensor[:, :, 1]
-        normal_y = map_tensor[:, :, 2]
-        normal_z = map_tensor[:, :, 3]
+        elevation = env_static['elevation']
+        normal_x = env_static['normal_x']
+        normal_y = env_static['normal_y']
+        normal_z = env_static['normal_z']
         
         # 2. 加载路径数据
         with open(path_file, 'rb') as f:
@@ -1365,22 +1431,11 @@ class UnevenPathDataLoader(Dataset):
         # 对角度进行标准化，确保在[-pi, pi]范围内
         path[:, 2] = (path[:, 2] + np.pi) % (2 * np.pi) - np.pi
         
-        map_input = torch.concatenate((
-            # torch.tensor(elevation, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
-            torch.tensor(normal_x, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
-            torch.tensor(normal_y, dtype=torch.float32).unsqueeze(0),  # [1, H, W]
-            torch.tensor(normal_z, dtype=torch.float32).unsqueeze(0)   # [1, H, W]
-        ), dim=0)
-
         # start_pose = torch.tensor([path[0, 0], path[0, 1], np.cos(path[0, 2]), np.sin(path[0, 2])], dtype=torch.float32)  # [4] 起点位姿 [x, y, cos(yaw), sin(yaw)]
         # goal_pose = torch.tensor([path[-1, 0], path[-1, 1], np.cos(path[-1, 2]), np.sin(path[-1, 2])], dtype=torch.float32)  # [4] 终点位姿 [x, y, cos(yaw), sin(yaw)]
         # pose_input = torch.stack((start_pose, goal_pose), dim=0)  # [2, 4] 起点和终点位姿
         
-        encoded_input = torch.tensor(np.concatenate((
-            normal_x[:, :, None],  # [H, W, 1]
-            normal_y[:, :, None],  # [H, W, 1]
-            normal_z[:, :, None]   # [H, W, 1]
-        ), axis=2), dtype=torch.float32)  # [H, W, 3]
+        encoded_input = env_static['encoded_input']  # [H, W, 3]
         
         # encoded_input = get_encoder_input(
         #     np.abs(normal_z),        # 确保使用的法向量z分量为正值
@@ -1442,7 +1497,7 @@ class UnevenPathDataLoader(Dataset):
         # 为每个轨迹点找到对应的锚点（固定尺寸处理）
         positive_anchors_per_point = []  # 每个轨迹点对应的锚点列表
         for pos in path_xy:
-            indices, = geom2pixMatpos(pos, res=res, size=map_tensor.shape[:2])
+            indices, = geom2pixMatpos(pos, res=res, size=env_static['map_shape'])
             current_anchors = list(set(indices))
             
             # 固定尺寸处理：确保每个轨迹点的正样本数量都是MAX_POSITIVE_ANCHORS
@@ -1492,26 +1547,28 @@ class UnevenPathDataLoader(Dataset):
         # 将填充位置(-1)的标签设为-1，训练时忽略
         labels[anchor == -1] = -1
         
-        # 5. 计算yaw_bins倾覆状态（根据参数决定是否计算）
+        # 5. 计算或加载 yaw_bins 倾覆状态（根据参数决定）
         yaw_stability = None
         cost_map = None
         if self.compute_stability_map:
-            yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
-            # 可以选择计算 cost_map 或 sdf_map
-            # cost_map = generate_cost_map_from_yaw_stability(
-            #     yaw_stability, 
-            #     voxel_size_xy=0.1, 
-            #     yaw_weight=2.1, 
-            #     d_safe=0.15, 
-            #     kalpa=0.08, 
-            #     return_esdf=False
-            # )
-            # 或者使用 sdf_map:
-            cost_map = generate_sdf_from_yaw_stability(
-                yaw_stability, 
-                voxel_size_xy=0.1, 
-                yaw_weight=1.4
-            )
+            # 先尝试从缓存读取（包括预计算文件或历史在线计算结果）
+            yaw_stability = env_static.get('yaw_stability', None)
+            cost_map = env_static.get('cost_map', None)
+
+            # 如果缓存没有，则在线计算一次并写回缓存
+            if yaw_stability is None or cost_map is None:
+                yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
+                cost_map = generate_sdf_from_yaw_stability(
+                    yaw_stability,
+                    voxel_size_xy=0.1,
+                    yaw_weight=1.4
+                )
+                if isinstance(yaw_stability, torch.Tensor):
+                    yaw_stability = yaw_stability.detach().cpu().numpy().astype(np.float32)
+                if isinstance(cost_map, torch.Tensor):
+                    cost_map = cost_map.detach().cpu().numpy().astype(np.float32)
+                env_static['yaw_stability'] = yaw_stability
+                env_static['cost_map'] = cost_map
 
         # 转换为PyTorch张量
         result = {
@@ -1532,7 +1589,7 @@ class UnevenPathDataLoader(Dataset):
                 torch.as_tensor(normal_y, dtype=torch.float),
                 torch.as_tensor(normal_z, dtype=torch.float)
             ], dim=0)  # 法线：(3, H, W)
-            # result['yaw_stability'] = torch.as_tensor(yaw_stability, dtype=torch.float)  # yaw分箱倾覆状态：[H, W, 36]
+            result['yaw_stability'] = torch.as_tensor(yaw_stability, dtype=torch.float)  # yaw分箱倾覆状态：[H, W, 36]
             result['cost_map'] = torch.as_tensor(cost_map, dtype=torch.float)  # 成本图：[H, W, yaw_bins]
         
         return result

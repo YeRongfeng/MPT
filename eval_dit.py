@@ -20,11 +20,13 @@ from evaluator import TrajectoryEvaluator
 from dataLoader_dit import compute_map_yaw_bins, generate_sdf_from_yaw_stability
 
 
-def generate_paths(model, map_input, start_point, goal_point, num_paths=1, device='cuda', 
+def generate_paths(model, map_input, start_point, goal_point, num_paths=1, device='cuda',
+                   solver='pmf_refined', num_steps=3,
+                   reconstruct_trajectory=True, num_traj_points=100,
                    use_guided_sampling=False, cost_map=None, map_info=None,
                    guidance_scale=0.15, guidance_start_step=0.7):
     """
-    生成完整路径（绝对坐标版本，使用sin/cos编码）
+    生成完整路径（绝对坐标版本，使用新 Rectified Flow 采样接口）
     
     Args:
         model: 训练好的PathDiffusionTransformer
@@ -33,13 +35,17 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=1, devic
         goal_point: (3,) [x, y, yaw] 终点坐标（真实坐标）
         num_paths: 生成路径数量
         device: 计算设备
-        use_guided_sampling: 是否使用guided sampling
+        solver: ODE 求解器类型 ('pmf_onestep' | 'pmf_refined' | 'euler' | 'heun')
+        num_steps: ODE 求解步数
+        reconstruct_trajectory: 是否从控制点重建轨迹
+        num_traj_points: 重建后的轨迹点数
+        use_guided_sampling: 是否使用guided sampling（若模型不支持将直接报错）
         cost_map: 稳定性代价地图 (用于guided sampling)
         map_info: 地图配置信息 (用于guided sampling)
         guidance_scale: 引导强度
         guidance_start_step: 开始引导的时间点比例
     Returns:
-        middle_paths: (num_paths, 20, 3) 中间20个点的绝对坐标 [x, y, theta]
+        trajectories: (num_paths, N, 3) 绝对坐标 [x, y, theta]
         inference_time: 单次推理耗时（秒）
     """
     model.eval()
@@ -62,42 +68,65 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=1, devic
     # 开始计时
     start_time = time.time()
     
-    # 生成中间20个点（4维编码）
     if use_guided_sampling:
+        if not hasattr(model, 'guided_sample'):
+            raise NotImplementedError("当前模型未实现 guided_sample，无法启用guided sampling")
         if cost_map is None or map_info is None:
             raise ValueError("cost_map and map_info are required for guided sampling")
         
-        normalized_traj = model.guided_sample(
+        traj_xy = model.guided_sample(
             map_input,
             start_normalized,
             goal_normalized,
             cost_map,
             map_info,
             num_samples=num_paths,
-            ddim_steps=50,
+            num_steps=num_steps,
+            solver=solver,
+            reconstruct_trajectory=reconstruct_trajectory,
+            num_traj_points=num_traj_points,
             guidance_scale=guidance_scale,
             guidance_start_step=guidance_start_step
-        )  # (num_paths, 20, 4)
+        )
     else:
         with torch.no_grad():
-            normalized_traj = model.sample(
+            traj_xy = model.sample(
                 map_input,
                 start_normalized,
                 goal_normalized,
                 num_samples=num_paths,
-                ddim_steps=50
-            )  # (num_paths, 20, 4) - 归一化的4维编码
+                num_steps=num_steps,
+                solver=solver,
+                reconstruct_trajectory=reconstruct_trajectory,
+                num_traj_points=num_traj_points
+            )  # (num_paths, N, 2)
     
     # 结束计时
     inference_time = time.time() - start_time
+
+    # 计算 yaw（从轨迹切向量估计）
+    if not isinstance(traj_xy, torch.Tensor):
+        traj_xy = torch.tensor(traj_xy, dtype=torch.float32, device=device)
+    else:
+        traj_xy = traj_xy.to(device)
+
+    B, N, _ = traj_xy.shape
+    if N < 2:
+        yaw = torch.zeros(B, N, device=traj_xy.device)
+    else:
+        dx = torch.zeros(B, N, device=traj_xy.device)
+        dy = torch.zeros(B, N, device=traj_xy.device)
+        dx[:, 1:-1] = traj_xy[:, 2:, 0] - traj_xy[:, :-2, 0]
+        dy[:, 1:-1] = traj_xy[:, 2:, 1] - traj_xy[:, :-2, 1]
+        dx[:, 0] = traj_xy[:, 1, 0] - traj_xy[:, 0, 0]
+        dy[:, 0] = traj_xy[:, 1, 1] - traj_xy[:, 0, 1]
+        dx[:, -1] = traj_xy[:, -1, 0] - traj_xy[:, -2, 0]
+        dy[:, -1] = traj_xy[:, -1, 1] - traj_xy[:, -2, 1]
+        yaw = torch.atan2(dy, dx)
+
+    traj_full = torch.cat([traj_xy, yaw.unsqueeze(-1)], dim=-1)  # (B, N, 3)
     
-    # 反归一化到真实坐标 (x, y, theta)
-    traj_denorm = torch.zeros(num_paths, 20, 3, device=normalized_traj.device)
-    traj_denorm[:, :, :2] = normalized_traj[:, :, :2] * 20.0  # x,y: [-1,1] → [-20,20]
-    # 从cos/sin恢复角度: atan2(sin, cos)
-    traj_denorm[:, :, 2] = torch.atan2(normalized_traj[:, :, 3], normalized_traj[:, :, 2])  # θ ∈ [-π, π]
-    
-    return traj_denorm.cpu().numpy(), inference_time  # (num_paths, 20, 3), float
+    return traj_full.detach().cpu().numpy(), inference_time
 
 
 def load_environment_data(env_folder: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -110,6 +139,7 @@ def load_environment_data(env_folder: str) -> Tuple[np.ndarray, np.ndarray, np.n
         normal_x = tensor[:, :, 1]
         normal_y = tensor[:, :, 2]
         normal_z = tensor[:, :, 3]
+    print(f"Loaded environment data from {env_folder}: elevation shape {elevation.shape}, normal shape {normal_x.shape}")
     return elevation, normal_x, normal_y, normal_z
 
 
@@ -150,7 +180,11 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
                         cost_map: torch.Tensor = None,
                         map_info: dict = None,
                         guidance_scale: float = 0.15,
-                        guidance_start_step: float = 0.7) -> Tuple[Dict[str, float], List[Dict[str, float]], List[Dict[str, float]], np.ndarray, np.ndarray, float, float]:
+                        guidance_start_step: float = 0.7,
+                        solver: str = 'pmf_refined',
+                        num_steps: int = 3,
+                        reconstruct_trajectory: bool = True,
+                        num_traj_points: int = 100) -> Tuple[Dict[str, float], List[Dict[str, float]], List[Dict[str, float]], np.ndarray, np.ndarray, float, float]:
     """
     评估单条路径（同时评估两个阶段的模型）
     
@@ -196,8 +230,12 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
             cost_map=None,
             map_info=None,
             guidance_scale=guidance_scale,
-            guidance_start_step=guidance_start_step
-        )  # (num_pred_paths, 20, 3), float
+            guidance_start_step=guidance_start_step,
+            solver=solver,
+            num_steps=num_steps,
+            reconstruct_trajectory=reconstruct_trajectory,
+            num_traj_points=num_traj_points
+        )  # (num_pred_paths, N, 3), float
         
         # stage2: stage1模型 + guided采样
         stage2_trajs, stage2_time = generate_paths(
@@ -211,8 +249,12 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
             cost_map=cost_map,
             map_info=map_info,
             guidance_scale=guidance_scale,
-            guidance_start_step=guidance_start_step
-        )  # (num_pred_paths, 20, 3), float
+            guidance_start_step=guidance_start_step,
+            solver=solver,
+            num_steps=num_steps,
+            reconstruct_trajectory=reconstruct_trajectory,
+            num_traj_points=num_traj_points
+        )  # (num_pred_paths, N, 3), float
     else:
         # 标准模式：对比stage1 vs stage2
         # stage1: 标准采样
@@ -227,8 +269,12 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
             cost_map=None,
             map_info=None,
             guidance_scale=guidance_scale,
-            guidance_start_step=guidance_start_step
-        )  # (num_pred_paths, 20, 3), float
+            guidance_start_step=guidance_start_step,
+            solver=solver,
+            num_steps=num_steps,
+            reconstruct_trajectory=reconstruct_trajectory,
+            num_traj_points=num_traj_points
+        )  # (num_pred_paths, N, 3), float
         
         # stage2: stage2模型 + 标准采样
         stage2_trajs, stage2_time = generate_paths(
@@ -242,8 +288,12 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
             cost_map=None,
             map_info=None,
             guidance_scale=guidance_scale,
-            guidance_start_step=guidance_start_step
-        )  # (num_pred_paths, 20, 3), float
+            guidance_start_step=guidance_start_step,
+            solver=solver,
+            num_steps=num_steps,
+            reconstruct_trajectory=reconstruct_trajectory,
+            num_traj_points=num_traj_points
+        )  # (num_pred_paths, N, 3), float
     
     # 评估真实轨迹
     gt_trajectory_tensor = torch.tensor(trajectory, dtype=torch.float32, device=device)
@@ -252,18 +302,16 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
     # 评估阶段一预测轨迹
     stage1_metrics_list = []
     for i in range(num_pred_paths):
-        pred_traj_single = stage1_trajs[i]  # (20, 3)
-        full_pred_traj = np.vstack([start_pos, pred_traj_single, goal_pos])  # (22, 3)
-        pred_trajectory_tensor = torch.tensor(full_pred_traj, dtype=torch.float32, device=device)
+        pred_traj_single = stage1_trajs[i]  # (N, 3)
+        pred_trajectory_tensor = torch.tensor(pred_traj_single, dtype=torch.float32, device=device)
         pred_metrics = evaluator.evaluate_trajectory(pred_trajectory_tensor)
         stage1_metrics_list.append(pred_metrics)
     
     # 评估阶段二预测轨迹
     stage2_metrics_list = []
     for i in range(num_pred_paths):
-        pred_traj_single = stage2_trajs[i]  # (20, 3)
-        full_pred_traj = np.vstack([start_pos, pred_traj_single, goal_pos])  # (22, 3)
-        pred_trajectory_tensor = torch.tensor(full_pred_traj, dtype=torch.float32, device=device)
+        pred_traj_single = stage2_trajs[i]  # (N, 3)
+        pred_trajectory_tensor = torch.tensor(pred_traj_single, dtype=torch.float32, device=device)
         pred_metrics = evaluator.evaluate_trajectory(pred_trajectory_tensor)
         stage2_metrics_list.append(pred_metrics)
     
@@ -386,8 +434,13 @@ def main():
     # 模型配置
     best = True
     # best = False
-    epoch = 11
+    epoch = 4
     stage = 2
+    
+    # ema = True
+    ema = False
+    # ema_decay = 0.99
+    ema_decay = 0.999
     
     # 评估配置
     num_pred_paths = 10  # 每个场景生成多少条预测轨迹
@@ -399,11 +452,18 @@ def main():
     # use_guided_sampling = True  # 启用guided sampling
     guidance_scale = 0.15  # 引导强度 (推荐: 0.08-0.2)
     guidance_start_step = 0.7  # 开始引导的时间点 (推荐: 0.5-0.7)
+
+    # ODE 求解器配置（与新模型接口对齐）
+    solver = 'pmf_refined'  # 'pmf_onestep' | 'pmf_refined' | 'euler' | 'heun'
+    # solver = 'pmf_onestep'  # 'pmf_onestep' | 'pmf_refined' | 'euler' | 'heun'
+    diffusion_step = 3
+    reconstruct_trajectory = True
+    num_traj_points = 100
     
     # 选择要评估的环境和路径
     # envNum = np.random.randint(0, 99)
     # env_list = [f'env{envNum:06d}']
-    env_list = ['env000008']  # 可以添加多个环境
+    env_list = ['env000010']  # 可以添加多个环境
     
     # 选择要评估的路径编号
     # path_nums = list(range(50))  # 评估前50条路径
@@ -417,6 +477,7 @@ def main():
     print(f"Generating {num_pred_paths} predictions per path")
     print(f"Map-based collision detection: {'Enabled' if use_map_evaluation else 'Disabled'}")
     print(f"Guided sampling: {'Enabled' if use_guided_sampling else 'Disabled'}")
+    print(f"Solver: {solver}, steps: {diffusion_step}, reconstruct: {reconstruct_trajectory}, points: {num_traj_points}")
     if use_guided_sampling:
         print(f"  → Guidance scale: {guidance_scale}")
         print(f"  → Guidance start step: {guidance_start_step}")
@@ -424,6 +485,7 @@ def main():
     
     # 加载模型
     modelFolder = 'data/sim'
+    # modelFolder = 'data'
     modelFile = osp.join(modelFolder, 'model_params.json')
     model_param = json.load(open(modelFile))
     
@@ -449,8 +511,12 @@ def main():
     model_stage2 = model_stage2.to(device)
     
     if best:
-        checkpoint_stage2 = torch.load(osp.join(modelFolder, 'stage2_best_model.pth'))
-        print(f"Loaded best stage 2 model.")
+        if ema:
+            checkpoint_stage2 = torch.load(osp.join(modelFolder, f'stage2_best_ema_{ema_decay}.pth'))
+            print(f"Loaded best EMA stage {stage} model.")
+        else:
+            checkpoint_stage2 = torch.load(osp.join(modelFolder, 'stage2_best_model.pth'))
+            print(f"Loaded best stage 2 model.")
     else:
         checkpoint_stage2 = torch.load(osp.join(modelFolder, f'checkpoint_stage2_epoch_{epoch}.pth'))
         print(f"Loaded stage 2 model from epoch {epoch}.")
@@ -511,21 +577,23 @@ def main():
             map_info = {
                 'resolution': 0.4,  # 0.4米/像素
                 'origin': (-20.0, -20.0, -np.pi),  # 地图原点 (x, y, yaw)
-                'size': (D, H, W)  # (yaw_bins, height, width)
+                'size': (W, H, D)  # (width, height, yaw_bins)
             }
             
-            # 转换 cost_map 格式为 (D, H, W) - cost_map已经是ESDF格式
+            # 转换地图格式为 (D, H, W)
             cost_map_transposed = cost_map.permute(2, 0, 1)  # [36, H, W]
+            yaw_stability_transposed = yaw_stability.permute(2, 0, 1)  # [36, H, W]
             
             # 创建带地图的评估器
-            # occupancy_map 和 yaw_stability_map 都使用同一个ESDF地图
+            # occupancy_map 使用 ESDF；yaw_stability_map 使用二值稳定性图
             evaluator = TrajectoryEvaluator(
                 occupancy_map=cost_map_transposed,
+                # yaw_stability_map=yaw_stability_transposed,
                 yaw_stability_map=cost_map_transposed,
                 map_info=map_info,
                 device=device
             )
-            print(f"Created evaluator with ESDF map and yaw stability map for {env_name}")
+            print(f"Created evaluator with ESDF occupancy map and binary yaw stability map for {env_name}")
         else:
             # 创建不带地图的评估器（只评估几何特性）
             evaluator = TrajectoryEvaluator(device=device)
@@ -558,7 +626,11 @@ def main():
                     cost_map=cost_map_for_guided,
                     map_info=map_info_for_guided,
                     guidance_scale=guidance_scale,
-                    guidance_start_step=guidance_start_step
+                    guidance_start_step=guidance_start_step,
+                    solver=solver,
+                    num_steps=diffusion_step,
+                    reconstruct_trajectory=reconstruct_trajectory,
+                    num_traj_points=num_traj_points
                 )
                 
                 # 收集结果

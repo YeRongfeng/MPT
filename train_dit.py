@@ -4,6 +4,7 @@ train_dit.py - 训练不平坦地面路径预测模型(基于扩散模型)
 
 import numpy as np
 import pickle
+from contextlib import nullcontext
 
 import torch
 import torch.optim as optim
@@ -25,13 +26,14 @@ from torch.utils.tensorboard import SummaryWriter
 from timm.utils import ModelEmaV2
 
 from ESDF3d_atpoint import compute_esdf_batch
-from grad_optimizer import TrajectoryOptimizerSE2
+# from grad_optimizer import TrajectoryOptimizerSE2
 from dit.Models import PathDiffusionTransformer
 
 # B样条工具
 from bspline_utils import (
     fit_bspline_least_squares,
-    reconstruct_from_control_points
+    reconstruct_from_control_points,
+    DifferentiableBSpline
 )
 from torch.func import functional_call, jvp
 
@@ -430,7 +432,110 @@ def compute_curvature_constraint_loss(trajectory, max_curvature=2.0):
     return curvature_loss
 
 
-def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epochs=100, is_training=True, current_stage=1, use_dense_trajectory=False, num_dense_points=100):
+def stage2_optimize_control_points(
+    model, map_input, start_normalized, goal_normalized, start_pose, goal_pose,
+    stability_cost_map, map_info, device, prediction_type='epsilon', num_iterations=10, lr=0.01
+):
+    """
+    【第二阶段优化】对每个batch样本进行采样和优化，返回1条优化的控制点
+    
+    关键：保证对每个样本返回形状(B, 24, 2)的优化中间控制点
+    
+    Args:
+        model: PathDiffusionTransformer 模型
+        map_input: (B, C, H, W) 输入地图
+        start_normalized: (B, 4) 起点（已归一化）
+        goal_normalized: (B, 4) 终点（已归一化）
+        start_pose: (B, 3) 起点原始坐标
+        goal_pose: (B, 3) 终点原始坐标
+        stability_cost_map: (D, H, W) 稳定性代价地图
+        map_info: dict 地图信息
+        device: 设备
+        prediction_type: 预测类型
+        num_iterations: 优化迭代次数
+        lr: 学习率
+    
+    Returns:
+        optimized_middle_cp: (B, 24, 2) 优化后的中间控制点，每个样本一条
+    """
+    from grad_optimizer import cost_on_dense_trajectory
+    
+    # 从 start_pose 推导 batch size
+    B = start_pose.shape[0]
+    
+    # B样条层
+    bspline_layer = DifferentiableBSpline(
+        num_control_points=26,
+        num_output_points=100,
+        degree=3
+    ).to(device)
+    
+    with torch.enable_grad():
+        # 【优化】整个batch采样和优化
+        with torch.no_grad():
+            sampled_control_points = model.sample(
+                map_input,  # (B, C, H, W)
+                start_normalized,  # (B, 4)
+                goal_normalized,  # (B, 4)
+                num_samples=1,
+                num_steps=3,
+                solver='pmf_refined',
+                reconstruct_trajectory=False,
+                num_traj_points=100
+            )  # (B, 26, 2)
+        
+        # 提取中间控制点（去掉起终点）
+        x0_sample = sampled_control_points[:, 1:-1, :].clone().detach()  # (B, 24, 2)
+        x0_sample.requires_grad_(True)
+        
+        # 为整个batch创建优化器
+        optimizer = torch.optim.AdamW([x0_sample], lr=lr)
+        
+        # 起点和终点
+        start_cp = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
+        goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
+        
+        # batch级优化循环
+        for iter in range(num_iterations):
+            optimizer.zero_grad()
+            
+            # 拼接完整控制点（整个batch）
+            full_control_points = torch.cat([
+                start_cp,       # (B, 1, 2)
+                x0_sample,      # (B, 24, 2)
+                goal_cp         # (B, 1, 2)
+            ], dim=1)  # (B, 26, 2)
+            
+            # 使用B样条重建轨迹
+            reconstructed_traj = bspline_layer(full_control_points)  # (B, 100, 2)
+            
+            # 计算cost（会对整个batch求均值）
+            cost = cost_on_dense_trajectory(
+                reconstructed_traj, 
+                start_pose,  # (B, 3)
+                goal_pose,   # (B, 3)
+                stability_cost_map, 
+                map_info, 
+                device
+            )  # 标量
+            
+            # 反向传播
+            cost.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_([x0_sample], 1.0)
+            
+            # 优化步
+            optimizer.step()
+        
+        # 返回优化后的控制点
+        optimized_middle_cp = x0_sample.detach()  # (B, 24, 2)
+    
+    return optimized_middle_cp
+
+
+
+def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epochs=100, is_training=True, current_stage=1, use_dense_trajectory=False, num_dense_points=100, prediction_type='x0'):
     """
     混合损失函数（绝对坐标版本）
     包括：
@@ -449,6 +554,7 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         is_training: bool - True时使用回归损失，False时返回实际cost值
         use_dense_trajectory: bool - True时使用密集轨迹计算主损失，False时使用原始控制点
         num_dense_points: int - 密集轨迹的点数（仅在use_dense_trajectory=True时使用）
+        prediction_type: str - 预测类型 ('epsilon', 'x0', 'v')
     """
     # 默认权重
     if loss_weights is None:
@@ -475,15 +581,75 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # - 起点/终点：固定的，从start_pose/goal_pose提取
     # - 中间24个点：网络预测的自由控制点
     # 
-    # 将完整轨迹(B, 100, 3)拟合为24个中间控制点(B, 24, 2)
-    middle_cp = trajectory_to_control_points(trajectory, num_middle_points=24)  # (B, 24, 2)
+    # 【第二阶段特殊处理】
+    # - 第一阶段（current_stage==1）：仅使用模仿学习数据
+    # - 第二阶段（current_stage==2）：在损失层面混合模仿数据和优化数据
+    #   * 分别计算两个loss：loss_imitation 和 loss_optimized
+    #   * 加权组合：total_loss = alpha * loss_imitation + (1-alpha) * loss_optimized
+    #   * 保留两种数据的特性，防止模态坍塌
     
-    # 起点和终点直接从start_pose和goal_pose提取（作为固定条件）
-    start_cp = start_pose[:, :2]  # (B, 2) - 起点坐标(x, y)
-    goal_cp = goal_pose[:, :2]    # (B, 2) - 终点坐标(x, y)
+    # 始终获取模仿学习的中间控制点
+    middle_cp_imitation = trajectory_to_control_points(trajectory, num_middle_points=24)  # (B, 24, 2)
+    
+    # 在第二阶段，也可扩展获取优化数据（当前未启用）
+    middle_cp_optimized = None
+    # if current_stage == 2:
+    #     # 检查是否有稳定性代价地图可用
+    #     if 'cost_map' in batch and loss_weights.get('capsize', 0.0) > 0:
+    #         # 准备归一化的起点和终点（仅用于优化函数）
+    #         start_normalized_temp = torch.zeros(B, 4, device=device)
+    #         start_normalized_temp[:, :2] = start_pose[:, :2] / 20.0
+    #         start_normalized_temp[:, 2] = torch.cos(start_pose[:, 2])
+    #         start_normalized_temp[:, 3] = torch.sin(start_pose[:, 2])
+    #         start_normalized_temp[:, :2] = torch.clamp(start_normalized_temp[:, :2], -1.0, 1.0)
+            
+    #         goal_normalized_temp = torch.zeros(B, 4, device=device)
+    #         goal_normalized_temp[:, :2] = goal_pose[:, :2] / 20.0
+    #         goal_normalized_temp[:, 2] = torch.cos(goal_pose[:, 2])
+    #         goal_normalized_temp[:, 3] = torch.sin(goal_pose[:, 2])
+    #         goal_normalized_temp[:, :2] = torch.clamp(goal_normalized_temp[:, :2], -1.0, 1.0)
+            
+    #         # 执行采样和优化，获取优化数据
+    #         middle_cp_optimized = stage2_optimize_control_points(
+    #             model=model,
+    #             map_input=map_input,
+    #             start_normalized=start_normalized_temp,
+    #             goal_normalized=goal_normalized_temp,
+    #             start_pose=start_pose,
+    #             goal_pose=goal_pose,
+    #             stability_cost_map=batch['cost_map'].to(device)[0],
+    #             map_info={
+    #                 'resolution': 0.4,
+    #                 'origin': (-20.0, -20.0, -np.pi),
+    #                 'size': (100, 100, 36)
+    #             },
+    #             device=device,
+    #             prediction_type=prediction_type,
+    #             num_iterations=10,
+    #             lr=0.1
+    #         )  # (B, 24, 2) 优化后的控制点
+    
+    # 使用模仿数据作为主要的中间控制点
+    middle_cp = middle_cp_imitation
+    
+    # 【第二阶段特殊处理】在batch维度堆叠模仿数据和优化数据
+    # 这样可以在一次前向传播中同时计算两个损失
+    stage2_mix_loss = False
+    # if current_stage == 2 and middle_cp_optimized is not None:
+    #     # 堆叠：(B, 24, 2) + (B, 24, 2) -> (2B, 24, 2)
+    #     middle_cp = torch.cat([middle_cp_imitation, middle_cp_optimized], dim=0)
+        
+    #     # 同时扩展其他条件
+    #     map_input = torch.cat([map_input, map_input], dim=0)
+    #     start_pose = torch.cat([start_pose, start_pose], dim=0)
+    #     goal_pose = torch.cat([goal_pose, goal_pose], dim=0)
+    #     trajectory = torch.cat([trajectory, trajectory], dim=0)
+        
+    #     B = B * 2  # 更新batch size
+    #     stage2_mix_loss = True
     
     # 归一化控制点：坐标范围通常在 [-20, 20]，归一化到 [-1, 1]
-    middle_cp_normalized = middle_cp / 20.0  # (B, 24, 2)
+    middle_cp_normalized = middle_cp / 20.0  # (B, 24, 2) 或 (2B, 24, 2)
     middle_cp_normalized = torch.clamp(middle_cp_normalized, -1.0, 1.0)
     
     # 归一化起点终点坐标（转换为4维：x, y, cos(θ), sin(θ)） - 用于条件
@@ -524,13 +690,26 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         model.eval()
         
         try:
+            # Forward-AD(JVP) 与 CUDA 高效 SDPA(尤其是 efficient/flash kernel)在部分版本不兼容。
+            # 这里在 JVP 路径中强制回退到 math kernel，避免：
+            # NotImplementedError: forward AD with _scaled_dot_product_efficient_attention
+            sdp_ctx = (
+                torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_mem_efficient=False,
+                    enable_math=True
+                )
+                if z_arg.is_cuda else nullcontext()
+            )
+
             # 使用 functional_call 代替直接 model()
             # 这里的参数顺序必须对应你 forward 的定义
-            model_output = functional_call(
-                model, 
-                {**params, **buffers}, 
-                (map_input, z_arg, t_arg, r_arg, start_normalized, goal_normalized)
-            )
+            with sdp_ctx:
+                model_output = functional_call(
+                    model, 
+                    {**params, **buffers}, 
+                    (map_input, z_arg, t_arg, r_arg, start_normalized, goal_normalized)
+                )
         finally:
             # 恢复之前的状态
             model.train(prev_training)
@@ -572,20 +751,46 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
 
     # 4. 构建 V_theta 并计算 Loss
     # V = u + (t - r) * stopgrad(du/dt)
+    
     V_theta = u_out + (t.view(-1, 1, 1) - r.view(-1, 1, 1)).detach() * du_dt_full.detach()
 
     if loss_type == 'v':
-        main_loss = F.mse_loss(V_theta, target_v)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 24, 2)
     elif loss_type == 'x0':
         # x0_rec = z_t - t * V_theta
         pred_x0_corrected = z_t - t.view(-1, 1, 1) * V_theta
-        main_loss = F.mse_loss(pred_x0_corrected, middle_cp_normalized)
+        main_loss_all = F.mse_loss(pred_x0_corrected, middle_cp_normalized, reduction='none')  # (B, 24, 2)
     else:
         # epsilon 空间的 pMF 修正写法：pred_eps_corrected = V_theta + pred_x0_corrected
         # 但推荐统一使用 v-loss 以符合论文实现
-        main_loss = F.mse_loss(V_theta, target_v)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none') # (B, 24, 2)
+    
+    # 【第二阶段特殊处理】分离模仿和优化两部分的损失，然后加权
+    if stage2_mix_loss:
+        # 分离损失：(2B, 24, 2) -> (B, 24, 2) + (B, 24, 2)
+        main_loss_imitation = main_loss_all[:len(main_loss_all)//2].mean()  # 前半部分
+        main_loss_optimized = main_loss_all[len(main_loss_all)//2:].mean()   # 后半部分
         
-    main_loss = main_loss * 1e-1
+        # # 根据训练进度动态调整混合系数
+        # # 早期更多使用模仿损失，保持在原分布附近
+        # # 后期逐渐增加优化损失的比例
+        # progress = epoch / (total_epochs + 1e-8)
+        # # alpha从0.8衰减到0.2：模仿损失比例从80%到20%
+        # alpha_loss = 0.8 - 0.6 * progress  # 范围 [0.8, 0.2]
+        
+        alpha_loss = 0.98
+        
+        # 加权组合两个损失
+        main_loss = alpha_loss * main_loss_imitation + (1.0 - alpha_loss) * main_loss_optimized
+    else:
+        # 第一阶段或第二阶段但没有优化数据：只用模仿数据
+        main_loss = main_loss_all.mean()
+        
+    # if loss_weights['main'] <= 0.0:
+    #     # main_loss = main_loss * 0.0
+    #     main_loss = torch.zeros_like(main_loss)
+        
+    # main_loss = main_loss * 1e-1
     
     # =================== 计算辅助损失（可选） ===================
     # 注意：由于我们现在只预测控制点，辅助损失的计算需要先重建轨迹
@@ -601,7 +806,157 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     tangent_loss = dummy_loss.clone()
     consistency_loss = dummy_loss.clone()
     
-    tangent_loss = compute_tangent_loss(middle_cp_normalized, start_normalized, goal_normalized)
+    if loss_weights['tangent'] > 0.0:
+        tangent_loss = compute_tangent_loss(middle_cp_normalized, start_normalized, goal_normalized)
+    
+    if loss_weights['capsize'] > 0.0:
+        # =================== 第二阶段：物理约束 ===================
+        # 训练阶段使用“当前前向预测的 x0”重建轨迹，避免随机采样链的高方差导致
+        # 任一单项辅助损失都把分布推向单模态（与条件解绑）。
+        if is_training:
+            # 从当前训练图得到 x0 预测（归一化坐标），保持与当前条件和时间步一致
+            # x0_middle_pred = z_t - t.view(-1, 1, 1) * V_theta  # (B, 24, 2)
+            x0_middle_pred = z_t - t.view(-1, 1, 1) * u_out  # (B, 24, 2)
+            x0_middle_denorm = torch.clamp(x0_middle_pred, -1.0, 1.0) * 20.0
+
+            # 组合完整控制点并重建密集轨迹
+            start_cp = start_pose[:, :2].unsqueeze(1)  # (B,1,2)
+            goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B,1,2)
+            full_ctrl_points = torch.cat([start_cp, x0_middle_denorm, goal_cp], dim=1)  # (B,26,2)
+
+            bspline_layer = DifferentiableBSpline(
+                num_control_points=24 + 2,
+                num_output_points=100,
+                degree=3
+            ).to(device)
+            reconstructed_traj = bspline_layer(full_ctrl_points)  # (B,100,2)
+            
+            # reconstructed_traj = model.sample_differentiable(
+            #     map_input,
+            #     start_normalized,
+            #     goal_normalized,
+            #     num_steps=3,
+            #     solver='pmf_refined',
+            #     reconstruct_trajectory=True,
+            #     num_traj_points=100
+            # )  # (B, 100, 2) - 已经是真实坐标（非归一化）
+
+            start_pose_expanded = start_pose
+            goal_pose_expanded = goal_pose
+        else:
+            # 验证阶段保留采样链评估，更接近推理分布
+            reconstructed_traj = model.sample(
+                map_input,
+                start_normalized,
+                goal_normalized,
+                num_samples=10,
+                num_steps=3,
+                solver='pmf_refined',
+                reconstruct_trajectory=True,
+                num_traj_points=100
+            )
+            # model.sample 在 num_samples>1 时返回 (B*num_samples, N, 2)
+            start_pose_expanded = start_pose.repeat_interleave(10, dim=0)
+            goal_pose_expanded = goal_pose.repeat_interleave(10, dim=0)
+        
+        # # reconstructed_traj = model.sample_differentiable(
+        # #     map_input,
+        # #     start_normalized,
+        # #     goal_normalized,
+        # #     num_steps=3,
+        # #     solver='pmf_refined',
+        # #     reconstruct_trajectory=True,
+        # #     num_traj_points=100
+        # # )  # (B, N, 2) - 只有(x,y)，已经是真实坐标（非归一化）
+        
+        # 使用整批 cost_map，避免错误地只取 batch[0]
+        stability_cost_map = batch['cost_map'].to(device)
+        map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
+        resolution = 0.4
+        origin = (-20.0, -20.0, -np.pi) # x, y, yaw
+        map_info = {
+            'resolution': resolution,
+            'origin': origin,
+            'size': map_size
+        }
+        
+        # # # =================== 新方法：多步优化 + MSE损失 ===================
+        # # if is_training:
+        # #     # 训练模式：使用多步优化 + MSE损失
+        # #     from grad_optimizer import optimize_control_points_multistep
+            
+        # #     # 对网络预测的控制点进行多步优化
+        # #     optimized_middle_cp, _ = optimize_control_points_multistep(
+        # #         middle_control_points=x0_middle_denorm,  # (B, 24, 2)
+        # #         start_pose=start_pose,
+        # #         goal_pose=goal_pose,
+        # #         stability_cost_map=stability_cost_map,
+        # #         map_info=map_info,
+        # #         iterations=10,
+        # #         lr=0.1,
+        # #         grad_clip_norm=1.0,
+        # #         device=device,
+        # #         verbose=False
+        # #     )
+            
+        # #     # 计算MSE损失：网络预测的控制点 vs 优化后的控制点
+        # #     capsize_loss = F.mse_loss(x0_middle_denorm, optimized_middle_cp.detach())
+            
+        # # else:
+        # #     # 验证模式：使用原来的cost计算方式
+        # #     from grad_optimizer import cost_on_dense_trajectory
+        # #     capsize_loss = cost_on_dense_trajectory(
+        # #         reconstructed_traj, start_pose, goal_pose,
+        # #         stability_cost_map, map_info, device
+        # #     )
+        # if is_training:
+        #     from grad_optimizer import cost_on_dense_trajectory_phr_alm
+
+        #     # 持久化 PHR-ALM 对偶变量（跨 batch）
+        #     if not hasattr(diffusion_loss, '_phr_alm_state'):
+        #         diffusion_loss._phr_alm_state = {
+        #             'lambda_ineq': None,
+        #             'lambda_eq': None,
+        #             'mu': 1.0,
+        #         }
+
+        #     phr_state = diffusion_loss._phr_alm_state
+        #     capsize_loss, _, lambda_ineq_new, lambda_eq_new, mu_new = cost_on_dense_trajectory_phr_alm(
+        #         reconstructed_traj,
+        #         start_pose_expanded,
+        #         goal_pose_expanded,
+        #         stability_cost_map,
+        #         map_info,
+        #         lambda_ineq=phr_state['lambda_ineq'],
+        #         lambda_eq=phr_state['lambda_eq'],
+        #         mu=phr_state['mu'],
+        #         update_dual=True,
+        #         device=device
+        #     )
+
+        #     phr_state['lambda_ineq'] = lambda_ineq_new
+        #     phr_state['lambda_eq'] = lambda_eq_new
+        #     phr_state['mu'] = mu_new
+            
+        #     capsize_loss = capsize_loss * 1e-8
+        # else:
+        #     from grad_optimizer import cost_on_dense_trajectory
+        #     capsize_loss = cost_on_dense_trajectory(
+        #         reconstructed_traj, start_pose_expanded, goal_pose_expanded,
+        #         stability_cost_map, map_info, device
+        #     )
+    
+        from grad_optimizer import cost_on_dense_trajectory
+        capsize_loss = cost_on_dense_trajectory(
+            reconstructed_traj, start_pose_expanded, goal_pose_expanded,
+            stability_cost_map, map_info, device
+        )
+
+        # 数值稳定性保护：capsize_loss 出现 NaN/Inf 时回退为 0（跳过该分量）
+        if not torch.isfinite(capsize_loss):
+            print("⚠ Warning: capsize_loss is NaN/Inf, fallback to 0 for this batch")
+            capsize_loss = dummy_loss.clone()
+
     
     # 占位符监控指标
     angle_range_ratio = 1.0
@@ -614,14 +969,26 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # 但为了训练效率，暂时跳过
     skip_angle_losses = True  # 控制点阶段跳过角度相关损失
     
+    # main_loss 数值稳定性保护（尤其在 stage2 main=0 时避免无关分支污染）
+    if isinstance(main_loss, torch.Tensor) and (not torch.isfinite(main_loss)):
+        print("⚠ Warning: main_loss is NaN/Inf, fallback to 0 for this batch")
+        main_loss = dummy_loss.clone()
+
     # 混合损失
-    total_loss = loss_weights['main'] * main_loss + loss_weights['tangent'] * tangent_loss
+    if loss_weights['main'] <= 0.0:
+        total_loss = loss_weights['tangent'] * tangent_loss \
+                    + loss_weights['capsize'] * capsize_loss
+    else:
+        total_loss = loss_weights['main'] * main_loss \
+                    + loss_weights['tangent'] * tangent_loss \
+                    + loss_weights['capsize'] * capsize_loss
     
-    # 检查损失异常
-    if torch.isnan(total_loss) or torch.isinf(total_loss):
-        print(f"❌ 损失异常: {total_loss.item()}")
-        print(f"  主损失: {main_loss.item()}")
-        raise ValueError("Loss is NaN or Inf")
+    # 检查损失异常：不中断训练，回退为零损失并跳过本 batch 更新
+    if not torch.isfinite(total_loss):
+        total_loss_val = total_loss.item() if isinstance(total_loss, torch.Tensor) else float('nan')
+        main_loss_val = main_loss.item() if isinstance(main_loss, torch.Tensor) else float('nan')
+        print(f"⚠ Warning: total_loss is NaN/Inf ({total_loss_val}), main_loss={main_loss_val}. Skip this batch.")
+        total_loss = dummy_loss.clone()
     
     # 返回各项损失用于记录
     loss_dict = {
@@ -640,7 +1007,10 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         'main_loss_ang': main_loss_ang.item() if isinstance(main_loss_ang, torch.Tensor) else 0.0,
     }
     
-    return total_loss, 0, B, loss_dict
+    # 调整返回的样本数：如果在第二阶段进行了混合，返回原始batch size
+    n_samples = B // 2 if stage2_mix_loss else B
+    
+    return total_loss, 0, n_samples, loss_dict
 
 def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weights=None, current_stage=1, total_stage_epochs=50, ema_models=None, use_dense_trajectory=False, num_dense_points=100):
     """
@@ -655,8 +1025,18 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
     total_loss = 0
     total_samples = 0
     
-    # 累积各项损失（添加consistency）
-    loss_accumulator = {'main': 0, 'smoothness': 0, 'curvature': 0, 'angle_smoothness': 0, 'angle_consistency': 0, 'uniformity': 0, 'tangent': 0, 'capsize': 0, 'consistency': 0}
+    # 累积各项损失
+    loss_accumulator = {
+        'main': 0, 
+        'smoothness': 0, 
+        'curvature': 0,
+        'angle_smoothness': 0, 
+        'angle_consistency': 0, 
+        'uniformity': 0, 
+        'tangent': 0, 
+        'capsize': 0, 
+        'consistency': 0,
+    }
     
     pbar = tqdm(trainingData, mininterval=2, desc=f"Training Epoch {stage_epoch} (Stage {current_stage})")
     for batch_idx, batch in enumerate(pbar):
@@ -668,18 +1048,20 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
             is_training=True,  # 训练模式：capsize loss使用回归损失
             current_stage=current_stage,  # 传递当前阶段
             use_dense_trajectory=use_dense_trajectory,
-            num_dense_points=num_dense_points
+            num_dense_points=num_dense_points,
+            prediction_type=prediction_type
         )
-        
+
+        # 先检查 loss 再统计，避免把 NaN 累积进 epoch 指标
+        if not torch.isfinite(loss):
+            print("Warning: NaN/Inf loss, skipping batch")
+            continue
+
         total_loss += loss.item()
         total_samples += n_samples
         
         for key in loss_accumulator.keys():
             loss_accumulator[key] += loss_dict[key]
-        
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: NaN/Inf loss, skipping batch")
-            continue
         
         loss.backward()
         
@@ -692,6 +1074,13 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
         original_grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), max_norm=clip_value, norm_type=2
         )
+
+        # 梯度异常保护：跳过本次参数更新，防止污染模型
+        if not torch.isfinite(original_grad_norm):
+            print("Warning: Non-finite gradient norm, skipping optimizer step for this batch")
+            optimizer.zero_grad()
+            continue
+
         was_clipped = original_grad_norm > clip_value
         
         optimizer.step_and_update_lr()
@@ -715,11 +1104,11 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
                 'GradNorm': grad_info
             })
         else:
-            # 阶段2：显示倾覆损失
+            # 阶段2：显示主损失与物理约束损失
             pbar.set_postfix({
                 'Total': f'{loss.item():.5f}',
-                'Capsize': f'{loss_dict["capsize"]*loss_weights["capsize"]:.5f}',
-                'Tangent': f'{loss_dict["tangent"]:.4f}',
+                'Main': f'{loss_dict["main"]:.5f}',
+                'Capsize': f'{loss_dict["capsize"]:.4f}',
                 'GradNorm': grad_info
             })
     
@@ -744,7 +1133,16 @@ def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_
     total_samples = 0
     
     # 累积各项损失
-    loss_accumulator = {'main': 0, 'smoothness': 0, 'curvature': 0, 'angle_smoothness': 0, 'angle_consistency': 0, 'uniformity': 0, 'tangent': 0, 'capsize': 0}
+    loss_accumulator = {
+        'main': 0, 
+        'smoothness': 0, 
+        'curvature': 0,
+        'angle_smoothness': 0, 
+        'angle_consistency': 0, 
+        'uniformity': 0, 
+        'tangent': 0, 
+        'capsize': 0,
+    }
     
     with torch.no_grad():
         for batch in tqdm(validationData, mininterval=2, desc="Validation"):
@@ -755,7 +1153,8 @@ def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_
                 is_training=False,  # 验证模式：capsize loss返回实际cost值
                 current_stage=current_stage,  # 传递当前阶段
                 use_dense_trajectory=use_dense_trajectory,
-                num_dense_points=num_dense_points
+                num_dense_points=num_dense_points,
+                prediction_type=prediction_type
             )
                 
             total_loss += loss.item()
@@ -825,7 +1224,7 @@ if __name__ == "__main__":
     parser.add_argument('--resume', help="Path to checkpoint to resume training", default=None)
     parser.add_argument('--stage', help="Training stage to start from (1 or 2)", type=int, default=1, choices=[1, 2])
     parser.add_argument('--stage1_epochs', help="Number of epochs for stage 1", type=int, default=200)
-    parser.add_argument('--stage2_epochs', help="Number of epochs for stage 2", type=int, default=50)
+    parser.add_argument('--stage2_epochs', help="Number of epochs for stage 2", type=int, default=300)
     # parser.add_argument('--prediction_type', help="Model prediction type", type=str, default='v', choices=['epsilon', 'x0', 'v'])
     args = parser.parse_args()
 
@@ -917,7 +1316,7 @@ if __name__ == "__main__":
     env_list = ["env000012", "env000013"]
     
     # =================== EMA配置 ===================
-    use_ema = True  # 是否使用EMA
+    use_ema = False  # 是否使用EMA
     ema_decays = [0.99, 0.999]  # EMA衰减率列表，可以设置多个值如[0.999, 0.9999, 0.99999]
     ema_models = []
     
@@ -949,7 +1348,6 @@ if __name__ == "__main__":
     #     'epochs': args.stage1_epochs,
     #     'lr_mul': 1e-1,  # 学习率倍增器
     #     'loss_weights': {
-    #         'main': 1e0,          # 主预测损失
     #         'smoothness': 1e-5,   # 平滑性损失
     #         'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
     #         'angle_smoothness': 1e-2,  # 角度平滑性损失
@@ -963,7 +1361,7 @@ if __name__ == "__main__":
         'epochs': args.stage1_epochs,
         'lr_mul': 1e-1,  # 学习率倍增器
         'loss_weights': {
-            'main': 1e-1,          # 主预测损失
+            'main': 1e-2,          # 主预测损失
             'smoothness': 0e-5,   # 平滑性损失
             'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
             'angle_smoothness': 0e-2,  # 角度平滑性损失
@@ -979,17 +1377,17 @@ if __name__ == "__main__":
     # **关键**：保留main loss作为正则化，capsize loss作为优化目标
     stage2_config = {
         'epochs': args.stage2_epochs,
-        'lr_mul': 1e-4,  # 小学习率微调（不是从头训练！）
+        'lr_mul': 1e-3,  # 小学习率微调（不是从头训练！）
         'loss_weights': {
-            'main': 0e-1,        # 保留主损失作为正则化（不能为0！）
+            'main': 0e-4,        # 保留主损失作为正则化（不能为0！）
             'smoothness': 0e-5,   # 平滑性损失
             'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
             'angle_smoothness': 0e-2,  # 角度平滑性损失
             'angle_consistency': 0e-6,  # 角度一致性损失
             'uniformity': 0e-4,   # 均匀性损失
             'tangent': 0e-2,   # 切线约束损失（确保起点和终点方向一致）
-            'capsize': 1e-4,      # 倾覆优化损失（主要优化目标）
-            'consistency': 0.0    # 时间一致性损失（当前不启用）
+            'capsize': 1e-2,
+            'consistency': 0.0,   # 时间一致性损失（当前不启用）
         }
     }
     
@@ -1001,8 +1399,15 @@ if __name__ == "__main__":
         loss_weights = stage1_config['loss_weights']
     else:
         loss_weights = stage2_config['loss_weights']
+
+    if current_stage == 2 and loss_weights.get('main', 0.0) <= 0.0:
+        print("⚠ Warning: Stage 2 main loss weight <= 0, training is capsize-only and may collapse.")
     
-    compute_stability = (current_stage == 2 and loss_weights.get('capsize', 0.0) > 0)
+    compute_stability = (
+        current_stage == 2 and (
+            loss_weights.get('capsize', 0.0) > 0
+        )
+    )
     
     trainDataset = UnevenPathDataLoader(
         env_list=env_list,
@@ -1115,6 +1520,12 @@ if __name__ == "__main__":
         # 恢复阶段信息
         saved_stage = checkpoint.get('stage', 1)
         saved_epoch = checkpoint.get('epoch', -1)
+        # 注意：当前保存的 epoch 是“阶段内索引”（stage_epoch），
+        # 恢复训练循环需要“全局索引”（global epoch）。
+        if saved_stage == 2 and saved_epoch >= 0:
+            saved_epoch_global = stage1_config['epochs'] + saved_epoch
+        else:
+            saved_epoch_global = saved_epoch
         
         # 尝试加载EMA模型状态（如果启用EMA且checkpoint中包含相同数量的EMA模型）
         if use_ema and len(ema_models) > 0:
@@ -1155,7 +1566,7 @@ if __name__ == "__main__":
             loss_weights = stage2_config['loss_weights']
             current_lr_mul = stage2_config['lr_mul']
             # 继续第二阶段的训练
-            start_epoch = saved_epoch + 1
+            start_epoch = saved_epoch_global + 1
             
         elif args.stage == 2 and saved_stage == 1:
             print("Loading stage 1 checkpoint, starting stage 2 from epoch 0")
@@ -1175,14 +1586,14 @@ if __name__ == "__main__":
             current_stage = 1
             loss_weights = stage1_config['loss_weights']
             current_lr_mul = stage1_config['lr_mul']
-            start_epoch = saved_epoch + 1
+            start_epoch = saved_epoch_global + 1
             
         else:  # args.stage == 2 and saved_stage == 2
             # 继续第二阶段的训练
             current_stage = 2
             loss_weights = stage2_config['loss_weights']
             current_lr_mul = stage2_config['lr_mul']
-            start_epoch = saved_epoch + 1
+            start_epoch = saved_epoch_global + 1
         
         # 根据恢复的阶段更新优化器学习率
         optimizer.lr_mul = current_lr_mul
@@ -1384,7 +1795,7 @@ if __name__ == "__main__":
         val_losses.append(val_loss)
         
         print(f"\n[Stage {current_stage}] Epoch {stage_epoch}:")
-        print(f"  Train Loss: {train_loss:.6f}")
+        print(f"  Train Loss: {train_loss:.9f}")
         print(f"    - Main: {train_loss_dict['main']:.6f}")
         # print(f"    - Smoothness: {train_loss_dict['smoothness']:.6f}")
         # print(f"    - Curvature: {train_loss_dict['curvature']:.6f}")
@@ -1392,8 +1803,8 @@ if __name__ == "__main__":
         # print(f"    - Angle Consistency: {train_loss_dict['angle_consistency']:.6f}")
         # print(f"    - Uniformity: {train_loss_dict['uniformity']:.6f}")
         print(f"    - Tangent: {train_loss_dict['tangent']:.6f}")
-        print(f"    - Capsize: {train_loss_dict['capsize']:.6f}")
-        print(f"  Val Loss:   {val_loss:.6f}")
+        print(f"    - Capsize: {train_loss_dict['capsize']:.9f}")
+        print(f"  Val Loss:   {val_loss:.9f}")
         print(f"    - Main: {val_loss_dict['main']:.6f}")
         # print(f"    - Smoothness: {val_loss_dict['smoothness']:.6f}")
         # print(f"    - Curvature: {val_loss_dict['curvature']:.6f}")
@@ -1401,7 +1812,7 @@ if __name__ == "__main__":
         # print(f"    - Angle Consistency: {val_loss_dict['angle_consistency']:.6f}")
         # print(f"    - Uniformity: {val_loss_dict['uniformity']:.6f}")
         print(f"    - Tangent: {val_loss_dict['tangent']:.6f}")
-        print(f"    - Capsize: {val_loss_dict['capsize']:.6f}")
+        print(f"    - Capsize: {val_loss_dict['capsize']:.9f}")
         
         # 打印EMA验证损失
         if use_ema and len(ema_val_losses) > 0:
@@ -1450,9 +1861,15 @@ if __name__ == "__main__":
         
         writer.add_scalar('LR', optimizer._optimizer.param_groups[0]['lr'], stage_epoch)
         
-        # 保存最佳标准模型（基于标准模型的验证损失）
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # 保存最佳标准模型
+        # # Stage 2：以验证集安全率为主（越高越好），main仅作为次级tie-break
+        # if current_stage == 2:
+        #     current_val_metric = -val_loss_dict.get('reward_rate', 0.0) + 1e-3 * val_loss_dict['main']
+        # else:
+        #     current_val_metric = val_loss
+        current_val_metric = val_loss
+        if current_val_metric < best_val_loss:
+            best_val_loss = current_val_metric
             
             if isinstance(model, nn.DataParallel):
                 state_dict = model.module.state_dict()
@@ -1470,19 +1887,33 @@ if __name__ == "__main__":
                 'optimizer_state_dict': optimizer._optimizer.state_dict(),
                 'n_steps': optimizer.n_steps,
                 'train_loss': train_loss,
-                'val_loss': val_loss,
+                'val_loss': current_val_metric,
                 'stage1_best_loss': stage1_best_loss,
                 'torch_seed': torch_seed
             }
             
             torch.save(checkpoint, best_model_path)
-            print(f"  ✓ Saved best model for Stage {current_stage} to {osp.basename(best_model_path)} (val_loss={val_loss:.6f})")
+            if current_stage == 2:
+                print(
+                    f"  ✓ Saved best model for Stage {current_stage} to {osp.basename(best_model_path)} "
+                    # f"(val_safe_rate={val_loss_dict.get('reward_rate', 0.0):.4f}, val_main={val_loss_dict['main']:.6f}, metric={current_val_metric:.6f})"
+                )
+            else:
+                print(f"  ✓ Saved best model for Stage {current_stage} to {osp.basename(best_model_path)} (val_loss={current_val_metric:.6f})")
         
-        # 分别保存每个EMA模型（基于各自的验证损失）
+        # 分别保存每个EMA模型（基于各自的训练指标在Stage 2）
         if use_ema and len(ema_models) > 0:
             for i, (ema_m, decay, ema_val_loss) in enumerate(zip(ema_models, ema_decays, ema_val_losses)):
-                if ema_val_loss < ema_best_val_losses[i]:
-                    ema_best_val_losses[i] = ema_val_loss
+                # if current_stage == 2:
+                #     # 同样使用训练集指标（EMA是基于training trajectory学出来的）
+                #     # 注意：这里我们还没有EMA模型的训练时指标，只能用val指标
+                #     # 但理想情况下应该在训练阶段累积EMA模型的reward_rate
+                #     ema_val_metric = -ema_val_loss_dicts[i].get('reward_rate', 0.0) + 1e-3 * ema_val_loss_dicts[i]['main']
+                # else:
+                #     ema_val_metric = ema_val_loss
+                ema_val_metric = ema_val_loss
+                if ema_val_metric < ema_best_val_losses[i]:
+                    ema_best_val_losses[i] = ema_val_metric
                     
                     # 获取EMA模型的state_dict
                     ema_state_dict = ema_m.module.state_dict()
@@ -1499,12 +1930,18 @@ if __name__ == "__main__":
                         'model_state_dict': ema_state_dict,
                         'ema_decay': decay,
                         'train_loss': train_loss,
-                        'val_loss': ema_val_loss,  # 使用EMA模型自己的验证损失
+                        'val_loss': ema_val_metric,
                         'stage1_best_loss': stage1_best_loss,
                         'torch_seed': torch_seed
                     }
                     torch.save(ema_checkpoint, ema_model_path)
-                    print(f"  ✓ Saved best EMA model (decay={decay}) to {ema_model_filename} (val_loss={ema_val_loss:.6f})")
+                    if current_stage == 2:
+                        print(
+                            f"  ✓ Saved best EMA model (decay={decay}) to {ema_model_filename} "
+                            # f"(val_safe_rate={ema_val_loss_dicts[i].get('reward_rate', 0.0):.4f}, val_main={ema_val_loss_dicts[i]['main']:.6f}, metric={ema_val_metric:.6f})"
+                        )
+                    else:
+                        print(f"  ✓ Saved best EMA model (decay={decay}) to {ema_model_filename} (val_loss={ema_val_metric:.6f})")
         
         # 定期保存检查点（每5个epoch）- 作为备份
         if (stage_epoch + 1) % 5 == 0:

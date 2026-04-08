@@ -77,6 +77,17 @@ python3 train_mamba.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=da
 python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim
 python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2
 python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth
+python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage2_best_model.pth --stage 2
+
+python3 train_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2 --use_lora 1 --lora_rank 8
+
+tensorboard --logdir=data/sim/
+
+# 使用LoRA进行第二阶段微调（rank=8）
+python train_dit.py --batchSize 32 --stage 2 --use_lora 1 --lora_rank 8
+
+# 传统全参数训练（向后兼容）
+python train_dit.py --batchSize 32 --stage 2 --use_lora 0
 
 python3 train_polynomial_dit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/polynomial
 

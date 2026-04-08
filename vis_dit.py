@@ -389,7 +389,7 @@ if __name__ == "__main__":
     best = True
     # best = False
     epoch = 4
-    stage = 1
+    stage = 2
     
     # ema = True
     ema = False
@@ -400,8 +400,8 @@ if __name__ == "__main__":
     # 设置为1: 只生成单条轨迹（确定性预测）
     # 设置为>1: 生成多条轨迹（展示扩散模型的多峰性）
     # num_pred_paths = 100  # 每个场景生成100条不同的轨迹
-    # num_pred_paths = 20  # 每个场景生成20条不同的轨迹
-    num_pred_paths = 10  # 每个场景生成5条不同的轨迹
+    num_pred_paths = 20  # 每个场景生成20条不同的轨迹
+    # num_pred_paths = 10  # 每个场景生成5条不同的轨迹
     # num_pred_paths = 5  # 每个场景生成5条不同的轨迹
     # num_pred_paths = 1  # 单条轨迹模式
     # ================================================
@@ -410,8 +410,8 @@ if __name__ == "__main__":
     # 'pmf_onestep': 一步预测方法（快速）
     # 'euler': 一阶Euler方法（快速，但精度较低）
     # 'heun': 二阶Heun方法（较慢，但精度更高）
-    # solver = 'pmf_onestep'  # 快速的一步预测方法
-    solver = 'pmf_refined'
+    solver = 'pmf_onestep'  # 快速的一步预测方法
+    # solver = 'pmf_refined'
     # solver = 'euler'  # 可选：速度更快
     diffusion_step = 3
     # solver = 'heun'  # 推荐：精度更高

@@ -4,27 +4,85 @@ from os import path as osp
 import numpy as np
 import pickle
 
-from skimage import io
-
 import sys
 sys.modules['numpy._core'] = np
 sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
 sys.modules['numpy._core.multiarray'] = np.core.multiarray
 
 import torch
-import torch.nn.functional as F
 import json
 
-from transformer import Models
-# from vision_mamba import Models
-from dataLoader_uneven import get_encoder_input, receptive_field
-from eval_model_uneven import getHashTable, get_patch
-import torch
+from dit.Models import PathDiffusionTransformer
 
 dataset_path = 'data/sim_dataset/val'
+diffusion_step = None
 
 # Define the network
 device='cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def generate_paths(model, map_input, start_point, goal_point, num_paths=1,
+                   reconstruct_trajectory=True, num_traj_points=100, solver='heun'):
+    """
+    使用 PathDiffusionTransformer 生成轨迹
+    Returns:
+        trajectories: (num_paths, N, 3)，每个点为 [x, y, theta]
+    """
+    model.eval()
+
+    # 归一化起终点为 4 维：(x, y, cos(theta), sin(theta))
+    start_normalized = torch.zeros(4, device=start_point.device)
+    start_normalized[:2] = start_point[:2] / 20.0
+    start_normalized[2] = torch.cos(start_point[2])
+    start_normalized[3] = torch.sin(start_point[2])
+    start_normalized[:2] = torch.clamp(start_normalized[:2], -1.0, 1.0)
+    start_normalized = start_normalized.unsqueeze(0)
+
+    goal_normalized = torch.zeros(4, device=goal_point.device)
+    goal_normalized[:2] = goal_point[:2] / 20.0
+    goal_normalized[2] = torch.cos(goal_point[2])
+    goal_normalized[3] = torch.sin(goal_point[2])
+    goal_normalized[:2] = torch.clamp(goal_normalized[:2], -1.0, 1.0)
+    goal_normalized = goal_normalized.unsqueeze(0)
+
+    with torch.no_grad():
+        sampled_traj_xy = model.sample(
+            map_input,
+            start_normalized,
+            goal_normalized,
+            num_samples=num_paths,
+            num_steps=diffusion_step,
+            solver=solver,
+            reconstruct_trajectory=reconstruct_trajectory,
+            num_traj_points=num_traj_points,
+        )  # (num_paths, N, 2)
+
+    def compute_theta_from_xy(traj_xy):
+        n = traj_xy.shape[0]
+        theta = np.zeros(n)
+        for i in range(1, n - 1):
+            dx = traj_xy[i + 1, 0] - traj_xy[i - 1, 0]
+            dy = traj_xy[i + 1, 1] - traj_xy[i - 1, 1]
+            theta[i] = np.arctan2(dy, dx)
+
+        dx = traj_xy[1, 0] - traj_xy[0, 0]
+        dy = traj_xy[1, 1] - traj_xy[0, 1]
+        theta[0] = np.arctan2(dy, dx)
+
+        dx = traj_xy[-1, 0] - traj_xy[-2, 0]
+        dy = traj_xy[-1, 1] - traj_xy[-2, 1]
+        theta[-1] = np.arctan2(dy, dx)
+        return theta
+
+    sampled_traj_xy_np = sampled_traj_xy.cpu().numpy()
+    trajectories = []
+    for i in range(num_paths):
+        traj_xy = sampled_traj_xy_np[i]
+        theta = compute_theta_from_xy(traj_xy)
+        traj_full = np.column_stack([traj_xy, theta])
+        trajectories.append(traj_full)
+
+    return np.stack(trajectories, axis=0)
 
 def plot_single_trajectory(ax, elevation_masked, start_pos, goal_pos, predTraj):
     """绘制单个轨迹子图的辅助函数"""
@@ -96,9 +154,24 @@ def plot_elevation_map(start_pos, goal_pos, envType, save_path='predictions'):
         normal_y = tensor[:, :, 2]
         normal_z = tensor[:, :, 3]
         elevation_masked = np.ma.masked_invalid(elevation)
-    
-    # 获取预测轨迹
-    patch_map, predProb, predTraj = get_patch(transformer, start_pos, goal_pos, normal_x, normal_y, normal_z)
+
+    encoder_input = torch.tensor(np.concatenate((
+        normal_x[:, :, None],
+        normal_y[:, :, None],
+        normal_z[:, :, None]
+    ), axis=2), dtype=torch.float32)
+
+    predTrajs = generate_paths(
+        model,
+        map_input=encoder_input.permute(2, 0, 1)[None, :].to(device),
+        start_point=torch.tensor(start_pos).float().to(device),
+        goal_point=torch.tensor(goal_pos).float().to(device),
+        num_paths=1,
+        reconstruct_trajectory=True,
+        num_traj_points=100,
+        solver=solver,
+    )
+    predTraj = predTrajs.squeeze(0)
     
     print(f"Start: ({start_pos[0]:.2f}, {start_pos[1]:.2f}, {start_pos[2]:.2f})")
     print(f"Goal: ({goal_pos[0]:.2f}, {goal_pos[1]:.2f}, {goal_pos[2]:.2f})")
@@ -125,46 +198,45 @@ def plot_elevation_map(start_pos, goal_pos, envType, save_path='predictions'):
 
 if __name__ == "__main__":
     best = True
-    # best = False
-    # stage = 1
-    # epoch = 39
     stage = 2
     epoch = 4
+
+    ema = False
+    ema_decay = 0.999
+
+    solver = 'pmf_onestep'
+    diffusion_step = 3
     
-    envType = 'env000000'  # 指定环境
+    envType = 'env000010'  # 指定环境
     save_path = 'predictions'
 
     modelFolder = 'data/sim'
     modelFile = osp.join(modelFolder, f'model_params.json')
     model_param = json.load(open(modelFile))
 
-    transformer = Models.UnevenTransformer(**model_param)
-    _ = transformer.to(device)
+    model = PathDiffusionTransformer(**model_param['model_args'])
+    _ = model.to(device)
 
-    if stage == 1:
-        if best:
-            checkpoint = torch.load(osp.join(modelFolder, f'best_stage1_model.pkl'))
-            print("Loaded best stage 1 model.")
+    if best:
+        if ema:
+            checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_ema_{ema_decay}.pth'))
+            print(f"Loaded best EMA stage {stage} model.")
         else:
-            checkpoint = torch.load(osp.join(modelFolder, f'stage1_model_epoch_{epoch}.pkl'))
-            print(f"Loaded stage 1 model from epoch {epoch}.")
+            checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_model.pth'))
+            print(f"Loaded best stage {stage} model.")
     else:
-        if best:
-            checkpoint = torch.load(osp.join(modelFolder, f'best_stage2_model.pkl'))
-            print("Loaded best stage 2 model.")
-        else:
-            checkpoint = torch.load(osp.join(modelFolder, f'stage2_model_epoch_{epoch}.pkl'))
-            print(f"Loaded stage 2 model from epoch {epoch}.")
-    transformer.load_state_dict(checkpoint['state_dict'])
+        checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_stage{stage}_epoch_{epoch}.pth'))
+        print(f"Loaded stage {stage} model from epoch {epoch}.")
+    model.load_state_dict(checkpoint['model_state_dict'])
 
-    _ = transformer.eval()
+    _ = model.eval()
 
     # 自定义起点和终点 (x, y, theta)
     # theta 是朝向角度，单位是弧度
-    # 位姿数据： start_map=(2.965, 14.376, 44.160°), goal_map=(-13.011, -10.320, 90.577°)
+    # 位姿数据： start_map=(-0.034, 0.081, 173.520°), goal_map=(0.045, 10.083, 89.578°)
 
-    start_pos = np.array([2.965, 14.376, 44.160/180*np.pi])  # 起点在左下角，朝向右
-    goal_pos = np.array([-13.011, -10.320, 90.577/180*np.pi])  # 终点在右上角，朝向东北
+    start_pos = np.array([-0.034, 0.081, 173.520/180*np.pi])  # 起点在左下角，朝向右
+    goal_pos = np.array([0.045, 10.083, 89.578/180*np.pi])  # 终点在右上角，朝向东北
 
     # # 或者定义多组起点终点进行测试
     # test_cases = [
