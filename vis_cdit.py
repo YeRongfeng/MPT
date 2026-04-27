@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 import json
 
-from dit.Models import PathDiffusionTransformer
+from dit.Models import CostConditionedPathDiffusionTransformer
 from dataLoader_uneven import get_encoder_input, receptive_field
 from eval_model_uneven import getHashTable, get_patch
 import torch
@@ -27,13 +27,13 @@ dataset_path = 'data/sim_dataset/val'
 
 diffusion_step = None
 
-def generate_paths(model, map_input, start_point, goal_point, num_paths=5, 
-                   reconstruct_trajectory=True, num_traj_points=100, solver='heun'):
+def generate_paths(model, map_input, start_point, goal_point, cost_scalar=0.0, num_paths=5, 
+                   reconstruct_trajectory=True, num_traj_points=100, solver='heun', w=1.0):
     """
     生成完整路径（使用B样条控制点重建）- Rectified Flow版本
     
     Args:
-        model: 训练好的PathDiffusionTransformer
+        model: 训练好的CostConditionedPathDiffusionTransformer
         map_input: (1, 3, H, W) 地图输入
         start_point: (3,) [x, y, yaw] 起点坐标（真实坐标）
         goal_point: (3,) [x, y, yaw] 终点坐标（真实坐标）
@@ -69,11 +69,13 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=5,
             map_input,
             start_normalized,
             goal_normalized,
+            cost_scalar=cost_scalar,
             num_samples=num_paths,
             num_steps=diffusion_step,  # 使用新参数名
             solver=solver,  # 选择ODE求解器
             reconstruct_trajectory=reconstruct_trajectory,
-            num_traj_points=num_traj_points
+            num_traj_points=num_traj_points,
+            w=w
         )  # (num_paths, N, 2) - 只有(x,y)，已经是真实坐标（非归一化）
     
     # 从xy坐标计算theta（通过差分计算切向量）
@@ -237,7 +239,7 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTrajs=None, out
     ax.set_title(title, fontsize=12, pad=8)
     ax.axis('off')
 
-def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_paths=1, use_bezier_interpolate=False):
+def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_paths=1, use_bezier_interpolate=False, w=1.0):
     """绘制多组轨迹对比图
     
     Args:
@@ -324,10 +326,12 @@ def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_path
                                   map_input=encoder_input.permute(2, 0, 1)[None, :].cuda(),
                                   start_point=torch.tensor(start_pos).float().to(device),
                                   goal_point=torch.tensor(goal_pos).float().to(device),
+                                  cost_scalar=cost_scalar,
                                   num_paths=num_pred_paths,  # 生成多条轨迹
                                   reconstruct_trajectory=True,  # 从控制点重建轨迹
                                   num_traj_points=100,  # 重建为100个点
-                                  solver=solver  # 传递求解器类型
+                                  solver=solver,  # 传递求解器类型
+                                  w=w
                                  )  # (num_pred_paths, 100, 3) - 100个重建的轨迹点
         
         # 如果只有一条轨迹，squeeze掉第一维
@@ -388,8 +392,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_path
 if __name__ == "__main__":
     best = True
     # best = False
-    epoch = 9
-    stage = 2
+    epoch = 4
     
     # ema = True
     ema = False
@@ -418,6 +421,17 @@ if __name__ == "__main__":
     # diffusion_step = 50
     # ==================================================
     
+    # cost_scalar=0.65  # 成本权重，路径生成时对成本期望值
+    # # cfg_w = 3.5  # CFG guidance权重：1.0=不引导，>1更强条件引导
+    # cfg_w = 1.5  # CFG guidance权重：1.0=不引导，>1更强条件引导
+    
+    # cost_mean = 1.4
+    # cost_std = 0.2
+    # cost_scalar = (cost_scalar - cost_mean) / cost_std  # 标准化成本权重
+    
+    cost_scalar = 0.65
+    cfg_w = 1.5
+    
     # =================== 样条插值配置 ===================
     # True: 使用三次样条插值生成平滑轨迹（100个点，保证经过所有控制点）
     # False: 直接使用控制点连接（默认，更快）
@@ -435,21 +449,21 @@ if __name__ == "__main__":
     modelFile = osp.join(modelFolder, f'model_params.json')
     model_param = json.load(open(modelFile))
 
-    model = PathDiffusionTransformer(**model_param['model_args'])
+    model = CostConditionedPathDiffusionTransformer(**model_param['model_args'])
     _ = model.to(device)
 
     # checkpoint = torch.load(osp.join(modelFolder, f'model_epoch_{epoch}.pkl'))
     
     if best:
         if ema:
-            checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_ema_{ema_decay}.pth'))
-            print(f"Loaded best EMA stage {stage} model.")
+            checkpoint = torch.load(osp.join(modelFolder, f'best_ema_{ema_decay}.pth'))
+            print(f"Loaded best EMA model.")
         else:
-            checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_model.pth'))
-            print(f"Loaded best stage {stage} model.")
+            checkpoint = torch.load(osp.join(modelFolder, f'best_model.pth'))
+            print(f"Loaded best model.")
     else:
-        checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_stage{stage}_epoch_{epoch}.pth'))
-        print(f"Loaded stage {stage} model from epoch {epoch}.")
+        checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_epoch_{epoch}.pth'))
+        print(f"Loaded model from epoch {epoch}.")
     
     model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -487,7 +501,8 @@ if __name__ == "__main__":
         print(f"Evaluating environment: {env}")
         print(f"Generating {num_pred_paths} trajectory sample(s) per scene")
         print(f"ODE Solver: {solver}")
+        print(f"CFG w: {cfg_w}")
         print(f"Spline interpolation: {'Enabled' if use_bezier_interpolate else 'Disabled'}")
 
         # 绘制多组轨迹对比图
-        plot_elevation_map(path_index_list, env, save_path, num_pred_paths=num_pred_paths, use_bezier_interpolate=use_bezier_interpolate)
+        plot_elevation_map(path_index_list, env, save_path, num_pred_paths=num_pred_paths, use_bezier_interpolate=use_bezier_interpolate, w=cfg_w)

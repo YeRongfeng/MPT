@@ -1347,3 +1347,542 @@ class PathDiffusionTransformer(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
 
+class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
+    """
+    成本条件化路径扩散变换器
+    
+    基于PathDiffusionTransformer，扩展功能支持成本标量作为额外的条件输入。
+    
+    【核心改进】
+    1. 新增成本输入：cost 是一个标量，表示路径的某种成本度量（如长度、曲率、碰撞风险等）
+    2. 成本嵌入：使用与时间步相同的正弦位置编码方法进行成本的Embedding
+    3. 条件融合：将成本条件与时间步和起终点条件一并融合到AdaLN中
+    
+    【数据流】
+    地图 → CNN特征提取 → Token融合 → 
+    [路径tokens + 时间步embedding + 成本embedding + 起终点embedding] →
+    DiT Blocks (带Cross-Attention) → 输出预测
+    
+    【使用场景】
+    - 条件路径规划：根据成本约束生成不同的路径
+    - 成本感知的轨迹优化：融合多种成本维度
+    - 可控生成：通过调整成本条件控制生成结果
+    """
+    
+    def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, 
+                 pad_idx, dropout, n_position, train_shape, 
+                 n_path_steps=24, diffusion_steps=50, prediction_type='epsilon', loss_type=None):
+        """
+        初始化成本条件化路径扩散变换器
+        
+        Args:
+            n_layers: Transformer层数
+            n_heads: 多头注意力头数
+            d_k: Key的维度
+            d_v: Value的维度
+            d_model: 模型隐层维度
+            d_inner: FFN内层维度
+            pad_idx: 填充索引
+            dropout: Dropout比率
+            n_position: 最大位置数
+            train_shape: 训练输入形状
+            n_path_steps: 中间控制点数量（默认24）
+            diffusion_steps: 扩散步数
+            prediction_type: 预测类型 ('epsilon', 'x0', 'v')
+            loss_type: 损失类型
+        """
+        super().__init__(
+            n_layers=n_layers,
+            n_heads=n_heads,
+            d_k=d_k,
+            d_v=d_v,
+            d_model=d_model,
+            d_inner=d_inner,
+            pad_idx=pad_idx,
+            dropout=dropout,
+            n_position=n_position,
+            train_shape=train_shape,
+            n_path_steps=n_path_steps,
+            diffusion_steps=diffusion_steps,
+            prediction_type=prediction_type,
+            loss_type=loss_type
+        )
+        
+        # ========== 成本嵌入模块 ==========
+        # 连续标量cost使用MLP嵌入（比sin/cos对标量更稳定）
+        self.cost_embedder = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model)
+        )
+        # 时间步嵌入缩放：将 t,r 从[0,1]放大后再做sin/cos编码，增强区分度
+        self.time_embed_scale = 1000.0
+        # learnable null token：用于CFG中的无条件分支
+        self.null_cost_embed = nn.Parameter(torch.zeros(1, d_model))
+        
+        # ========== 更新条件融合MLP ==========
+        # 原始：4个d_model (time + time_r + start + goal)
+        # 新增：1个d_model (cost)
+        # 总计：5个d_model
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(d_model * 5, d_model * 6),  # 5 = time + time_r + start + goal + cost
+            nn.GELU(),
+            nn.Linear(d_model * 6, d_model)
+        )
+    
+    def forward(self, map_input, noisy_path, timestep, timestep_r, start_pose, goal_pose, cost,
+                cost_drop_mask=None, force_null_cost=False):
+        """
+        前向传播 - 支持成本条件
+        
+        【数据流架构】
+        1. Path Tokens (x): 作为Query在DiT主干中流动并不断更新
+        2. Map Tokens: 作为Key/Value在Cross-Attention中被查询（保持不变）
+        3. Condition (c): Time + Start + Goal + Cost 融合后通过AdaLN调制每一层
+        
+        Args:
+            map_input: (B, 3, H, W) 输入地图
+            noisy_path: (B, n_path_steps, 2) 加噪后的中间控制点 x_t (x,y)
+                       n_path_steps=24，不包含起终点
+            timestep: (B,) 连续时间步 t ∈ [0, 1]
+                     t=0: 纯数据, t=1: 纯噪声
+            timestep_r: (B,) 反向时间步
+            start_pose: (B, 4) 起点坐标 (x,y,cos(θ),sin(θ)) - 已归一化
+            goal_pose: (B, 4) 终点坐标 (x,y,cos(θ),sin(θ)) - 已归一化
+            cost: (B,) 成本标量，可以是单个数值或批量成本
+                  范围可以是任意，建议归一化到 [0, 1]
+            
+        Returns:
+            model_output: (B, n_path_steps, 2) 预测的速度场 v = x_1 - x_0
+        """
+        B = map_input.shape[0]
+        
+        # ========== 1. 编码地图 (Context, 单尺度12×12 KV) ==========
+        feat_50 = self.map_fe_block1(map_input)           # (B, d_model//8, 50, 50)
+        feat_25 = self.map_fe_block2(feat_50)             # (B, d_model//4, 25, 25)
+        feat_12 = self.map_fe_block3(feat_25)             # (B, d_model//2, 12, 12)
+        feat_12 = self.map_fe_block4(feat_12)             # (B, d_model, 12, 12)
+        
+        map_tokens = self.reorder_dims(feat_12)           # (B, 144, D)
+        map_tokens = self.map_position_enc(map_tokens, conv_shape=feat_12.shape[-2:])
+        
+        # ========== 2. 编码路径 + 起终点 (Query Sequence) ==========
+        # 2.1 编码中间路径点 (B, N, D)
+        path_tokens = self.path_patchify(noisy_path)
+        # 添加 Learnable Position Embedding (仅针对中间路径点)
+        path_tokens = path_tokens + self.path_pos_embed  # (B, N, D)
+        
+        # 2.2 编码起终点 (B, 1, D)
+        start_token = self.pose_embedder(start_pose).unsqueeze(1)
+        goal_token = self.pose_embedder(goal_pose).unsqueeze(1)
+        
+        # 拼接顺序: [Start, Path, Goal] -> (B, N+2, D)
+        combined_tokens = torch.cat([start_token, path_tokens, goal_token], dim=1)
+        
+        # 2.3 预处理
+        combined_tokens = self.layer_norm(combined_tokens)
+        combined_tokens = self.dropout(combined_tokens)
+        
+        # ========== 3. 编码条件（新增成本） ==========
+        t_emb = self.time_embedder(timestep * self.time_embed_scale)              # (B, D) - 时间步
+        r_emb = self.time_embedder(timestep_r * self.time_embed_scale)            # (B, D) - 反向时间步
+        s_emb = self.pose_embedder(start_pose)            # (B, D) - 起点
+        g_emb = self.pose_embedder(goal_pose)             # (B, D) - 终点
+        
+        # 【关键改进】成本条件化嵌入
+        # 方式1：如果cost是标量或单个值，需要扩展为批次大小
+        if cost.dim() == 0:
+            # 单个标量，扩展为批量
+            cost_batch = cost.unsqueeze(0).expand(B)
+        else:
+            # 已经是批量形式 (B,)
+            cost_batch = cost
+        
+        # 连续cost标量通过MLP直接映射到特征空间
+        cost_embed_input = cost_batch.float().reshape(B, 1)
+        cost_emb = self.cost_embedder(cost_embed_input)   # (B, D)
+        null_emb = self.null_cost_embed.expand(B, -1)     # (B, D)
+
+        # CFG训练：按mask替换为learnable null token；
+        # 推理CFG无条件分支：force_null_cost=True时全量替换
+        if force_null_cost:
+            cost_emb = null_emb
+        elif cost_drop_mask is not None:
+            mask = cost_drop_mask
+            if mask.dim() > 1:
+                mask = mask.reshape(B)
+            mask = mask.to(device=cost_emb.device, dtype=torch.bool)
+            cost_emb = torch.where(mask.unsqueeze(-1), null_emb, cost_emb)
+        
+        # 融合所有全局条件 -> (B, D)
+        cond = self.cond_mlp(torch.cat([t_emb, r_emb, s_emb, g_emb, cost_emb], dim=-1))
+        
+        # ========== 4. DiT Blocks（解耦数据流） ==========
+        # x (Query): combined tokens，在主干中不断更新
+        # map_tokens (Key/Value): 地图tokens，保持不变
+        # cond: 全局条件，包含时间步、起终点和成本
+        x = combined_tokens
+        for block in self.dit_blocks:
+            if self.training and self.use_gradient_checkpoint:
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, map_tokens, cond, use_reentrant=False
+                )
+            else:
+                x = block(x, map_tokens, cond)
+        
+        x = self.layer_norm(x)  # 最后LayerNorm
+        
+        # ========== 5. 输出预测（单头连续回归） ==========
+        middle_feats = x[:, 1:-1, :]  # 提取中间控制点特征，去掉起终点 (B, n_path_steps, D)
+        model_output = self.main_pred(middle_feats)  # (B, n_path_steps, 2)
+        model_output = torch.clamp(model_output, -1.0, 1.0)
+        
+        return model_output  # 返回24个中间控制点
+    
+    def get_velocity(self, z_in, t_scalar, r_scalar, cost_scalar, map_input, start_pose, goal_pose, w=1.0):
+        """
+        成本条件化速度获取函数（用于pMF采样）
+        
+        Args:
+            z_in: (B, N, 2) 当前噪声状态
+            t_scalar: 时间步标量或张量
+            r_scalar: 反向时间步标量或张量
+            cost_scalar: 成本标量或张量
+            map_input: (B, 3, H, W) 地图
+            start_pose: (B, 4) 起点
+            goal_pose: (B, 4) 终点
+            
+        Returns:
+            v_field: (B, N, 2) 速度场
+        """
+        B = z_in.shape[0]
+        device = z_in.device
+        
+        # 确保所有输入都是批量形式
+        if not isinstance(t_scalar, torch.Tensor):
+            t_batch = torch.full((B,), t_scalar, device=device, dtype=z_in.dtype)
+        else:
+            t_batch = t_scalar if t_scalar.shape[0] == B else torch.full((B,), t_scalar.item(), device=device, dtype=z_in.dtype)
+        
+        if not isinstance(r_scalar, torch.Tensor):
+            r_batch = torch.full((B,), r_scalar, device=device, dtype=z_in.dtype)
+        else:
+            r_batch = r_scalar if r_scalar.shape[0] == B else torch.full((B,), r_scalar.item(), device=device, dtype=z_in.dtype)
+        
+        if not isinstance(cost_scalar, torch.Tensor):
+            cost_batch = torch.full((B,), cost_scalar, device=device, dtype=z_in.dtype)
+        else:
+            cost_batch = cost_scalar if cost_scalar.shape[0] == B else torch.full((B,), cost_scalar.item(), device=device, dtype=z_in.dtype)
+        
+        # 模型前向传播（支持CFG guidance）
+        model_out = self._forward_with_cfg(
+            map_input, z_in, t_batch, r_batch, start_pose, goal_pose, cost_batch, w=w
+        )
+        
+        # 统一逻辑：先求 pred_x0
+        if self.prediction_type == 'v':
+            pred_x0 = z_in - t_scalar * model_out
+        elif self.prediction_type == 'x0':
+            pred_x0 = model_out
+        else:  # 'epsilon'
+            pred_x0 = (z_in - t_scalar * model_out)
+        
+        # 计算速度场
+        eps = 1e-5
+        t_val = t_scalar if isinstance(t_scalar, (int, float)) else t_scalar.item()
+        if t_val < 1e-5:
+            return torch.zeros_like(z_in)
+        
+        v_field = (z_in - pred_x0) / t_val
+        return v_field
+    
+    def get_velocity_tensor(self, z_in, t_scalar, r_scalar, cost_scalar, map_input, start_pose, goal_pose, w=1.0):
+        """
+        可微分的成本条件化速度获取函数（t/r/cost 使用 0-d tensor）
+        
+        Args:
+            z_in: (B, N, 2) 当前噪声状态
+            t_scalar: 时间步标量或张量
+            r_scalar: 反向时间步标量或张量
+            cost_scalar: 成本标量或张量
+            map_input: (B, 3, H, W) 地图
+            start_pose: (B, 4) 起点
+            goal_pose: (B, 4) 终点
+            
+        Returns:
+            v_field: (B, N, 2) 速度场
+        """
+        B = z_in.shape[0]
+        device = z_in.device
+
+        # 确保为张量
+        if not torch.is_tensor(t_scalar):
+            t_scalar = torch.tensor(t_scalar, device=device, dtype=z_in.dtype)
+        if not torch.is_tensor(r_scalar):
+            r_scalar = torch.tensor(r_scalar, device=device, dtype=z_in.dtype)
+        if not torch.is_tensor(cost_scalar):
+            cost_scalar = torch.tensor(cost_scalar, device=device, dtype=z_in.dtype)
+
+        # 扩展为批量
+        t_batch = t_scalar.expand(B)
+        r_batch = r_scalar.expand(B)
+        cost_batch = cost_scalar.expand(B)
+
+        # 前向传播（支持CFG guidance）
+        model_out = self._forward_with_cfg(
+            map_input, z_in, t_batch, r_batch, start_pose, goal_pose, cost_batch, w=w
+        )
+
+        # 预测x0
+        if self.prediction_type == 'v':
+            pred_x0 = z_in - t_scalar * model_out
+        elif self.prediction_type == 'x0':
+            pred_x0 = model_out
+        else:  # 'epsilon'
+            pred_x0 = (z_in - t_scalar * model_out)
+
+        # 计算速度场（可微分）
+        eps = 1e-5
+        v_field = (z_in - pred_x0) / (t_scalar + eps)
+        return v_field
+
+    def _expand_cost_to_batch(self, cost_scalar, batch_size, device, dtype):
+        """将 cost 标量或张量统一扩展为 batch 形式。"""
+        if not torch.is_tensor(cost_scalar):
+            return torch.full((batch_size,), float(cost_scalar), device=device, dtype=dtype)
+
+        cost_scalar = cost_scalar.to(device=device, dtype=dtype)
+        if cost_scalar.dim() == 0:
+            return cost_scalar.expand(batch_size)
+        if cost_scalar.shape[0] == batch_size:
+            return cost_scalar
+        return torch.full((batch_size,), float(cost_scalar.reshape(-1)[0].item()), device=device, dtype=dtype)
+
+    def _forward_with_cfg(self, map_input, z_in, t_batch, r_batch, start_pose, goal_pose, cost_batch, w=1.0):
+        """CFG前向：pred = pred_uncond + w * (pred_cond - pred_uncond)。
+
+        这里的“uncond”采用 learnable null cost token 分支。
+        """
+        if abs(float(w) - 1.0) < 1e-8:
+            return self.forward(map_input, z_in, t_batch, r_batch, start_pose, goal_pose, cost_batch)
+
+        pred_cond = self.forward(map_input, z_in, t_batch, r_batch, start_pose, goal_pose, cost_batch)
+        pred_uncond = self.forward(
+            map_input, z_in, t_batch, r_batch, start_pose, goal_pose, cost_batch,
+            force_null_cost=True
+        )
+        return pred_uncond + float(w) * (pred_cond - pred_uncond)
+
+    def sample_differentiable(self, map_input, start_pose, goal_pose, cost_scalar=0.0, num_steps=3,
+                              solver='pmf_refined', reconstruct_trajectory=True, num_traj_points=100, w=1.0):
+        """
+        可微分采样（用于训练期的梯度回传），支持 cost 条件。
+        """
+        device = map_input.device
+        B = map_input.shape[0]
+
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
+
+        if solver == 'pmf_refined':
+            t_start = torch.tensor(1.0, device=device, dtype=z.dtype)
+            t_mid = torch.tensor(0.1, device=device, dtype=z.dtype)
+
+            v_coarse = self.get_velocity_tensor(z, t_start, t_mid, cost_batch, map_input, start_pose, goal_pose, w=w)
+            z = z + (t_mid - t_start) * v_coarse
+
+            timesteps = torch.linspace(t_mid, torch.tensor(0.0, device=device, dtype=z.dtype), num_steps + 1, device=device)
+            for i in range(num_steps):
+                t_curr = timesteps[i]
+                t_next = timesteps[i + 1]
+                dt = t_next - t_curr
+                v_fine = self.get_velocity_tensor(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+                z = z + dt * v_fine
+        elif solver == 'euler':
+            timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
+            for i in range(num_steps):
+                t_curr = timesteps[i]
+                t_next = timesteps[i + 1]
+                dt = t_next - t_curr
+                v_pred = self.get_velocity_tensor(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+                z = z + dt * v_pred
+        elif solver == 'heun':
+            timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
+            for i in range(num_steps):
+                t_curr = timesteps[i]
+                t_next = timesteps[i + 1]
+                dt = t_next - t_curr
+                v1 = self.get_velocity_tensor(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+                z_pred = z + dt * v1
+                v2 = self.get_velocity_tensor(z_pred, t_next, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+                z = z + dt * (v1 + v2) / 2
+        else:
+            raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_refined', 'euler' or 'heun'.")
+
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        control_points = torch.cat([start_xy, z, goal_xy], dim=1)
+
+        control_points_normalized = torch.clamp(control_points, -1.0, 1.0)
+        control_points_denorm = control_points_normalized * 20.0
+
+        if not reconstruct_trajectory:
+            return control_points_denorm
+
+        bspline_layer = DifferentiableBSpline(
+            num_control_points=self.n_path_steps + 2,
+            num_output_points=num_traj_points,
+            degree=3
+        ).to(device)
+        reconstructed_traj = bspline_layer(control_points_denorm)
+        return reconstructed_traj
+
+    @torch.no_grad()
+    def sample_pmf_onestep(self, map_input, start_pose, goal_pose, cost_scalar=0.0, w=1.0):
+        """pMF 核心：单步生成，支持 cost 条件。"""
+        device = map_input.device
+        B = map_input.shape[0]
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
+
+        t_batch = torch.ones(B, device=device, dtype=z.dtype)
+        r_batch = torch.zeros(B, device=device, dtype=z.dtype)
+        pred_x0 = self._forward_with_cfg(
+            map_input, z, t_batch, r_batch, start_pose, goal_pose, cost_batch, w=w
+        )
+
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        control_points = torch.cat([start_xy, pred_x0, goal_xy], dim=1)
+        return control_points
+
+    @torch.no_grad()
+    def sample_pmf_refined(self, map_input, start_pose, goal_pose, cost_scalar=0.0,
+                           refine_steps=3, t_refine_start=0.1, w=1.0):
+        """pMF 两阶段采样，支持 cost 条件。"""
+        device = map_input.device
+        B = map_input.shape[0]
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
+
+        t_start = 1.0
+        t_mid = t_refine_start
+        v_coarse = self.get_velocity(z, t_start, t_mid, cost_batch, map_input, start_pose, goal_pose, w=w)
+        z = z + (t_mid - t_start) * v_coarse
+
+        timesteps = torch.linspace(t_mid, 0.0, refine_steps + 1, device=device, dtype=z.dtype)
+        for i in range(refine_steps):
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            dt = t_next - t_curr
+            v_fine = self.get_velocity(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+            z = z + dt * v_fine
+
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        return torch.cat([start_xy, z, goal_xy], dim=1)
+
+    @torch.no_grad()
+    def sample_euler(self, map_input, start_pose, goal_pose, cost_scalar=0.0, num_steps=None, w=1.0):
+        """Euler ODE 采样，支持 cost 条件。"""
+        if num_steps is None:
+            num_steps = self.diffusion_steps
+
+        device = map_input.device
+        B = map_input.shape[0]
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
+
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
+        for i in range(num_steps):
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            dt = t_next - t_curr
+            v_pred = self.get_velocity(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+            z = z + dt * v_pred
+
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        return torch.cat([start_xy, z, goal_xy], dim=1)
+
+    @torch.no_grad()
+    def sample_heun(self, map_input, start_pose, goal_pose, cost_scalar=0.0, num_steps=None, w=1.0):
+        """Heun ODE 采样，支持 cost 条件。"""
+        if num_steps is None:
+            num_steps = self.diffusion_steps
+
+        device = map_input.device
+        B = map_input.shape[0]
+        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
+
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
+        for i in range(num_steps):
+            t_curr = timesteps[i].item()
+            t_next = timesteps[i + 1].item()
+            dt = t_next - t_curr
+
+            v1 = self.get_velocity(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+            z_pred = z + dt * v1
+            v2 = self.get_velocity(z_pred, t_next, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
+            z = z + dt * (v1 + v2) / 2
+
+        start_xy = start_pose[:, :2].unsqueeze(1)
+        goal_xy = goal_pose[:, :2].unsqueeze(1)
+        return torch.cat([start_xy, z, goal_xy], dim=1)
+
+    @torch.no_grad()
+    def sample(self, map_input, start_pose, goal_pose, cost_scalar=0.0, num_samples=5, num_steps=50,
+               solver='heun', reconstruct_trajectory=True, num_traj_points=100, w=1.0):
+        """
+        成本条件化采样接口。
+
+        这里重定义 sample 的原因是：基类 sample 会调用不带 cost 参数的 get_velocity，
+        对新网络类会丢失 cost 条件。
+        """
+        device = map_input.device
+        batch_size = map_input.shape[0]
+
+        cost_batch = self._expand_cost_to_batch(cost_scalar, batch_size, device, map_input.dtype)
+
+        if num_samples == 1:
+            map_input_batch = map_input
+            start_pose_batch = start_pose
+            goal_pose_batch = goal_pose
+            cost_input_batch = cost_batch
+        else:
+            map_input_batch = map_input.repeat_interleave(num_samples, dim=0)
+            start_pose_batch = start_pose.repeat_interleave(num_samples, dim=0)
+            goal_pose_batch = goal_pose.repeat_interleave(num_samples, dim=0)
+            cost_input_batch = cost_batch.repeat_interleave(num_samples, dim=0)
+
+        if solver == 'pmf_onestep':
+            result = self.sample_pmf_onestep(
+                map_input_batch, start_pose_batch, goal_pose_batch, cost_input_batch, w=w
+            )
+        elif solver == 'pmf_refined':
+            result = self.sample_pmf_refined(map_input_batch, start_pose_batch, goal_pose_batch, cost_input_batch,
+                                             refine_steps=num_steps, t_refine_start=0.1, w=w)
+        elif solver == 'euler':
+            result = self.sample_euler(map_input_batch, start_pose_batch, goal_pose_batch, cost_input_batch,
+                                       num_steps=num_steps, w=w)
+        elif solver == 'heun':
+            result = self.sample_heun(map_input_batch, start_pose_batch, goal_pose_batch, cost_input_batch,
+                                     num_steps=num_steps, w=w)
+        else:
+            raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_onestep', 'euler' or 'heun'.")
+
+        control_points_normalized = torch.clamp(result, -1.0, 1.0)
+        control_points_denorm = control_points_normalized * 20.0
+
+        if not reconstruct_trajectory:
+            return control_points_denorm
+
+        bspline_layer = DifferentiableBSpline(
+            num_control_points=self.n_path_steps + 2,
+            num_output_points=num_traj_points,
+            degree=3
+        ).to(device)
+        reconstructed_traj = bspline_layer(control_points_denorm)
+        return reconstructed_traj
+

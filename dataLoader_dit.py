@@ -173,6 +173,7 @@ def PaddedSequence(batch):
         'labels': torch.stack([batch_i['labels'] for batch_i in valid_batch]),  # [B, 2*N, MAX_POSITIVE_ANCHORS]
         'length': torch.tensor([batch_i['anchor'].shape[0] for batch_i in valid_batch]),  # [B,] - 序列长度
         'trajectory': torch.stack([batch_i['trajectory'] for batch_i in valid_batch]),  # [B, N+2, 3]
+        'cost': torch.stack([batch_i['cost'] for batch_i in valid_batch])  # 路径成本标量
     }
     
     # 如果有stability相关数据（Stage 2训练需要），则添加到返回字典
@@ -1410,6 +1411,7 @@ class UnevenPathDataLoader(Dataset):
         # valid = path_data['valid']  # 是否有效路径
         # if not valid:
         #     return None  # 如果路径无效，返回None    
+        cost = path_data.get('cost', 0.0)  # 路径成本（如果有）
         
         trajectory = path_data['path']  # [N+2, 3]
         
@@ -1580,6 +1582,7 @@ class UnevenPathDataLoader(Dataset):
             'goal_pose': torch.from_numpy(goal_pose).float(),    # ✅ 添加终点
             'trajectory': torch.as_tensor(trajectory, dtype=torch.float),  # 轨迹点：[N, 3]
             'elevation': torch.as_tensor(elevation, dtype=torch.float),  # 高程图：[H, W]
+            'cost': torch.tensor(cost, dtype=torch.float)  # 路径成本
         }
         
         # 条件性地添加stability相关数据

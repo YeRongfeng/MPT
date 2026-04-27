@@ -432,6 +432,28 @@ def compute_curvature_constraint_loss(trajectory, max_curvature=2.0):
     return curvature_loss
 
 
+def _get_stage2_fisher_proxy_state():
+    """获取/初始化第二阶段的 Fisher 近端状态。"""
+    if not hasattr(diffusion_loss, '_stage2_fisher_proxy_state'):
+        diffusion_loss._stage2_fisher_proxy_state = {
+            'ref_params': None,
+            'fisher_diag': None,
+            'ema_beta': 0.95,
+            'proxy_scale': 0.5,
+            'fisher_eps': 1e-8,
+        }
+    return diffusion_loss._stage2_fisher_proxy_state
+
+
+def refresh_stage2_fisher_reference(model):
+    """在一次优化步之后，刷新第二阶段 Fisher 近端参考参数。"""
+    state = _get_stage2_fisher_proxy_state()
+    base_model = model.module if hasattr(model, 'module') else model
+    trainable_params = [p for p in base_model.parameters() if p.requires_grad]
+    state['ref_params'] = [p.detach().clone() for p in trainable_params]
+
+
+
 def stage2_optimize_control_points(
     model, map_input, start_normalized, goal_normalized, start_pose, goal_pose,
     stability_cost_map, map_info, device, prediction_type='epsilon', num_iterations=10, lr=0.01
@@ -803,6 +825,8 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     angle_consistency_loss = dummy_loss.clone()
     uniformity_loss = dummy_loss.clone()
     capsize_loss = dummy_loss.clone()
+    capsize_safe_loss = dummy_loss.clone()
+    capsize_proxy_penalty = dummy_loss.clone()
     tangent_loss = dummy_loss.clone()
     consistency_loss = dummy_loss.clone()
     
@@ -947,15 +971,65 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         #     )
     
         from grad_optimizer import cost_on_dense_trajectory
-        capsize_loss = cost_on_dense_trajectory(
+        safe_loss = cost_on_dense_trajectory(
             reconstructed_traj, start_pose_expanded, goal_pose_expanded,
             stability_cost_map, map_info, device
         )
 
         # 数值稳定性保护：capsize_loss 出现 NaN/Inf 时回退为 0（跳过该分量）
-        if not torch.isfinite(capsize_loss):
+        if not torch.isfinite(safe_loss):
             print("⚠ Warning: capsize_loss is NaN/Inf, fallback to 0 for this batch")
-            capsize_loss = dummy_loss.clone()
+            safe_loss = dummy_loss.clone()
+
+        # =========================================================
+        # 第二阶段：MeanFlow 约束微调的 Fisher 近端代理
+        #   capsize_loss = safe_loss + 0.5 / eta * (theta - theta_ref)^T F_diag (theta - theta_ref)
+        # 其中 F_diag 用当前 batch 的梯度平方做 EMA 近似。
+        # =========================================================
+        capsize_safe_loss = safe_loss
+        capsize_loss = safe_loss
+        if is_training:
+            proxy_state = _get_stage2_fisher_proxy_state()
+            base_model = model.module if hasattr(model, 'module') else model
+            trainable_params = [p for p in base_model.parameters() if p.requires_grad]
+
+            # 首次进入第二阶段时，用当前参数初始化参考点与 Fisher 对角
+            if proxy_state['ref_params'] is None or len(proxy_state['ref_params']) != len(trainable_params):
+                proxy_state['ref_params'] = [p.detach().clone() for p in trainable_params]
+                proxy_state['fisher_diag'] = [torch.ones_like(p) for p in trainable_params]
+
+            # 用安全损失的参数梯度平方近似 Fisher 对角，并做 EMA 平滑
+            grads = torch.autograd.grad(
+                safe_loss,
+                trainable_params,
+                retain_graph=True,
+                allow_unused=True,
+                create_graph=False,
+            )
+
+            fisher_diag = []
+            with torch.no_grad():
+                for old_fisher, grad, param in zip(proxy_state['fisher_diag'], grads, trainable_params):
+                    if grad is None:
+                        new_fisher = torch.zeros_like(param)
+                    else:
+                        new_fisher = grad.detach().pow(2)
+                    fisher_diag.append(proxy_state['ema_beta'] * old_fisher + (1.0 - proxy_state['ema_beta']) * new_fisher)
+                proxy_state['fisher_diag'] = fisher_diag
+
+            # 参数偏移的 Fisher 加权平方范数
+            penalty_terms = []
+            for param, ref_param, fisher in zip(trainable_params, proxy_state['ref_params'], proxy_state['fisher_diag']):
+                delta = param - ref_param
+                penalty_terms.append((fisher * delta.pow(2)).mean())
+
+            if len(penalty_terms) > 0:
+                fisher_penalty = torch.stack(penalty_terms).mean()
+            else:
+                fisher_penalty = dummy_loss.clone()
+
+            capsize_proxy_penalty = fisher_penalty
+            capsize_loss = safe_loss + proxy_state['proxy_scale'] * fisher_penalty
 
     
     # 占位符监控指标
@@ -1000,6 +1074,8 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         'uniformity': uniformity_loss.item(),
         'tangent': tangent_loss.item(),
         'capsize': capsize_loss.item(),
+        'capsize_safe': capsize_safe_loss.item(),
+        'capsize_proxy_penalty': capsize_proxy_penalty.item(),
         'consistency': consistency_loss.item(),
         'angle_norm_mean': mean_norm_sq ** 0.5,
         'angle_norm_error': angle_norm_error.item() if isinstance(angle_norm_error, torch.Tensor) else 0.0,
@@ -1089,6 +1165,10 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
         if ema_models is not None:
             for ema_m in ema_models:
                 ema_m.update(model)
+
+        # 第二阶段：刷新 Fisher 近端参考参数，作为下一步更新的锚点
+        if current_stage == 2:
+            refresh_stage2_fisher_reference(model)
         
         # 更新进度条
         grad_info = f'{original_grad_norm:.2f}→{clip_value}' if was_clipped else f'{original_grad_norm:.2f}'
@@ -1381,7 +1461,7 @@ if __name__ == "__main__":
         'epochs': args.stage2_epochs,
         'lr_mul': 1e-3,  # 小学习率微调（不是从头训练！）
         'loss_weights': {
-            'main': 1e-2,        # 保留主损失作为正则化（不能为0！）
+            'main': 0e-2,        # 保留主损失作为正则化（不能为0！）
             'smoothness': 0e-5,   # 平滑性损失
             'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
             'angle_smoothness': 0e-2,  # 角度平滑性损失

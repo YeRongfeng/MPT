@@ -1,5 +1,5 @@
 """
-train_dit.py - 训练不平坦地面路径预测模型(基于扩散模型)
+train_grpo.py - 训练不平坦地面路径预测模型(基于扩散模型)
 """
 
 import numpy as np
@@ -432,106 +432,232 @@ def compute_curvature_constraint_loss(trajectory, max_curvature=2.0):
     return curvature_loss
 
 
-def stage2_optimize_control_points(
-    model, map_input, start_normalized, goal_normalized, start_pose, goal_pose,
-    stability_cost_map, map_info, device, prediction_type='epsilon', num_iterations=10, lr=0.01
+def _predict_x0_from_model_output(z_t, t, model_output, prediction_type='x0'):
+    """将模型输出统一转换为 x0 预测。"""
+    t_v = t.view(-1, 1, 1)
+    if prediction_type == 'epsilon':
+        return (z_t - t_v * model_output) / (1.0 - t_v + 1e-5)
+    if prediction_type == 'x0':
+        return model_output
+    if prediction_type == 'v':
+        return z_t - t_v * model_output
+    raise ValueError(f"Unsupported prediction_type: {prediction_type}")
+
+
+def generate_gr_awf_pseudo_targets(
+    model,
+    map_input,
+    start_normalized,
+    goal_normalized,
+    start_pose,
+    goal_pose,
+    middle_cp_normalized,
+    batch,
+    device,
+    prediction_type='x0',
+    num_path=4,
+    tau=1.0,
+    t_eval_min=0.5,
+    t_eval_max=1.0,
+    num_dense_points=100,
+    relabel_mode='topm_sample',
+    top_m=None,
+    weight_uniform_mix=0.2,
+    quality_guard=True,
+    max_cost_ratio=1.05,
+    min_span=0.05,
 ):
     """
-    【第二阶段优化】对每个batch样本进行采样和优化，返回1条优化的控制点
-    
-    关键：保证对每个样本返回形状(B, 24, 2)的优化中间控制点
-    
-    Args:
-        model: PathDiffusionTransformer 模型
-        map_input: (B, C, H, W) 输入地图
-        start_normalized: (B, 4) 起点（已归一化）
-        goal_normalized: (B, 4) 终点（已归一化）
-        start_pose: (B, 3) 起点原始坐标
-        goal_pose: (B, 3) 终点原始坐标
-        stability_cost_map: (D, H, W) 稳定性代价地图
-        map_info: dict 地图信息
-        device: 设备
-        prediction_type: 预测类型
-        num_iterations: 优化迭代次数
-        lr: 学习率
-    
+    GR-AWF 第二阶段伪标签生成：
+    1) 组并行探索（无梯度）
+    2) 组内相对优势 -> softmax 权重
+    3) 用组内重采样/选择，得到替换 batch GT 的 pseudo x0（避免均值塌缩）
+
     Returns:
-        optimized_middle_cp: (B, 24, 2) 优化后的中间控制点，每个样本一条
+        pseudo_middle_cp_normalized: (B, N, D)
+        stats: 监控信息
     """
     from grad_optimizer import cost_on_dense_trajectory
-    
-    # 从 start_pose 推导 batch size
-    B = start_pose.shape[0]
-    
-    # B样条层
+
+    B, N, D = middle_cp_normalized.shape
+    K = max(1, int(num_path))
+
+    # ===== Stage-1: 并行探索（no-grad） =====
+    map_stacked = map_input.repeat_interleave(K, dim=0)
+    start_norm_stacked = start_normalized.repeat_interleave(K, dim=0)
+    goal_norm_stacked = goal_normalized.repeat_interleave(K, dim=0)
+    start_pose_stacked = start_pose.repeat_interleave(K, dim=0)
+    goal_pose_stacked = goal_pose.repeat_interleave(K, dim=0)
+    x0_anchor = middle_cp_normalized.repeat_interleave(K, dim=0)
+
+    prev_training = model.training
+    model.eval()
+    with torch.no_grad():
+        t_eval = torch.rand(B * K, device=device) * (t_eval_max - t_eval_min) + t_eval_min
+        t_eval = torch.clamp(t_eval, min=1e-4, max=1.0 - 1e-4)
+        r_eval = torch.rand_like(t_eval) * t_eval
+
+        eps_explore = torch.randn_like(x0_anchor)
+        t_eval_v = t_eval.view(-1, 1, 1)
+        z_eval = (1.0 - t_eval_v) * x0_anchor + t_eval_v * eps_explore
+
+        model_out_eval = model(
+            map_stacked,
+            z_eval,
+            t_eval,
+            r_eval,
+            start_norm_stacked,
+            goal_norm_stacked,
+        )
+        x0_pseudo = _predict_x0_from_model_output(
+            z_eval, t_eval, model_out_eval, prediction_type=prediction_type
+        ).detach()
+        x0_pseudo = torch.clamp(x0_pseudo, -1.0, 1.0)
+
+    # 恢复原训练状态
+    model.train(prev_training)
+
+    # ===== Stage-2: 组内相对优势打分（黑盒 cost） =====
+    x0_pseudo_denorm = x0_pseudo * 20.0
+    start_cp = start_pose_stacked[:, :2].unsqueeze(1)
+    goal_cp = goal_pose_stacked[:, :2].unsqueeze(1)
+    full_control_points = torch.cat([start_cp, x0_pseudo_denorm, goal_cp], dim=1)  # (B*K, 26, 2)
+
     bspline_layer = DifferentiableBSpline(
         num_control_points=26,
-        num_output_points=100,
+        num_output_points=num_dense_points,
         degree=3
     ).to(device)
-    
-    with torch.enable_grad():
-        # 【优化】整个batch采样和优化
+    dense_traj = bspline_layer(full_control_points)  # (B*K, num_dense_points, 2)
+
+    stability_cost_map = batch['cost_map'].to(device)
+    if stability_cost_map.shape[0] == B:
+        stability_cost_map = stability_cost_map.repeat_interleave(K, dim=0)
+
+    map_info = {
+        'resolution': 0.4,
+        'origin': (-20.0, -20.0, -np.pi),
+        'size': (100, 100, 36)
+    }
+
+    with torch.no_grad():
+        costs_flat = cost_on_dense_trajectory(
+            dense_traj,
+            start_pose_stacked,
+            goal_pose_stacked,
+            stability_cost_map,
+            map_info,
+            device,
+            return_per_sample=True,
+        )  # (B*K,)
+
+        costs = costs_flat.view(B, K)
+        cost_mean = costs.mean(dim=1, keepdim=True)
+        cost_std = costs.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-6)
+        advantages = (cost_mean - costs) / cost_std
+        weights = F.softmax(advantages / max(float(tau), 1e-6), dim=1)  # (B, K), sum=1
+
+        # 与均匀分布做 convex mixing，避免过早塌缩到单一路径
+        uniform_mix = float(weight_uniform_mix)
+        uniform_mix = min(max(uniform_mix, 0.0), 1.0)
+        if uniform_mix > 0.0:
+            weights = (1.0 - uniform_mix) * weights + uniform_mix * (torch.ones_like(weights) / K)
+
+    # ===== Stage-3: 组内重采样/选择为新的 pseudo GT（detach） =====
+    x0_group = x0_pseudo.view(B, K, N, D)
+
+    # Top-M 截断（工程折中）：去掉明显劣质轨迹，再在幸存者内重采样
+    if top_m is None:
+        M = max(1, K // 2)
+    else:
+        M = max(1, min(int(top_m), K))
+
+    if relabel_mode == 'soft_all':
+        # 全量软加权（显存充裕时最稳），但可能有“均值化”风险
+        pseudo_middle_cp_normalized = (x0_group * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        selected_cost = (weights * costs).sum(dim=1)  # (B,)
+    elif relabel_mode == 'sample':
+        selected_idx = torch.multinomial(weights, num_samples=1).squeeze(1)  # (B,)
+        batch_idx = torch.arange(B, device=device)
+        pseudo_middle_cp_normalized = x0_group[batch_idx, selected_idx]
+        selected_cost = costs.gather(1, selected_idx.unsqueeze(1)).squeeze(1)
+    elif relabel_mode == 'top1':
+        # 不推荐：容易坍塌，仅保留兼容
+        selected_idx = torch.argmax(weights, dim=1)
+        batch_idx = torch.arange(B, device=device)
+        pseudo_middle_cp_normalized = x0_group[batch_idx, selected_idx]
+        selected_cost = costs.gather(1, selected_idx.unsqueeze(1)).squeeze(1)
+    else:
+        # 默认 topm_sample：Top-M + 重新加权 + multinomial
+        top_adv_vals, top_adv_idx = torch.topk(advantages, k=M, dim=1)  # (B, M)
+        top_weights = F.softmax(top_adv_vals / max(float(tau), 1e-6), dim=1)  # (B, M)
+
+        uniform_mix = float(weight_uniform_mix)
+        uniform_mix = min(max(uniform_mix, 0.0), 1.0)
+        if uniform_mix > 0.0:
+            top_weights = (1.0 - uniform_mix) * top_weights + uniform_mix * (torch.ones_like(top_weights) / M)
+
+        picked_local = torch.multinomial(top_weights, num_samples=1).squeeze(1)  # (B,)
+        selected_idx = top_adv_idx.gather(1, picked_local.unsqueeze(1)).squeeze(1)  # (B,)
+        batch_idx = torch.arange(B, device=device)
+        pseudo_middle_cp_normalized = x0_group[batch_idx, selected_idx]
+        selected_cost = costs.gather(1, selected_idx.unsqueeze(1)).squeeze(1)
+
+    # 质量门控：防止伪标签退化为“点”或明显劣化轨迹
+    keep_ratio = 1.0
+    if quality_guard:
         with torch.no_grad():
-            sampled_control_points = model.sample(
-                map_input,  # (B, C, H, W)
-                start_normalized,  # (B, 4)
-                goal_normalized,  # (B, 4)
-                num_samples=1,
-                num_steps=3,
-                solver='pmf_refined',
-                reconstruct_trajectory=False,
-                num_traj_points=100
-            )  # (B, 26, 2)
-        
-        # 提取中间控制点（去掉起终点）
-        x0_sample = sampled_control_points[:, 1:-1, :].clone().detach()  # (B, 24, 2)
-        x0_sample.requires_grad_(True)
-        
-        # 为整个batch创建优化器
-        optimizer = torch.optim.AdamW([x0_sample], lr=lr)
-        
-        # 起点和终点
-        start_cp = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
-        goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
-        
-        # batch级优化循环
-        for iter in range(num_iterations):
-            optimizer.zero_grad()
-            
-            # 拼接完整控制点（整个batch）
-            full_control_points = torch.cat([
-                start_cp,       # (B, 1, 2)
-                x0_sample,      # (B, 24, 2)
-                goal_cp         # (B, 1, 2)
+            # 基线：当前 batch 原 GT 控制点的 cost
+            anchor_full_cp = torch.cat([
+                start_pose[:, :2].unsqueeze(1),
+                middle_cp_normalized * 20.0,
+                goal_pose[:, :2].unsqueeze(1)
             ], dim=1)  # (B, 26, 2)
-            
-            # 使用B样条重建轨迹
-            reconstructed_traj = bspline_layer(full_control_points)  # (B, 100, 2)
-            
-            # 计算cost（会对整个batch求均值）
-            cost = cost_on_dense_trajectory(
-                reconstructed_traj, 
-                start_pose,  # (B, 3)
-                goal_pose,   # (B, 3)
-                stability_cost_map, 
-                map_info, 
-                device
-            )  # 标量
-            
-            # 反向传播
-            cost.backward()
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_([x0_sample], 1.0)
-            
-            # 优化步
-            optimizer.step()
-        
-        # 返回优化后的控制点
-        optimized_middle_cp = x0_sample.detach()  # (B, 24, 2)
-    
-    return optimized_middle_cp
+            anchor_dense = bspline_layer(anchor_full_cp)  # (B, num_dense_points, 2)
+            anchor_map = batch['cost_map'].to(device)
+            anchor_cost = cost_on_dense_trajectory(
+                anchor_dense,
+                start_pose,
+                goal_pose,
+                anchor_map,
+                map_info,
+                device,
+                return_per_sample=True,
+            )  # (B,)
+
+            # 空间展宽（归一化坐标）过小，视为坍塌到点
+            span = torch.norm(
+                pseudo_middle_cp_normalized.max(dim=1).values - pseudo_middle_cp_normalized.min(dim=1).values,
+                dim=1
+            )  # (B,)
+
+            keep_by_cost = selected_cost <= (anchor_cost * max(float(max_cost_ratio), 1e-3))
+            keep_by_span = span >= max(float(min_span), 1e-6)
+            keep_mask = keep_by_cost & keep_by_span
+
+            keep_ratio = keep_mask.float().mean().item()
+            keep_mask_exp = keep_mask.view(B, 1, 1)
+            pseudo_middle_cp_normalized = torch.where(
+                keep_mask_exp,
+                pseudo_middle_cp_normalized,
+                middle_cp_normalized
+            )
+
+    pseudo_middle_cp_normalized = pseudo_middle_cp_normalized.detach()
+
+    entropy = -(weights * torch.log(weights.clamp_min(1e-8))).sum(dim=1)  # (B,)
+
+    stats = {
+        'mean_cost': costs_flat.mean().item(),
+        'adv_mean': advantages.mean().item(),
+        'adv_std': advantages.std(unbiased=False).item(),
+        'w_max': weights.max().item(),
+        'w_min': weights.min().item(),
+        'w_entropy': entropy.mean().item(),
+        'top_m': float(M),
+        'keep_ratio': keep_ratio,
+    }
+    return pseudo_middle_cp_normalized, stats
 
 
 
@@ -551,7 +677,7 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         epoch: 当前epoch（用于动态权重）
         current_stage: 当前训练阶段（1或2），只在阶段2执行高级损失计算
         total_epochs: 总epoch数（用于动态权重）
-        is_training: bool - True时使用回归损失，False时返回实际cost值
+        is_training: bool - 训练模式下第二阶段会执行 GR-AWF 重标注；验证模式不重标注
         use_dense_trajectory: bool - True时使用密集轨迹计算主损失，False时使用原始控制点
         num_dense_points: int - 密集轨迹的点数（仅在use_dense_trajectory=True时使用）
         prediction_type: str - 预测类型 ('epsilon', 'x0', 'v')
@@ -664,6 +790,54 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     goal_normalized[:, 2] = torch.cos(goal_pose[:, 2])  # cos(θ)
     goal_normalized[:, 3] = torch.sin(goal_pose[:, 2])  # sin(θ)
     goal_normalized[:, :2] = torch.clamp(goal_normalized[:, :2], -1.0, 1.0)
+
+    # =================== Stage 2: GR-AWF 先替换 batch GT，再走与阶段1一致的损失流程 ===================
+    stage2_relabel_active = False
+    stage2_relabel_stats = None
+    if is_training and current_stage == 2 and ('cost_map' in batch):
+        num_path = int(loss_weights.get('num_path', 4))
+        tau = float(loss_weights.get('tau', 1.0))
+        t_eval_min = float(loss_weights.get('t_eval_min', 0.5))
+        t_eval_max = float(loss_weights.get('t_eval_max', 1.0))
+        relabel_mode = str(loss_weights.get('relabel_mode', 'topm_sample'))
+        top_m = int(loss_weights.get('top_m', max(1, num_path // 2)))
+        weight_uniform_mix = float(loss_weights.get('weight_uniform_mix', 0.2))
+        quality_guard = bool(loss_weights.get('quality_guard', True))
+        max_cost_ratio = float(loss_weights.get('max_cost_ratio', 1.05))
+        min_span = float(loss_weights.get('min_span', 0.05))
+        pseudo_replace_ratio = float(loss_weights.get('pseudo_replace_ratio', 0.7))
+        pseudo_replace_ratio = min(max(pseudo_replace_ratio, 0.0), 1.0)
+
+        pseudo_cp_normalized, stage2_relabel_stats = generate_gr_awf_pseudo_targets(
+            model=model,
+            map_input=map_input,
+            start_normalized=start_normalized,
+            goal_normalized=goal_normalized,
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            middle_cp_normalized=middle_cp_normalized,
+            batch=batch,
+            device=device,
+            prediction_type=prediction_type,
+            num_path=num_path,
+            tau=tau,
+            t_eval_min=t_eval_min,
+            t_eval_max=t_eval_max,
+            num_dense_points=num_dense_points,
+            relabel_mode=relabel_mode,
+            top_m=top_m,
+            weight_uniform_mix=weight_uniform_mix,
+            quality_guard=quality_guard,
+            max_cost_ratio=max_cost_ratio,
+            min_span=min_span,
+        )
+
+        # 软替换：保留一部分原始 GT 作为锚点，减少自举塌缩
+        middle_cp_normalized = (
+            (1.0 - pseudo_replace_ratio) * middle_cp_normalized
+            + pseudo_replace_ratio * pseudo_cp_normalized
+        )
+        stage2_relabel_active = True
     
     # ===== pixel Mean Flow: 连续时间采样 =====
     # 采样 t 和 r (0 <= r <= t <= 1)
@@ -809,153 +983,64 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     if loss_weights['tangent'] > 0.0:
         tangent_loss = compute_tangent_loss(middle_cp_normalized, start_normalized, goal_normalized)
     
-    if loss_weights['capsize'] > 0.0:
-        # =================== 第二阶段：物理约束 ===================
-        # 训练阶段使用“当前前向预测的 x0”重建轨迹，避免随机采样链的高方差导致
-        # 任一单项辅助损失都把分布推向单模态（与条件解绑）。
-        if is_training:
-            # 从当前训练图得到 x0 预测（归一化坐标），保持与当前条件和时间步一致
-            # x0_middle_pred = z_t - t.view(-1, 1, 1) * V_theta  # (B, 24, 2)
-            x0_middle_pred = z_t - t.view(-1, 1, 1) * u_out  # (B, 24, 2)
-            x0_middle_denorm = torch.clamp(x0_middle_pred, -1.0, 1.0) * 20.0
+    # 旧的第二阶段 capsize 反传分支已移除。
+    # 现在第二阶段仅通过 GR-AWF 重标注 pseudo GT，然后复用第一阶段主损失流程。
 
-            # 组合完整控制点并重建密集轨迹
-            start_cp = start_pose[:, :2].unsqueeze(1)  # (B,1,2)
-            goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B,1,2)
-            full_ctrl_points = torch.cat([start_cp, x0_middle_denorm, goal_cp], dim=1)  # (B,26,2)
-
-            bspline_layer = DifferentiableBSpline(
-                num_control_points=24 + 2,
-                num_output_points=100,
-                degree=3
-            ).to(device)
-            reconstructed_traj = bspline_layer(full_ctrl_points)  # (B,100,2)
-            
-            # reconstructed_traj = model.sample_differentiable(
-            #     map_input,
-            #     start_normalized,
-            #     goal_normalized,
-            #     num_steps=3,
-            #     solver='pmf_refined',
-            #     reconstruct_trajectory=True,
-            #     num_traj_points=100
-            # )  # (B, 100, 2) - 已经是真实坐标（非归一化）
-
-            start_pose_expanded = start_pose
-            goal_pose_expanded = goal_pose
-        else:
-            # 验证阶段保留采样链评估，更接近推理分布
-            reconstructed_traj = model.sample(
-                map_input,
-                start_normalized,
-                goal_normalized,
-                num_samples=10,
-                num_steps=3,
-                solver='pmf_refined',
-                reconstruct_trajectory=True,
-                num_traj_points=100
-            )
-            # model.sample 在 num_samples>1 时返回 (B*num_samples, N, 2)
-            start_pose_expanded = start_pose.repeat_interleave(10, dim=0)
-            goal_pose_expanded = goal_pose.repeat_interleave(10, dim=0)
-        
-        # # reconstructed_traj = model.sample_differentiable(
-        # #     map_input,
-        # #     start_normalized,
-        # #     goal_normalized,
-        # #     num_steps=3,
-        # #     solver='pmf_refined',
-        # #     reconstruct_trajectory=True,
-        # #     num_traj_points=100
-        # # )  # (B, N, 2) - 只有(x,y)，已经是真实坐标（非归一化）
-        
-        # 使用整批 cost_map，避免错误地只取 batch[0]
-        stability_cost_map = batch['cost_map'].to(device)
-        map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
-        resolution = 0.4
-        origin = (-20.0, -20.0, -np.pi) # x, y, yaw
-        map_info = {
-            'resolution': resolution,
-            'origin': origin,
-            'size': map_size
-        }
-        
-        # # # =================== 新方法：多步优化 + MSE损失 ===================
-        # # if is_training:
-        # #     # 训练模式：使用多步优化 + MSE损失
-        # #     from grad_optimizer import optimize_control_points_multistep
-            
-        # #     # 对网络预测的控制点进行多步优化
-        # #     optimized_middle_cp, _ = optimize_control_points_multistep(
-        # #         middle_control_points=x0_middle_denorm,  # (B, 24, 2)
-        # #         start_pose=start_pose,
-        # #         goal_pose=goal_pose,
-        # #         stability_cost_map=stability_cost_map,
-        # #         map_info=map_info,
-        # #         iterations=10,
-        # #         lr=0.1,
-        # #         grad_clip_norm=1.0,
-        # #         device=device,
-        # #         verbose=False
-        # #     )
-            
-        # #     # 计算MSE损失：网络预测的控制点 vs 优化后的控制点
-        # #     capsize_loss = F.mse_loss(x0_middle_denorm, optimized_middle_cp.detach())
-            
-        # # else:
-        # #     # 验证模式：使用原来的cost计算方式
-        # #     from grad_optimizer import cost_on_dense_trajectory
-        # #     capsize_loss = cost_on_dense_trajectory(
-        # #         reconstructed_traj, start_pose, goal_pose,
-        # #         stability_cost_map, map_info, device
-        # #     )
-        # if is_training:
-        #     from grad_optimizer import cost_on_dense_trajectory_phr_alm
-
-        #     # 持久化 PHR-ALM 对偶变量（跨 batch）
-        #     if not hasattr(diffusion_loss, '_phr_alm_state'):
-        #         diffusion_loss._phr_alm_state = {
-        #             'lambda_ineq': None,
-        #             'lambda_eq': None,
-        #             'mu': 1.0,
-        #         }
-
-        #     phr_state = diffusion_loss._phr_alm_state
-        #     capsize_loss, _, lambda_ineq_new, lambda_eq_new, mu_new = cost_on_dense_trajectory_phr_alm(
-        #         reconstructed_traj,
-        #         start_pose_expanded,
-        #         goal_pose_expanded,
-        #         stability_cost_map,
-        #         map_info,
-        #         lambda_ineq=phr_state['lambda_ineq'],
-        #         lambda_eq=phr_state['lambda_eq'],
-        #         mu=phr_state['mu'],
-        #         update_dual=True,
-        #         device=device
-        #     )
-
-        #     phr_state['lambda_ineq'] = lambda_ineq_new
-        #     phr_state['lambda_eq'] = lambda_eq_new
-        #     phr_state['mu'] = mu_new
-            
-        #     capsize_loss = capsize_loss * 1e-8
-        # else:
-        #     from grad_optimizer import cost_on_dense_trajectory
-        #     capsize_loss = cost_on_dense_trajectory(
-        #         reconstructed_traj, start_pose_expanded, goal_pose_expanded,
-        #         stability_cost_map, map_info, device
-        #     )
-    
+    # Stage 2 验证：使用 pred_x0 对应轨迹的 cost 作为 val_loss（不反传）
+    if (not is_training) and current_stage == 2 and ('cost_map' in batch):
         from grad_optimizer import cost_on_dense_trajectory
+
+        x0_middle_pred = z_t - t.view(-1, 1, 1) * u_out  # (B, 24, 2), normalized
+        x0_middle_denorm = torch.clamp(x0_middle_pred, -1.0, 1.0) * 20.0
+
+        start_cp = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
+        goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
+        full_ctrl_points = torch.cat([start_cp, x0_middle_denorm, goal_cp], dim=1)  # (B, 26, 2)
+
+        bspline_layer = DifferentiableBSpline(
+            num_control_points=26,
+            num_output_points=100,
+            degree=3
+        ).to(device)
+        reconstructed_traj = bspline_layer(full_ctrl_points)  # (B, 100, 2)
+
+        map_info = {
+            'resolution': 0.4,
+            'origin': (-20.0, -20.0, -np.pi),
+            'size': (100, 100, 36)
+        }
+        stability_cost_map = batch['cost_map'].to(device)
         capsize_loss = cost_on_dense_trajectory(
-            reconstructed_traj, start_pose_expanded, goal_pose_expanded,
-            stability_cost_map, map_info, device
+            reconstructed_traj,
+            start_pose,
+            goal_pose,
+            stability_cost_map,
+            map_info,
+            device
         )
 
-        # 数值稳定性保护：capsize_loss 出现 NaN/Inf 时回退为 0（跳过该分量）
         if not torch.isfinite(capsize_loss):
-            print("⚠ Warning: capsize_loss is NaN/Inf, fallback to 0 for this batch")
             capsize_loss = dummy_loss.clone()
+
+        # 验证阶段以 cost 作为主指标（用于 early stopping / best model）
+        total_loss = capsize_loss
+
+        loss_dict = {
+            'main': main_loss.item(),
+            'smoothness': smoothness_loss.item(),
+            'curvature': curvature_loss.item(),
+            'angle_smoothness': angle_smoothness_loss.item(),
+            'angle_consistency': angle_consistency_loss.item(),
+            'uniformity': uniformity_loss.item(),
+            'tangent': tangent_loss.item(),
+            'capsize': capsize_loss.item(),
+            'consistency': consistency_loss.item(),
+            'angle_norm_mean': 1.0,
+            'angle_norm_error': 0.0,
+            'main_loss_pos': main_loss.item(),
+            'main_loss_ang': 0.0,
+        }
+        return total_loss, 0, B, loss_dict
 
     
     # 占位符监控指标
@@ -974,14 +1059,12 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         print("⚠ Warning: main_loss is NaN/Inf, fallback to 0 for this batch")
         main_loss = dummy_loss.clone()
 
-    # 混合损失
+    # 混合损失（旧 stage2 capsize 反传项已移除）
     if loss_weights['main'] <= 0.0:
-        total_loss = loss_weights['tangent'] * tangent_loss \
-                    + loss_weights['capsize'] * capsize_loss
+        total_loss = loss_weights['tangent'] * tangent_loss
     else:
         total_loss = loss_weights['main'] * main_loss \
-                    + loss_weights['tangent'] * tangent_loss \
-                    + loss_weights['capsize'] * capsize_loss
+                    + loss_weights['tangent'] * tangent_loss
     
     # 检查损失异常：不中断训练，回退为零损失并跳过本 batch 更新
     if not torch.isfinite(total_loss):
@@ -990,6 +1073,15 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         print(f"⚠ Warning: total_loss is NaN/Inf ({total_loss_val}), main_loss={main_loss_val}. Skip this batch.")
         total_loss = dummy_loss.clone()
     
+    # stage2 relabel 模式下，用重标注阶段的平均 cost 作为监控项（不参与反传）
+    capsize_log_value = capsize_loss.item()
+    if stage2_relabel_stats is not None:
+        capsize_log_value = float(stage2_relabel_stats.get('mean_cost', capsize_log_value))
+    w_max_log = float(stage2_relabel_stats.get('w_max', 0.0)) if stage2_relabel_stats is not None else 0.0
+    w_min_log = float(stage2_relabel_stats.get('w_min', 0.0)) if stage2_relabel_stats is not None else 0.0
+    w_entropy_log = float(stage2_relabel_stats.get('w_entropy', 0.0)) if stage2_relabel_stats is not None else 0.0
+    keep_ratio_log = float(stage2_relabel_stats.get('keep_ratio', 0.0)) if stage2_relabel_stats is not None else 0.0
+
     # 返回各项损失用于记录
     loss_dict = {
         'main': main_loss.item(),
@@ -999,12 +1091,16 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         'angle_consistency': angle_consistency_loss.item(),
         'uniformity': uniformity_loss.item(),
         'tangent': tangent_loss.item(),
-        'capsize': capsize_loss.item(),
+        'capsize': capsize_log_value,
         'consistency': consistency_loss.item(),
         'angle_norm_mean': mean_norm_sq ** 0.5,
         'angle_norm_error': angle_norm_error.item() if isinstance(angle_norm_error, torch.Tensor) else 0.0,
         'main_loss_pos': main_loss_pos.item() if isinstance(main_loss_pos, torch.Tensor) else 0.0,
         'main_loss_ang': main_loss_ang.item() if isinstance(main_loss_ang, torch.Tensor) else 0.0,
+        'w_max': w_max_log,
+        'w_min': w_min_log,
+        'w_entropy': w_entropy_log,
+        'keep_ratio': keep_ratio_log,
     }
     
     # 调整返回的样本数：如果在第二阶段进行了混合，返回原始batch size
@@ -1045,7 +1141,7 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
         loss, _, n_samples, loss_dict = diffusion_loss(
             model, batch, device, loss_weights, 
             epoch=stage_epoch, total_epochs=total_stage_epochs,
-            is_training=True,  # 训练模式：capsize loss使用回归损失
+            is_training=True,  # 训练模式：第二阶段启用 GR-AWF 重标注
             current_stage=current_stage,  # 传递当前阶段
             use_dense_trajectory=use_dense_trajectory,
             num_dense_points=num_dense_points,
@@ -1109,6 +1205,10 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
                 'Total': f'{loss.item():.5f}',
                 'Main': f'{loss_dict["main"]:.5f}',
                 'Capsize': f'{loss_dict["capsize"]:.4f}',
+                'Wmax': f'{loss_dict.get("w_max", 0.0):.2f}',
+                'Wmin': f'{loss_dict.get("w_min", 0.0):.2f}',
+                'WEnt': f'{loss_dict.get("w_entropy", 0.0):.2f}',
+                'Keep': f'{loss_dict.get("keep_ratio", 0.0):.2f}',
                 'GradNorm': grad_info
             })
     
@@ -1150,7 +1250,7 @@ def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_
             loss, _, n_samples, loss_dict = diffusion_loss(
                 model, batch, device, loss_weights,
                 epoch=epoch, total_epochs=total_epochs,
-                is_training=False,  # 验证模式：capsize loss返回实际cost值
+                is_training=False,  # 验证模式：不做 GR-AWF 重标注
                 current_stage=current_stage,  # 传递当前阶段
                 use_dense_trajectory=use_dense_trajectory,
                 num_dense_points=num_dense_points,
@@ -1381,15 +1481,27 @@ if __name__ == "__main__":
         'epochs': args.stage2_epochs,
         'lr_mul': 1e-3,  # 小学习率微调（不是从头训练！）
         'loss_weights': {
-            'main': 1e-2,        # 保留主损失作为正则化（不能为0！）
+            'main': 1.0,         # GR-AWF 主损失（加权流匹配）
             'smoothness': 0e-5,   # 平滑性损失
             'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
             'angle_smoothness': 0e-2,  # 角度平滑性损失
             'angle_consistency': 0e-6,  # 角度一致性损失
             'uniformity': 0e-4,   # 均匀性损失
             'tangent': 0e-2,   # 切线约束损失（确保起点和终点方向一致）
-            'capsize': 1e-2,
+            'capsize': 0.0,    # 旧第二阶段损失已弃用，仅保留日志字段
             'consistency': 0.0,   # 时间一致性损失（当前不启用）
+            # ===== GR-AWF 超参数 =====
+            'num_path': 8,      # 组大小 K（Baseline 推荐）
+            'tau': 1.0,         # softmax 温度（Baseline 推荐）
+            't_eval_min': 0.8,  # 探索时间步（固定 0.8）
+            't_eval_max': 0.8,  # 探索时间步（固定 0.8）
+            'relabel_mode': 'topm_sample',  # topm_sample/sample/soft_all/top1
+            'top_m': 2,                     # Top-M 截断数量（K=8 时建议先用 2）
+            'weight_uniform_mix': 0.1,      # 与均匀分布混合，抗塌缩
+            'pseudo_replace_ratio': 0.5,    # 伪标签替换比例（软替换，防止自举坍塌）
+            'quality_guard': True,          # 启用伪标签质量门控
+            'max_cost_ratio': 1.05,         # 仅接受不劣于基线太多的伪标签
+            'min_span': 0.05,               # 轨迹展宽下限（归一化坐标）
         }
     }
     
@@ -1403,13 +1515,10 @@ if __name__ == "__main__":
         loss_weights = stage2_config['loss_weights']
 
     if current_stage == 2 and loss_weights.get('main', 0.0) <= 0.0:
-        print("⚠ Warning: Stage 2 main loss weight <= 0, training is capsize-only and may collapse.")
+        print("⚠ Warning: Stage 2 main loss weight <= 0.")
     
-    compute_stability = (
-        current_stage == 2 and (
-            loss_weights.get('capsize', 0.0) > 0
-        )
-    )
+    # GR-AWF 重标注在第二阶段需要 cost_map
+    compute_stability = (current_stage == 2)
     
     trainDataset = UnevenPathDataLoader(
         env_list=env_list,
@@ -1694,7 +1803,7 @@ if __name__ == "__main__":
                 n_warmup_steps=50
             )
             print(f"✓ Reset optimizer with new learning rate: {old_lr_mul} → {stage2_config['lr_mul']}")
-            print(f"✓ Enabled capsize loss: {stage2_config['loss_weights']['capsize']}")
+            print(f"✓ Enabled GR-AWF relabeling for Stage 2")
             print()
 
             

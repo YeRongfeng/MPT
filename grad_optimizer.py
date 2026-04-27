@@ -55,7 +55,7 @@ def compute_theta_from_xy(traj_xy):
     theta = torch.atan2(dxy[:, :, 1], dxy[:, :, 0])       # (B, N)
     return theta.squeeze(0) if squeeze_back else theta
 
-def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, map_info, device='cpu'):
+def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, map_info, device='cpu', return_per_sample=False):
         """
         对已生成的密集轨迹直接计算 Cost（支持批量处理）。
         trajectory: (B, N, 2) 或 (B, N, 3)
@@ -281,6 +281,10 @@ def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, m
             weights['endpoints'] * yaw_endpoint_cost +
             weights['jerk'] * jerk_cost
         )
+
+        # 支持返回逐样本代价（GR-AWF 组内相对优势）或 batch 均值（兼容原逻辑）
+        if return_per_sample:
+            return total_cost
 
         # 返回标量：对 batch 上的 total_cost 求均值
         # 注意：外部训练还会乘以 loss_weights['capsize']，这里不再额外缩小
