@@ -421,7 +421,7 @@ def plot_trajectory_heatmap(envType, save_path='predictions', grid_size=100):
     print(f"Saved: {save_file}")
 
 if __name__ == "__main__":
-    envType = 'env000012'  # 指定环境
+    envType = 'env000014'  # 指定环境
     save_path = 'predictions'
     
     print(f"Visualizing dataset for environment: {envType}")

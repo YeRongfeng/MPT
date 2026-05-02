@@ -140,8 +140,9 @@ def plot_terrain(elevation, nx, ny, nz):
         ax.add_collection3d(coll)
         
     # 设置连接线颜色为黑色
-    coll.set_edgecolor((0.0, 0.0, 0.0, 1.0))
-    coll.set_linewidth(0.1)
+    if len(polys) > 0:
+        coll.set_edgecolor((0.0, 0.0, 0.0, 1.0))
+        coll.set_linewidth(0.1)
 
     # 设置范围并彻底隐藏坐标系
     ax.set_xlim(0, w - 1)
@@ -181,7 +182,7 @@ def plot_terrain(elevation, nx, ny, nz):
         # 旧版本 matplotlib 没有该接口，保持原样（可考虑升级 matplotlib）
         pass
 
-    for waxis in (ax.w_xaxis, ax.w_yaxis, ax.w_zaxis):
+    for waxis in (ax.xaxis, ax.yaxis, ax.zaxis):
         try:
             waxis.line.set_color((1.0, 1.0, 1.0, 0.0))
             waxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
@@ -219,8 +220,10 @@ def plot_terrain(elevation, nx, ny, nz):
     
 if __name__ == "__main__":
     envNum = np.random.randint(0, 99)  # 随机选择环境id
-    envList = ['env000009']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    dataset_path = 'data/terrain/train'
+    # envList = ['env000009']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    # dataset_path = 'data/terrain/train'
+    envList = ['env000015']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    dataset_path = 'data/sim_dataset/train'
     
     env_path = osp.join(dataset_path, envList[0])
     

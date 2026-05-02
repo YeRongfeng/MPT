@@ -1,6 +1,4 @@
-"""
-train_dit.py - 训练不平坦地面路径预测模型(基于扩散模型)
-"""
+"""train_langevin.py - 两阶段训练不平坦地面路径预测模型。"""
 
 import numpy as np
 import pickle
@@ -18,21 +16,17 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from os import path as osp
 
-from transformer import Models, Optim
+from transformer import Optim
 from dataLoader_dit import UnevenPathDataLoader, PaddedSequence
-from dataLoader_dit import hashTable, receptive_field
 
 from torch.utils.tensorboard import SummaryWriter
 from timm.utils import ModelEmaV2
 
-from ESDF3d_atpoint import compute_esdf_batch
-# from grad_optimizer import TrajectoryOptimizerSE2
 from dit.Models import PathDiffusionTransformer
 
 # B样条工具
 from bspline_utils import (
     fit_bspline_least_squares,
-    reconstruct_from_control_points,
     DifferentiableBSpline
 )
 from torch.func import functional_call, jvp
@@ -79,41 +73,6 @@ def trajectory_to_control_points(trajectory, num_middle_points=24):
     middle_control_points = torch.tensor(np.stack(middle_control_points_list, axis=0), dtype=torch.float32, device=device)
     
     return middle_control_points  # (B, num_middle_points, 2)
-
-
-def control_points_to_trajectory(control_points, num_output_points=100):
-    """
-    从控制点重建密集轨迹
-    
-    Args:
-        control_points: (B, num_control_points, 2) 控制点张量（只包含x,y）
-        num_output_points: 重建后的轨迹点数量
-    
-    Returns:
-        trajectory: (B, num_output_points, 2) 重建的轨迹（只包含x,y）
-    """
-    B, num_cp, _ = control_points.shape
-    device = control_points.device
-    
-    # 将张量转换为numpy
-    control_points_np = control_points.cpu().numpy()
-    
-    trajectory_list = []
-    for i in range(B):
-        cp = control_points_np[i]  # (num_cp, 2)
-        
-        # 重建轨迹
-        traj = reconstruct_from_control_points(
-            cp,
-            num_output_points=num_output_points,
-            degree=3
-        )
-        trajectory_list.append(traj)
-    
-    # 转换回张量
-    trajectory = torch.tensor(np.stack(trajectory_list, axis=0), dtype=torch.float32, device=device)
-    
-    return trajectory  # (B, num_output_points, 2)
 
 
 def compute_tangent_loss(pred_middle_cps, start_pose, goal_pose):
@@ -181,287 +140,68 @@ def compute_tangent_loss(pred_middle_cps, start_pose, goal_pose):
     # 总 Loss
     return dist_loss + dir_loss
 
-def compute_smoothness_loss(trajectory, include_angle=False, threshold=None):
-    """
-    改进的平滑性损失 - 只惩罚超过阈值的急转弯
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-        include_angle: bool - 是否在平滑性计算中包含角度维度
-        threshold: float - 加速度阈值，只惩罚超过此值的加速度（None则惩罚所有）
-    Returns:
-        smoothness_loss: 标量
-    """
-    # 位置部分 (x, y) 的一阶和二阶差分
-    pos_first_diff = trajectory[:, 1:, :2] - trajectory[:, :-1, :2]  # (B, N-1, 2)
-    pos_second_diff = pos_first_diff[:, 1:, :] - pos_first_diff[:, :-1, :]  # (B, N-2, 2)
-    
-    # 计算加速度的L2范数
-    acceleration_norm = torch.norm(pos_second_diff, dim=2)  # (B, N-2)
-    
-    if threshold is not None:
-        # 只惩罚超过阈值的加速度（软阈值）
-        # 使用ReLU：max(0, |a| - threshold)^2
-        excess_acceleration = torch.relu(acceleration_norm - threshold)
-        pos_smoothness = torch.mean(excess_acceleration ** 2)
-    else:
-        # 原始版本：惩罚所有加速度
-        pos_smoothness = torch.mean(acceleration_norm ** 2)
-    
-    if include_angle:
-        # 角度部分：对theta做周期性感知的差分
-        theta = trajectory[:, :, 2]  # (B, N)
-        angle_first_diff = torch.atan2(torch.sin(theta[:, 1:] - theta[:, :-1]),
-                                       torch.cos(theta[:, 1:] - theta[:, :-1]))  # (B, N-1)
-        angle_second_diff = torch.atan2(torch.sin(angle_first_diff[:, 1:] - angle_first_diff[:, :-1]),
-                                        torch.cos(angle_first_diff[:, 1:] - angle_first_diff[:, :-1]))  # (B, N-2)
-        angle_acc_norm = torch.abs(angle_second_diff)  # (B, N-2)
-        
-        if threshold is not None:
-            angle_threshold = threshold * 0.1
-            excess_angle_acc = torch.relu(angle_acc_norm - angle_threshold)
-            angle_smoothness = torch.mean(excess_angle_acc ** 2)
-        else:
-            angle_smoothness = torch.mean(angle_acc_norm ** 2)
-        
-        smoothness_loss = pos_smoothness + angle_smoothness
-    else:
-        smoothness_loss = pos_smoothness
-    
-    return smoothness_loss
 
-def compute_angle_smoothness_loss(trajectory):
-    """
-    计算角度平滑性损失 - 惩罚角速度本身和角加速度
-    使用theta的周期性感知差分计算角速度/角加速度
-    
-    **重要**：当trajectory包含固定的起点和终点时（22个点），
-    排除边界段的角速度约束（索引0和20），避免强制预测点角度向固定的起终点角度靠拢。
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        angle_loss: 标量
-    """
-    theta = trajectory[:, :, 2]  # (B, N)
-    
-    # 相邻点角度差（周期性感知）
-    delta = torch.atan2(torch.sin(theta[:, 1:] - theta[:, :-1]),
-                        torch.cos(theta[:, 1:] - theta[:, :-1]))  # (B, N-1)
-    angular_velocity = torch.abs(delta)  # (B, N-1)
-    
-    # **关键修改**：如果轨迹是22个点（包含起终点），排除边界段的角速度约束
-    N = trajectory.shape[1]
-    velocity_weights = torch.ones_like(angular_velocity)
-    
-    if N == 22:  # 完整轨迹（起点+20预测点+终点）
-        # 完全排除边界段：不约束"起点→第一个预测点"和"最后预测点→终点"的角度变化
-        # 让第一个和最后一个预测点的角度可以自由适应实际运动方向
-        velocity_weights[:, 0] = 0.0   # 排除起点到第一个预测点
-        velocity_weights[:, -1] = 0.0  # 排除最后一个预测点到终点
-    
-    velocity_loss = torch.mean((angular_velocity ** 2) * velocity_weights)
-    
-    # 计算角速度的变化（角加速度）
-    delta_diff = torch.atan2(torch.sin(delta[:, 1:] - delta[:, :-1]),
-                             torch.cos(delta[:, 1:] - delta[:, :-1]))  # (B, N-2)
-    angle_acc = torch.abs(delta_diff)  # (B, N-2)
-    
-    # **角加速度也需要排除边界相关的项**
-    # 对于22个点的轨迹，angle_acc有20个值（索引0-19）
-    # 索引0对应的是"起点→第一预测点→第二预测点"的角加速度
-    # 索引19对应的是"倒数第三预测点→倒数第二预测点→终点"的角加速度
-    if N == 22:
-        acc_weights = torch.ones_like(angle_acc)
-        acc_weights[:, 0] = 0.0   # 排除涉及起点的角加速度
-        acc_weights[:, -1] = 0.0  # 排除涉及终点的角加速度
-        acceleration_loss = torch.mean((angle_acc ** 2) * acc_weights)
-    else:
-        acceleration_loss = torch.mean(angle_acc ** 2)
-    
-    # 混合损失：角速度 + 角加速度
-    # 只约束预测点内部的角度平滑性，不约束与固定起终点的衔接
-    angle_loss = velocity_loss + 0.5 * acceleration_loss
-    
-    return angle_loss
+class LangevinReplayBuffer:
+    """CPU replay buffer for detached stage-2 Langevin targets."""
 
-def compute_angle_consistency_loss(trajectory):
-    """
-    计算角度一致性损失 - 防止倒车（使用heading向量与运动方向的点积）
-    该损失确保运动方向与车辆朝向一致（防止倒车）
-    
-    **重要**：当trajectory包含固定的起点和终点时（22个点），
-    只计算预测点内部的角度一致性（索引1到20），排除边界段（0→1和20→21）
-    以避免与固定的起终点角度产生冲突。
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        angle_loss: 标量
-    """
-    # 提取位置和朝向向量
-    positions = trajectory[:, :, :2]  # (B, N, 2)
-    theta = trajectory[:, :, 2]  # (B, N)
-    
-    # 车辆朝向向量：(cos(θ), sin(θ))
-    heading_vectors = torch.stack([torch.cos(theta), torch.sin(theta)], dim=2)  # (B, N, 2)
-    
-    # 归一化朝向向量
-    eps = 1e-6
-    heading_norms = torch.norm(heading_vectors, dim=2, keepdim=True)  # (B, N, 1)
-    heading_vectors_norm = heading_vectors / (heading_norms + eps)  # (B, N, 2)
-    
-    # 计算运动方向向量（从当前点指向下一个点）
-    motion_vectors = positions[:, 1:, :] - positions[:, :-1, :]  # (B, N-1, 2)
-    
-    # 计算运动向量的长度，用于归一化和过滤静止点
-    motion_lengths = torch.norm(motion_vectors, dim=2, keepdim=True)  # (B, N-1, 1)
-    
-    # 只对运动距离足够大的点计算损失
-    valid_mask = (motion_lengths.squeeze(2) > eps)  # (B, N-1)
-    
-    # **关键修改**：如果轨迹是22个点（包含起终点），排除边界段
-    # 只计算索引1到20之间的角度一致性（预测点内部）
-    N = trajectory.shape[1]
-    if N == 22:  # 完整轨迹（起点+20预测点+终点）
-        # 排除第一段（起点→第一个预测点，索引0）和最后一段（最后一个预测点→终点，索引20）
-        boundary_mask = torch.ones_like(valid_mask, dtype=torch.bool)
-        boundary_mask[:, 0] = False   # 排除起点→第一个预测点
-        boundary_mask[:, -1] = False  # 排除最后一个预测点→终点
-        valid_mask = valid_mask & boundary_mask
-    
-    # 如果没有有效的运动点，返回0损失
-    if not valid_mask.any():
-        return torch.tensor(0.0, device=trajectory.device)
-    
-    # 归一化运动向量
-    motion_vectors_norm = motion_vectors / (motion_lengths + eps)  # (B, N-1, 2)
-    
-    # 使用当前点的归一化朝向向量
-    current_headings = heading_vectors_norm[:, :-1, :]  # (B, N-1, 2)
-    
-    # 计算朝向向量与运动向量的点积（余弦相似度）
-    # dot = cos(θ)，当θ=0时（前进）dot=1，当θ=π时（倒车）dot=-1
-    cos_similarity = (current_headings * motion_vectors_norm).sum(dim=2)  # (B, N-1)
-    
-    # 只计算有效点的损失
-    # 使用 (1 - cos_similarity) 作为损失：
-    # - 前进时 cos ≈ 1，损失 ≈ 0
-    # - 倒车时 cos ≈ -1，损失 ≈ 2
-    masked_loss = (1 - cos_similarity) * valid_mask.float()  # (B, N-1)
-    angle_loss = masked_loss.sum() / (valid_mask.sum() + eps)
-    
-    # 最终检查NaN
-    if torch.isnan(angle_loss) or torch.isinf(angle_loss):
-        return torch.tensor(0.0, device=trajectory.device)
-    
-    return angle_loss
+    def __init__(self, max_size=4096):
+        self.max_size = int(max_size)
+        self.storage = []
+        self.next_idx = 0
 
-def compute_uniformity_loss(trajectory):
-    """
-    计算均匀性损失 - 相邻点之间距离的方差
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        uniformity_loss: 标量
-    """
-    # 计算相邻点的欧几里得距离
-    pos_diff = trajectory[:, 1:, :2] - trajectory[:, :-1, :2]  # (B, N-1, 2)
-    distances = torch.norm(pos_diff, dim=2)  # (B, N-1)
-    # 距离的方差（希望距离均匀）
-    mean_dist = torch.mean(distances, dim=1, keepdim=True)  # (B, 1)
-    uniformity_loss = torch.mean((distances - mean_dist) ** 2)
-    return uniformity_loss
+    def __len__(self):
+        return len(self.storage)
 
-def compute_sincos_normalization_loss(trajectory):
-    """
-    兼容保留：theta范围正则（替代sin/cos归一化损失）
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        norm_loss: 标量
-    """
-    theta = trajectory[:, :, 2]  # (B, N)
-    angle_overflow = torch.abs(theta) - torch.pi
-    angle_overflow = torch.clamp(angle_overflow, min=0.0)
-    norm_loss = torch.mean(angle_overflow ** 2)
-    return norm_loss
+    def add_batch(self, map_input, start_pose, goal_pose, target_middle_cp):
+        map_cpu = map_input.detach().to('cpu', dtype=torch.float16)
+        start_cpu = start_pose.detach().to('cpu', dtype=torch.float32)
+        goal_cpu = goal_pose.detach().to('cpu', dtype=torch.float32)
+        target_cpu = target_middle_cp.detach().to('cpu', dtype=torch.float32)
 
-def compute_curvature_constraint_loss(trajectory, max_curvature=2.0):
-    """
-    曲率约束损失 - 只惩罚超过最大曲率的点
-    使用三点法计算曲率：κ = 2*sin(θ) / d
-    其中θ是转角，d是弦长
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-        max_curvature: float - 最大允许曲率（单位：1/米）
-    Returns:
-        curvature_loss: 标量
-    """
-    positions = trajectory[:, :, :2]  # (B, N, 2)
-    
-    # 计算三个连续点形成的向量
-    vec1 = positions[:, 1:-1, :] - positions[:, :-2, :]  # (B, N-2, 2) P1->P2
-    vec2 = positions[:, 2:, :] - positions[:, 1:-1, :]    # (B, N-2, 2) P2->P3
-    
-    # 计算转角（使用向量夹角）
-    # cos(θ) = (v1·v2) / (|v1||v2|)
-    dot_product = (vec1 * vec2).sum(dim=2)  # (B, N-2)
-    norm1 = torch.norm(vec1, dim=2)  # (B, N-2)
-    norm2 = torch.norm(vec2, dim=2)  # (B, N-2)
-    
-    eps = 1e-6
-    cos_angle = dot_product / (norm1 * norm2 + eps)
-    # 数值稳定性：不仅clamp到[-1,1]，还要避免正好在边界（acos梯度无穷大）
-    cos_angle = torch.clamp(cos_angle, -0.9999, 0.9999)
-    angle = torch.acos(cos_angle)  # (B, N-2) 转角 [0, π]
-    
-    # 计算弦长（P1到P3的距离）
-    chord_length = torch.norm(positions[:, 2:, :] - positions[:, :-2, :], dim=2) + eps  # (B, N-2)
-    
-    # 近似曲率：κ ≈ 2*sin(θ/2) / chord_length
-    # 简化：κ ≈ θ / chord_length (小角度近似)
-    curvature = angle / chord_length  # (B, N-2)
-    
-    # 只惩罚超过最大曲率的点
-    excess_curvature = curvature - max_curvature  # (B, N-2)
-    # curvature_loss = torch.mean(torch.relu(excess_curvature) ** 2)
-    curvature_loss = torch.mean(F.softplus(excess_curvature, beta=2.0))
-    
-    return curvature_loss
+        n = target_cpu.shape[0]
+        for i in range(n):
+            item = {
+                'map': map_cpu[i],
+                'start_pose': start_cpu[i],
+                'goal_pose': goal_cpu[i],
+                'target_middle_cp': target_cpu[i],
+            }
+            if len(self.storage) < self.max_size:
+                self.storage.append(item)
+            else:
+                self.storage[self.next_idx] = item
+                self.next_idx = (self.next_idx + 1) % self.max_size
 
+    def sample(self, batch_size, device):
+        if len(self.storage) == 0:
+            raise RuntimeError("Cannot sample from an empty Langevin replay buffer.")
 
-def _get_stage2_fisher_proxy_state():
-    """获取/初始化第二阶段的 Fisher 近端状态。"""
-    if not hasattr(diffusion_loss, '_stage2_fisher_proxy_state'):
-        diffusion_loss._stage2_fisher_proxy_state = {
-            'ref_params': None,
-            'fisher_diag': None,
-            'ema_beta': 0.95,
-            'proxy_scale': 0.01,
-            'fisher_eps': 1e-8,
+        indices = torch.randint(0, len(self.storage), (int(batch_size),)).tolist()
+        items = [self.storage[i] for i in indices]
+        return {
+            'map': torch.stack([item['map'] for item in items], dim=0).to(device=device, dtype=torch.float32),
+            'start_pose': torch.stack([item['start_pose'] for item in items], dim=0).to(device=device),
+            'goal_pose': torch.stack([item['goal_pose'] for item in items], dim=0).to(device=device),
+            'target_middle_cp': torch.stack([item['target_middle_cp'] for item in items], dim=0).to(device=device),
         }
-    return diffusion_loss._stage2_fisher_proxy_state
-
-
-def refresh_stage2_fisher_reference(model):
-    """在一次优化步之后，刷新第二阶段 Fisher 近端参考参数。"""
-    state = _get_stage2_fisher_proxy_state()
-    base_model = model.module if hasattr(model, 'module') else model
-    trainable_params = [p for p in base_model.parameters() if p.requires_grad]
-    state['ref_params'] = [p.detach().clone() for p in trainable_params]
-
 
 
 def stage2_optimize_control_points(
     model, map_input, start_normalized, goal_normalized, start_pose, goal_pose,
-    stability_cost_map, map_info, device, prediction_type='epsilon', num_iterations=10, lr=0.01
+    stability_cost_map, map_info, device,
+    num_iterations=10, num_particles=32, temperature_kappa=1.0,
+    rho_grad=0.05, rho_noise=0.02, rho_max=0.1,
+    temperature_min=1e-6, eta_min=1e-5, eta_max=10.0,
+    noise_scale=0.3, clamp_abs=20.0, stats_ema_alpha=0.05,
+    diagnostics=True
 ):
     """
-    【第二阶段优化】对每个batch样本进行采样和优化，返回1条优化的控制点
+    【第二阶段 Langevin 分布迁移】从当前模型采样出控制点，并用
+    q_T(x|c) ∝ exp[-C(x,c) / T] 对样本做 Langevin 更新。
     
-    关键：保证对每个样本返回形状(B, 24, 2)的优化中间控制点
+    与直接最小化 cost 不同，Langevin 更新保留噪声项：
+        x <- x - eta * grad_x C(x,c) + sqrt(2*T*eta) * noise
+    这样第二阶段目标是一个有温度的低 cost 分布，而不是单点最优轨迹。
     
     Args:
         model: PathDiffusionTransformer 模型
@@ -473,17 +213,24 @@ def stage2_optimize_control_points(
         stability_cost_map: (D, H, W) 稳定性代价地图
         map_info: dict 地图信息
         device: 设备
-        prediction_type: 预测类型
-        num_iterations: 优化迭代次数
-        lr: 学习率
+        num_iterations: Langevin 内循环步数
+        num_particles: 每个条件本次刷新的小粒子数 k_small
+        temperature_kappa: T = (P90(C)-P10(C)) / kappa
+        rho_grad: 梯度步长占粒子典型距离 D 的比例
+        rho_noise: 噪声步长占粒子典型距离 D 的比例
+        rho_max: 单步最大梯度位移占 D 的比例，用于 g_max = rho_max * D / eta
+        noise_scale: Langevin 噪声倍率；设为0会退化为确定性梯度下降
+        clamp_abs: 控制点绝对坐标裁剪范围
     
     Returns:
-        optimized_middle_cp: (B, 24, 2) 优化后的中间控制点，每个样本一条
+        optimized_middle_cp: (B*k_small, 24, 2) 优化后的中间控制点
+        metrics: Langevin 参数与迁移质量监控指标
     """
     from grad_optimizer import cost_on_dense_trajectory
     
     # 从 start_pose 推导 batch size
     B = start_pose.shape[0]
+    K = max(1, int(num_particles))
     
     # B样条层
     bspline_layer = DifferentiableBSpline(
@@ -493,71 +240,206 @@ def stage2_optimize_control_points(
     ).to(device)
     
     with torch.enable_grad():
-        # 【优化】整个batch采样和优化
+        # 从当前模型分布初始化，而不是从专家轨迹初始化。
         with torch.no_grad():
-            sampled_control_points = model.sample(
-                map_input,  # (B, C, H, W)
-                start_normalized,  # (B, 4)
-                goal_normalized,  # (B, 4)
-                num_samples=1,
-                num_steps=3,
-                solver='pmf_refined',
-                reconstruct_trajectory=False,
-                num_traj_points=100
-            )  # (B, 26, 2)
+            sample_model = model.module if hasattr(model, 'module') else model
+            prev_training = sample_model.training
+            sample_model.eval()
+            try:
+                sampled_control_points = sample_model.sample(
+                    map_input,  # (B, C, H, W)
+                    start_normalized,  # (B, 4)
+                    goal_normalized,  # (B, 4)
+                    num_samples=K,
+                    num_steps=3,
+                    solver='pmf_refined',
+                    reconstruct_trajectory=False,
+                    num_traj_points=100
+            )  # (B*k_small, 26, 2)
+            finally:
+                sample_model.train(prev_training)
         
         # 提取中间控制点（去掉起终点）
-        x0_sample = sampled_control_points[:, 1:-1, :].clone().detach()  # (B, 24, 2)
-        x0_sample.requires_grad_(True)
+        x_langevin = sampled_control_points[:, 1:-1, :].clone().detach()  # (B*k_small, 24, 2)
         
-        # 为整个batch创建优化器
-        optimizer = torch.optim.AdamW([x0_sample], lr=lr)
-        
-        # 起点和终点
-        start_cp = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
-        goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
-        
-        # batch级优化循环
-        for iter in range(num_iterations):
-            optimizer.zero_grad()
-            
-            # 拼接完整控制点（整个batch）
+        # 起点和终点按粒子数展开，顺序与 model.sample 的 repeat_interleave 保持一致
+        start_pose_particles = start_pose.repeat_interleave(K, dim=0)
+        goal_pose_particles = goal_pose.repeat_interleave(K, dim=0)
+        start_cp = start_pose_particles[:, :2].unsqueeze(1)  # (B*k_small, 1, 2)
+        goal_cp = goal_pose_particles[:, :2].unsqueeze(1)    # (B*k_small, 1, 2)
+
+        def build_dense_trajectory(middle_control_points):
             full_control_points = torch.cat([
-                start_cp,       # (B, 1, 2)
-                x0_sample,      # (B, 24, 2)
-                goal_cp         # (B, 1, 2)
-            ], dim=1)  # (B, 26, 2)
-            
-            # 使用B样条重建轨迹
-            reconstructed_traj = bspline_layer(full_control_points)  # (B, 100, 2)
-            
-            # 计算cost（会对整个batch求均值）
-            cost = cost_on_dense_trajectory(
-                reconstructed_traj, 
-                start_pose,  # (B, 3)
-                goal_pose,   # (B, 3)
-                stability_cost_map, 
-                map_info, 
-                device
-            )  # 标量
-            
-            # 反向传播
-            cost.backward()
-            
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_([x0_sample], 1.0)
-            
-            # 优化步
-            optimizer.step()
+                start_cp,
+                middle_control_points,
+                goal_cp
+            ], dim=1)  # (B*k_small, 26, 2)
+            return bspline_layer(full_control_points)
+
+        def cost_values_for(middle_control_points):
+            return cost_on_dense_trajectory(
+                build_dense_trajectory(middle_control_points),
+                start_pose_particles,
+                goal_pose_particles,
+                stability_cost_map,
+                map_info,
+                device,
+                return_per_sample=True
+            )
+
+        def median_pairwise_distance(middle_control_points):
+            flat = middle_control_points.detach().reshape(middle_control_points.shape[0], -1)
+            if flat.shape[0] <= 1:
+                return torch.tensor(float(flat.shape[1]) ** 0.5, device=device)
+            return torch.pdist(flat, p=2).median().clamp_min(1e-6)
+
+        def covariance_trace(middle_control_points):
+            flat = middle_control_points.detach().reshape(middle_control_points.shape[0], -1)
+            centered = flat - flat.mean(dim=0, keepdim=True)
+            return centered.pow(2).sum(dim=1).mean()
+
+        # 先用当前粒子估计 cost 尺度、粒子距离和梯度尺度。
+        x_stats = x_langevin.detach().requires_grad_(True)
+        cost_before_values = cost_values_for(x_stats)
+        grad_stats = torch.autograd.grad(
+            cost_before_values.sum(),
+            x_stats,
+            retain_graph=False,
+            create_graph=False
+        )[0]
+        grad_stats = torch.nan_to_num(grad_stats, nan=0.0, posinf=0.0, neginf=0.0)
+
+        cost_before_flat = cost_before_values.detach().flatten()
+        p90 = torch.quantile(cost_before_flat, 0.90)
+        p10 = torch.quantile(cost_before_flat, 0.10)
+        delta_cost_batch = (p90 - p10).clamp_min(temperature_min)
+
+        D_batch = median_pairwise_distance(x_langevin).clamp_min(1e-6)
+        grad_norm = torch.norm(grad_stats.detach().flatten(start_dim=1), dim=1)
+        G_batch = grad_norm.median().clamp_min(1e-8)
+
+        ema_alpha = float(stats_ema_alpha)
+        ema_alpha = max(0.0, min(1.0, ema_alpha))
+        if not hasattr(stage2_optimize_control_points, '_stat_ema'):
+            stage2_optimize_control_points._stat_ema = {
+                'delta_cost': delta_cost_batch.detach(),
+                'D': D_batch.detach(),
+                'G': G_batch.detach(),
+            }
+        else:
+            stat_ema = stage2_optimize_control_points._stat_ema
+            stat_ema['delta_cost'] = (1.0 - ema_alpha) * stat_ema['delta_cost'].to(device) + ema_alpha * delta_cost_batch.detach()
+            stat_ema['D'] = (1.0 - ema_alpha) * stat_ema['D'].to(device) + ema_alpha * D_batch.detach()
+            stat_ema['G'] = (1.0 - ema_alpha) * stat_ema['G'].to(device) + ema_alpha * G_batch.detach()
+
+        stat_ema = stage2_optimize_control_points._stat_ema
+        delta_cost = stat_ema['delta_cost'].to(device).clamp_min(temperature_min)
+        D = stat_ema['D'].to(device).clamp_min(1e-6)
+        G = stat_ema['G'].to(device).clamp_min(1e-8)
+        temperature = (delta_cost / max(float(temperature_kappa), 1e-8)).clamp_min(temperature_min)
+
+        d = x_langevin[0].numel()
+        eta_grad = float(rho_grad) * D / (G + 1e-8)
+        eta_noise = (float(rho_noise) * D) ** 2 / (2.0 * temperature * d + 1e-8)
+        eta = torch.minimum(eta_grad, eta_noise)
+        eta = torch.clamp(eta, min=float(eta_min), max=float(eta_max))
+        grad_clip_norm = (float(rho_max) * D / (eta + 1e-8)).clamp_min(1e-8)
+
+        grad_stats_norm_particles = torch.norm(grad_stats.detach().flatten(start_dim=1), dim=1).view(-1, 1, 1)
+        grad_stats_scale = torch.clamp(grad_clip_norm.view(1, 1, 1) / (grad_stats_norm_particles + 1e-8), max=1.0)
+        grad_stats_clipped = grad_stats.detach() * grad_stats_scale
+        grad_step_norm = (
+            eta * torch.norm(grad_stats_clipped.flatten(start_dim=1), dim=1).median()
+        ).clamp_min(0.0)
+        noise_step_norm = (
+            torch.sqrt(2.0 * temperature * eta) * float(noise_scale) * (float(d) ** 0.5)
+        ).clamp_min(0.0)
+        step_snr = grad_step_norm / (noise_step_norm + 1e-8)
+
+        temperature_particles = temperature.view(1, 1, 1)
+        eta_particles = eta.view(1, 1, 1)
+        grad_clip_particles = grad_clip_norm.view(1, 1, 1)
+
+        def clipped_cost_grad(current_x):
+            current_x = current_x.detach().requires_grad_(True)
+            current_cost_values = cost_values_for(current_x)
+            current_grad = torch.autograd.grad(
+                current_cost_values.sum(),
+                current_x,
+                retain_graph=False,
+                create_graph=False
+            )[0]
+            current_grad = torch.nan_to_num(current_grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+            current_grad_norm = torch.norm(current_grad.flatten(start_dim=1), dim=1).view(-1, 1, 1)
+            current_grad_scale = torch.clamp(grad_clip_particles / (current_grad_norm + 1e-8), max=1.0)
+            return current_x, current_cost_values, current_grad * current_grad_scale
+
+        cost_grad_only_values = None
+        if diagnostics:
+            x_grad_only = x_langevin.detach()
+            for _ in range(num_iterations):
+                x_grad_only, _, grad_only = clipped_cost_grad(x_grad_only)
+                with torch.no_grad():
+                    x_grad_only = x_grad_only - eta_particles * grad_only
+                    x_grad_only = torch.clamp(x_grad_only, -clamp_abs, clamp_abs)
+            with torch.no_grad():
+                cost_grad_only_values = cost_values_for(x_grad_only.detach())
         
+        # batch 级 Langevin 内循环。这里不更新模型参数，只移动样本。
+        for _ in range(num_iterations):
+            x_langevin, _, grad = clipped_cost_grad(x_langevin)
+
+            noise = torch.randn_like(x_langevin) if noise_scale > 0 else torch.zeros_like(x_langevin)
+            with torch.no_grad():
+                x_langevin = x_langevin \
+                    - eta_particles * grad \
+                    + torch.sqrt(2.0 * temperature_particles * eta_particles) * noise_scale * noise
+                x_langevin = torch.clamp(x_langevin, -clamp_abs, clamp_abs)
+        
+        with torch.no_grad():
+            cost_after_values = cost_values_for(x_langevin.detach())
+            if cost_grad_only_values is None:
+                cost_grad_only_values = torch.zeros_like(cost_after_values)
+            D_after = median_pairwise_distance(x_langevin)
+            cov_before = covariance_trace(x_stats.detach())
+            cov_after = covariance_trace(x_langevin)
+            diversity_ratio = D_after / (D + 1e-8)
+            metrics = {
+                'langevin_T': temperature.mean().item(),
+                'langevin_delta_cost': delta_cost.mean().item(),
+                'langevin_G': G.mean().item(),
+                'langevin_eta_grad': eta_grad.mean().item(),
+                'langevin_eta_noise': eta_noise.mean().item(),
+                'langevin_eta': eta.mean().item(),
+                'langevin_eta_at_max': float(eta.mean().item() >= float(eta_max) * 0.999),
+                'langevin_gmax': grad_clip_norm.mean().item(),
+                'langevin_grad_step_norm': grad_step_norm.mean().item(),
+                'langevin_noise_step_norm': noise_step_norm.mean().item(),
+                'langevin_step_snr': step_snr.mean().item(),
+                'langevin_D_before': D.mean().item(),
+                'langevin_D_after': D_after.mean().item(),
+                'langevin_diversity_ratio': diversity_ratio.mean().item(),
+                'langevin_cov_trace_before': cov_before.mean().item(),
+                'langevin_cov_trace_after': cov_after.mean().item(),
+                'langevin_cov_trace_ratio': (cov_after / (cov_before + 1e-8)).mean().item(),
+                'langevin_cost_before': cost_before_values.detach().mean().item(),
+                'langevin_cost_after': cost_after_values.detach().mean().item(),
+                'langevin_cost_grad_only': cost_grad_only_values.detach().mean().item(),
+                'langevin_cost_delta': (cost_after_values.detach() - cost_before_values.detach()).mean().item(),
+                'langevin_cost_delta_grad_only': (
+                    cost_grad_only_values.detach() - cost_before_values.detach()
+                ).mean().item(),
+            }
+
         # 返回优化后的控制点
-        optimized_middle_cp = x0_sample.detach()  # (B, 24, 2)
+        optimized_middle_cp = x_langevin.detach()  # (B*k_small, 24, 2)
     
-    return optimized_middle_cp
+    return optimized_middle_cp, metrics
 
 
 
-def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epochs=100, is_training=True, current_stage=1, use_dense_trajectory=False, num_dense_points=100, prediction_type='x0'):
+def diffusion_loss(model, batch, device, loss_weights=None, current_stage=1, prediction_type='x0'):
     """
     混合损失函数（绝对坐标版本）
     包括：
@@ -569,33 +451,25 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     - 倾覆监督损失: 基于稳定性代价地图的损失
     
     Args:
-        loss_weights: dict with keys ['main', 'smoothness', 'curvature', 'angle_smoothness', 'angle_consistency', 'uniformity', 'capsize']
-        epoch: 当前epoch（用于动态权重）
+        loss_weights: dict with keys such as ['main', 'tangent', 'langevin_steps']
         current_stage: 当前训练阶段（1或2），只在阶段2执行高级损失计算
-        total_epochs: 总epoch数（用于动态权重）
-        is_training: bool - True时使用回归损失，False时返回实际cost值
-        use_dense_trajectory: bool - True时使用密集轨迹计算主损失，False时使用原始控制点
-        num_dense_points: int - 密集轨迹的点数（仅在use_dense_trajectory=True时使用）
         prediction_type: str - 预测类型 ('epsilon', 'x0', 'v')
     """
     # 默认权重
     if loss_weights is None:
         loss_weights = {
             'main': 1.0,
-            'smoothness': 0.1,
-            'curvature': 0.0,
-            'angle_smoothness': 0.05,
-            'angle_consistency': 0.05,
-            'uniformity': 0.01,
-            'capsize': 0.0,
-            'consistency': 0.1  # 时间一致性损失权重
+            'tangent': 0.0,
         }
     map_input = batch['map'].float().to(device)
-    trajectory = batch['trajectory'].to(device)  # (B, 100, 3)
+    trajectory = batch.get('trajectory', None)
+    if trajectory is not None:
+        trajectory = trajectory.to(device)  # (B, 100, 3)
     start_pose = batch['start_pose'].to(device)  # (B, 3)
     goal_pose = batch['goal_pose'].to(device)  # (B, 3)
     
     B = map_input.shape[0]
+    condition_count = B
     
     # =================== B样条控制点转换 ===================
     # 【语义说明】
@@ -603,75 +477,111 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # - 起点/终点：固定的，从start_pose/goal_pose提取
     # - 中间24个点：网络预测的自由控制点
     # 
-    # 【第二阶段特殊处理】
-    # - 第一阶段（current_stage==1）：仅使用模仿学习数据
-    # - 第二阶段（current_stage==2）：在损失层面混合模仿数据和优化数据
-    #   * 分别计算两个loss：loss_imitation 和 loss_optimized
-    #   * 加权组合：total_loss = alpha * loss_imitation + (1-alpha) * loss_optimized
-    #   * 保留两种数据的特性，防止模态坍塌
+    # 【两阶段目标】
+    # - 第一阶段（current_stage==1）：使用数据轨迹做模仿学习。
+    # - 第二阶段（current_stage==2）：只使用 Langevin 迁移后的粒子做目标，
+    #   不再混合专家控制点。
     
-    # 始终获取模仿学习的中间控制点
-    middle_cp_imitation = trajectory_to_control_points(trajectory, num_middle_points=24)  # (B, 24, 2)
-    
-    # 在第二阶段，也可扩展获取优化数据（当前未启用）
+    middle_cp = None
+
+    # 第二阶段：只使用 Langevin dynamics 得到的新分布目标样本。
+    # q_T(x|c) ∝ exp[-C(x,c)/T]，不再混合模仿学习控制点。
     middle_cp_optimized = None
-    # if current_stage == 2:
-    #     # 检查是否有稳定性代价地图可用
-    #     if 'cost_map' in batch and loss_weights.get('capsize', 0.0) > 0:
-    #         # 准备归一化的起点和终点（仅用于优化函数）
-    #         start_normalized_temp = torch.zeros(B, 4, device=device)
-    #         start_normalized_temp[:, :2] = start_pose[:, :2] / 20.0
-    #         start_normalized_temp[:, 2] = torch.cos(start_pose[:, 2])
-    #         start_normalized_temp[:, 3] = torch.sin(start_pose[:, 2])
-    #         start_normalized_temp[:, :2] = torch.clamp(start_normalized_temp[:, :2], -1.0, 1.0)
+    langevin_stats = {
+        'langevin_T': 0.0,
+        'langevin_delta_cost': 0.0,
+        'langevin_G': 0.0,
+        'langevin_eta_grad': 0.0,
+        'langevin_eta_noise': 0.0,
+        'langevin_eta': 0.0,
+        'langevin_eta_at_max': 0.0,
+        'langevin_gmax': 0.0,
+        'langevin_grad_step_norm': 0.0,
+        'langevin_noise_step_norm': 0.0,
+        'langevin_step_snr': 0.0,
+        'langevin_D_before': 0.0,
+        'langevin_D_after': 0.0,
+        'langevin_diversity_ratio': 0.0,
+        'langevin_cov_trace_before': 0.0,
+        'langevin_cov_trace_after': 0.0,
+        'langevin_cov_trace_ratio': 0.0,
+        'langevin_cost_before': 0.0,
+        'langevin_cost_after': 0.0,
+        'langevin_cost_grad_only': 0.0,
+        'langevin_cost_delta': 0.0,
+        'langevin_cost_delta_grad_only': 0.0,
+        'langevin_buffer_size': 0.0,
+    }
+    if current_stage == 1:
+        if trajectory is None:
+            raise ValueError("Stage 1 requires batch['trajectory'] for imitation training.")
+        middle_cp = trajectory_to_control_points(trajectory, num_middle_points=24)  # (B, 24, 2)
+    elif current_stage == 2:
+        if 'target_middle_cp' in batch:
+            middle_cp = batch['target_middle_cp'].to(device)
+            if middle_cp.shape[0] != B:
+                raise ValueError(
+                    f"target_middle_cp batch mismatch: target={middle_cp.shape[0]}, conditions={B}"
+                )
+        else:
+            if 'cost_map' not in batch:
+                raise ValueError("Stage 2 requires replay targets or batch['cost_map']; imitation fallback is disabled.")
+
+            start_normalized_temp = torch.zeros(B, 4, device=device)
+            start_normalized_temp[:, :2] = start_pose[:, :2] / 20.0
+            start_normalized_temp[:, 2] = torch.cos(start_pose[:, 2])
+            start_normalized_temp[:, 3] = torch.sin(start_pose[:, 2])
+            start_normalized_temp[:, :2] = torch.clamp(start_normalized_temp[:, :2], -1.0, 1.0)
             
-    #         goal_normalized_temp = torch.zeros(B, 4, device=device)
-    #         goal_normalized_temp[:, :2] = goal_pose[:, :2] / 20.0
-    #         goal_normalized_temp[:, 2] = torch.cos(goal_pose[:, 2])
-    #         goal_normalized_temp[:, 3] = torch.sin(goal_pose[:, 2])
-    #         goal_normalized_temp[:, :2] = torch.clamp(goal_normalized_temp[:, :2], -1.0, 1.0)
+            goal_normalized_temp = torch.zeros(B, 4, device=device)
+            goal_normalized_temp[:, :2] = goal_pose[:, :2] / 20.0
+            goal_normalized_temp[:, 2] = torch.cos(goal_pose[:, 2])
+            goal_normalized_temp[:, 3] = torch.sin(goal_pose[:, 2])
+            goal_normalized_temp[:, :2] = torch.clamp(goal_normalized_temp[:, :2], -1.0, 1.0)
             
-    #         # 执行采样和优化，获取优化数据
-    #         middle_cp_optimized = stage2_optimize_control_points(
-    #             model=model,
-    #             map_input=map_input,
-    #             start_normalized=start_normalized_temp,
-    #             goal_normalized=goal_normalized_temp,
-    #             start_pose=start_pose,
-    #             goal_pose=goal_pose,
-    #             stability_cost_map=batch['cost_map'].to(device)[0],
-    #             map_info={
-    #                 'resolution': 0.4,
-    #                 'origin': (-20.0, -20.0, -np.pi),
-    #                 'size': (100, 100, 36)
-    #             },
-    #             device=device,
-    #             prediction_type=prediction_type,
-    #             num_iterations=10,
-    #             lr=0.1
-    #         )  # (B, 24, 2) 优化后的控制点
-    
-    # 使用模仿数据作为主要的中间控制点
-    middle_cp = middle_cp_imitation
-    
-    # 【第二阶段特殊处理】在batch维度堆叠模仿数据和优化数据
-    # 这样可以在一次前向传播中同时计算两个损失
-    stage2_mix_loss = False
-    # if current_stage == 2 and middle_cp_optimized is not None:
-    #     # 堆叠：(B, 24, 2) + (B, 24, 2) -> (2B, 24, 2)
-    #     middle_cp = torch.cat([middle_cp_imitation, middle_cp_optimized], dim=0)
-        
-    #     # 同时扩展其他条件
-    #     map_input = torch.cat([map_input, map_input], dim=0)
-    #     start_pose = torch.cat([start_pose, start_pose], dim=0)
-    #     goal_pose = torch.cat([goal_pose, goal_pose], dim=0)
-    #     trajectory = torch.cat([trajectory, trajectory], dim=0)
-        
-    #     B = B * 2  # 更新batch size
-    #     stage2_mix_loss = True
+            middle_cp_optimized, langevin_stats = stage2_optimize_control_points(
+                model=model,
+                map_input=map_input,
+                start_normalized=start_normalized_temp,
+                goal_normalized=goal_normalized_temp,
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                stability_cost_map=batch['cost_map'].to(device),
+                map_info={
+                    'resolution': 0.4,
+                    'origin': (-20.0, -20.0, -np.pi),
+                    'size': (100, 100, 36)
+                },
+                device=device,
+                num_iterations=int(loss_weights.get('langevin_steps', 10)),
+                num_particles=int(loss_weights.get('langevin_gen_particles', 1)),
+                temperature_kappa=float(loss_weights.get('langevin_kappa', 1.0)),
+                rho_grad=float(loss_weights.get('langevin_rho_grad', 0.05)),
+                rho_noise=float(loss_weights.get('langevin_rho_noise', 0.02)),
+                rho_max=float(loss_weights.get('langevin_rho_max', 0.1)),
+                temperature_min=float(loss_weights.get('langevin_temperature_min', 1e-6)),
+                eta_min=float(loss_weights.get('langevin_eta_min', 1e-5)),
+                eta_max=float(loss_weights.get('langevin_eta_max', 10.0)),
+                noise_scale=float(loss_weights.get('langevin_noise_scale', 0.3)),
+                stats_ema_alpha=float(loss_weights.get('langevin_stats_ema_alpha', 0.05)),
+                diagnostics=bool(loss_weights.get('langevin_diagnostics', True)),
+            )  # (B*k_small, 24, 2)
+
+            optimized_count = middle_cp_optimized.shape[0]
+            particles_per_condition = max(1, optimized_count // B)
+
+            # 只有评估或无 buffer fallback 会走这里；训练时优先从 replay buffer 取普通 batch。
+            middle_cp = middle_cp_optimized
+            map_input = map_input.repeat_interleave(particles_per_condition, dim=0)
+            start_pose = start_pose.repeat_interleave(particles_per_condition, dim=0)
+            goal_pose = goal_pose.repeat_interleave(particles_per_condition, dim=0)
+            if trajectory is not None:
+                trajectory = trajectory.repeat_interleave(particles_per_condition, dim=0)
+            
+            B = middle_cp.shape[0]  # 更新batch size
     
     # 归一化控制点：坐标范围通常在 [-20, 20]，归一化到 [-1, 1]
-    middle_cp_normalized = middle_cp / 20.0  # (B, 24, 2) 或 (2B, 24, 2)
+    middle_cp_normalized = middle_cp / 20.0  # stage1: data batch, stage2: replay/train batch
     middle_cp_normalized = torch.clamp(middle_cp_normalized, -1.0, 1.0)
     
     # 归一化起点终点坐标（转换为4维：x, y, cos(θ), sin(θ)） - 用于条件
@@ -787,288 +697,21 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         # 但推荐统一使用 v-loss 以符合论文实现
         main_loss_all = F.mse_loss(V_theta, target_v, reduction='none') # (B, 24, 2)
     
-    # 【第二阶段特殊处理】分离模仿和优化两部分的损失，然后加权
-    if stage2_mix_loss:
-        # 分离损失：(2B, 24, 2) -> (B, 24, 2) + (B, 24, 2)
-        main_loss_imitation = main_loss_all[:len(main_loss_all)//2].mean()  # 前半部分
-        main_loss_optimized = main_loss_all[len(main_loss_all)//2:].mean()   # 后半部分
-        
-        # # 根据训练进度动态调整混合系数
-        # # 早期更多使用模仿损失，保持在原分布附近
-        # # 后期逐渐增加优化损失的比例
-        # progress = epoch / (total_epochs + 1e-8)
-        # # alpha从0.8衰减到0.2：模仿损失比例从80%到20%
-        # alpha_loss = 0.8 - 0.6 * progress  # 范围 [0.8, 0.2]
-        
-        alpha_loss = 0.98
-        
-        # 加权组合两个损失
-        main_loss = alpha_loss * main_loss_imitation + (1.0 - alpha_loss) * main_loss_optimized
-    else:
-        # 第一阶段或第二阶段但没有优化数据：只用模仿数据
-        main_loss = main_loss_all.mean()
-        
-    # if loss_weights['main'] <= 0.0:
-    #     # main_loss = main_loss * 0.0
-    #     main_loss = torch.zeros_like(main_loss)
-        
-    # main_loss = main_loss * 1e-1
-    
-    # =================== 计算辅助损失（可选） ===================
-    # 注意：由于我们现在只预测控制点，辅助损失的计算需要先重建轨迹
-    
-    # 初始化所有损失为零tensor（保持梯度连接）
+    # 阶段1的 target 是 imitation 控制点；阶段2的 target 是 Langevin 粒子。
+    main_loss = main_loss_all.mean()
     dummy_loss = main_loss.sum() * 0.0
-    smoothness_loss = dummy_loss.clone()
-    curvature_loss = dummy_loss.clone()
-    angle_smoothness_loss = dummy_loss.clone()
-    angle_consistency_loss = dummy_loss.clone()
-    uniformity_loss = dummy_loss.clone()
-    capsize_loss = dummy_loss.clone()
-    capsize_safe_loss = dummy_loss.clone()
-    capsize_proxy_penalty = dummy_loss.clone()
-    fisher_diag_mean = dummy_loss.clone()
-    param_drift_mean = dummy_loss.clone()
     tangent_loss = dummy_loss.clone()
-    consistency_loss = dummy_loss.clone()
     
-    if loss_weights['tangent'] > 0.0:
+    if loss_weights.get('tangent', 0.0) > 0.0:
         tangent_loss = compute_tangent_loss(middle_cp_normalized, start_normalized, goal_normalized)
-    
-    if loss_weights['capsize'] > 0.0:
-        # =================== 第二阶段：物理约束 ===================
-        # 训练阶段使用“当前前向预测的 x0”重建轨迹，避免随机采样链的高方差导致
-        # 任一单项辅助损失都把分布推向单模态（与条件解绑）。
-        if is_training:
-            # 从当前训练图得到 x0 预测（归一化坐标），保持与当前条件和时间步一致
-            # x0_middle_pred = z_t - t.view(-1, 1, 1) * V_theta  # (B, 24, 2)
-            x0_middle_pred = z_t - t.view(-1, 1, 1) * u_out  # (B, 24, 2)
-            x0_middle_denorm = torch.clamp(x0_middle_pred, -1.0, 1.0) * 20.0
-
-            # 组合完整控制点并重建密集轨迹
-            start_cp = start_pose[:, :2].unsqueeze(1)  # (B,1,2)
-            goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B,1,2)
-            full_ctrl_points = torch.cat([start_cp, x0_middle_denorm, goal_cp], dim=1)  # (B,26,2)
-
-            bspline_layer = DifferentiableBSpline(
-                num_control_points=24 + 2,
-                num_output_points=100,
-                degree=3
-            ).to(device)
-            reconstructed_traj = bspline_layer(full_ctrl_points)  # (B,100,2)
-            
-            # reconstructed_traj = model.sample_differentiable(
-            #     map_input,
-            #     start_normalized,
-            #     goal_normalized,
-            #     num_steps=3,
-            #     solver='pmf_refined',
-            #     reconstruct_trajectory=True,
-            #     num_traj_points=100
-            # )  # (B, 100, 2) - 已经是真实坐标（非归一化）
-
-            start_pose_expanded = start_pose
-            goal_pose_expanded = goal_pose
-        else:
-            # 验证阶段保留采样链评估，更接近推理分布
-            reconstructed_traj = model.sample(
-                map_input,
-                start_normalized,
-                goal_normalized,
-                num_samples=10,
-                num_steps=3,
-                solver='pmf_refined',
-                reconstruct_trajectory=True,
-                num_traj_points=100
-            )
-            # model.sample 在 num_samples>1 时返回 (B*num_samples, N, 2)
-            start_pose_expanded = start_pose.repeat_interleave(10, dim=0)
-            goal_pose_expanded = goal_pose.repeat_interleave(10, dim=0)
-        
-        # # reconstructed_traj = model.sample_differentiable(
-        # #     map_input,
-        # #     start_normalized,
-        # #     goal_normalized,
-        # #     num_steps=3,
-        # #     solver='pmf_refined',
-        # #     reconstruct_trajectory=True,
-        # #     num_traj_points=100
-        # # )  # (B, N, 2) - 只有(x,y)，已经是真实坐标（非归一化）
-        
-        # 使用整批 cost_map，避免错误地只取 batch[0]
-        stability_cost_map = batch['cost_map'].to(device)
-        map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
-        resolution = 0.4
-        origin = (-20.0, -20.0, -np.pi) # x, y, yaw
-        map_info = {
-            'resolution': resolution,
-            'origin': origin,
-            'size': map_size
-        }
-        
-        # # # =================== 新方法：多步优化 + MSE损失 ===================
-        # # if is_training:
-        # #     # 训练模式：使用多步优化 + MSE损失
-        # #     from grad_optimizer import optimize_control_points_multistep
-            
-        # #     # 对网络预测的控制点进行多步优化
-        # #     optimized_middle_cp, _ = optimize_control_points_multistep(
-        # #         middle_control_points=x0_middle_denorm,  # (B, 24, 2)
-        # #         start_pose=start_pose,
-        # #         goal_pose=goal_pose,
-        # #         stability_cost_map=stability_cost_map,
-        # #         map_info=map_info,
-        # #         iterations=10,
-        # #         lr=0.1,
-        # #         grad_clip_norm=1.0,
-        # #         device=device,
-        # #         verbose=False
-        # #     )
-            
-        # #     # 计算MSE损失：网络预测的控制点 vs 优化后的控制点
-        # #     capsize_loss = F.mse_loss(x0_middle_denorm, optimized_middle_cp.detach())
-            
-        # # else:
-        # #     # 验证模式：使用原来的cost计算方式
-        # #     from grad_optimizer import cost_on_dense_trajectory
-        # #     capsize_loss = cost_on_dense_trajectory(
-        # #         reconstructed_traj, start_pose, goal_pose,
-        # #         stability_cost_map, map_info, device
-        # #     )
-        # if is_training:
-        #     from grad_optimizer import cost_on_dense_trajectory_phr_alm
-
-        #     # 持久化 PHR-ALM 对偶变量（跨 batch）
-        #     if not hasattr(diffusion_loss, '_phr_alm_state'):
-        #         diffusion_loss._phr_alm_state = {
-        #             'lambda_ineq': None,
-        #             'lambda_eq': None,
-        #             'mu': 1.0,
-        #         }
-
-        #     phr_state = diffusion_loss._phr_alm_state
-        #     capsize_loss, _, lambda_ineq_new, lambda_eq_new, mu_new = cost_on_dense_trajectory_phr_alm(
-        #         reconstructed_traj,
-        #         start_pose_expanded,
-        #         goal_pose_expanded,
-        #         stability_cost_map,
-        #         map_info,
-        #         lambda_ineq=phr_state['lambda_ineq'],
-        #         lambda_eq=phr_state['lambda_eq'],
-        #         mu=phr_state['mu'],
-        #         update_dual=True,
-        #         device=device
-        #     )
-
-        #     phr_state['lambda_ineq'] = lambda_ineq_new
-        #     phr_state['lambda_eq'] = lambda_eq_new
-        #     phr_state['mu'] = mu_new
-            
-        #     capsize_loss = capsize_loss * 1e-8
-        # else:
-        #     from grad_optimizer import cost_on_dense_trajectory
-        #     capsize_loss = cost_on_dense_trajectory(
-        #         reconstructed_traj, start_pose_expanded, goal_pose_expanded,
-        #         stability_cost_map, map_info, device
-        #     )
-    
-        from grad_optimizer import cost_on_dense_trajectory
-        safe_loss = cost_on_dense_trajectory(
-            reconstructed_traj, start_pose_expanded, goal_pose_expanded,
-            stability_cost_map, map_info, device
-        )
-
-        # 数值稳定性保护：capsize_loss 出现 NaN/Inf 时回退为 0（跳过该分量）
-        if not torch.isfinite(safe_loss):
-            print("⚠ Warning: capsize_loss is NaN/Inf, fallback to 0 for this batch")
-            safe_loss = dummy_loss.clone()
-
-        # =========================================================
-        # 第二阶段：MeanFlow 约束微调的 Fisher 近端代理
-        #   capsize_loss = safe_loss + 0.5 / eta * (theta - theta_ref)^T F_diag (theta - theta_ref)
-        # 其中 F_diag 用当前 batch 的梯度平方做 EMA 近似。
-        # =========================================================
-        capsize_safe_loss = safe_loss
-        capsize_loss = safe_loss
-        if is_training:
-            proxy_state = _get_stage2_fisher_proxy_state()
-            base_model = model.module if hasattr(model, 'module') else model
-            trainable_params = [p for p in base_model.parameters() if p.requires_grad]
-
-            # 首次进入第二阶段时，用当前参数初始化参考点与 Fisher 对角
-            if proxy_state['ref_params'] is None or len(proxy_state['ref_params']) != len(trainable_params):
-                proxy_state['ref_params'] = [p.detach().clone() for p in trainable_params]
-                proxy_state['fisher_diag'] = [torch.ones_like(p) for p in trainable_params]
-
-            # 用安全损失的参数梯度平方近似 Fisher 对角，并做 EMA 平滑
-            grads = torch.autograd.grad(
-                safe_loss,
-                trainable_params,
-                retain_graph=True,
-                allow_unused=True,
-                create_graph=False,
-            )
-
-            fisher_diag = []
-            with torch.no_grad():
-                for old_fisher, grad, param in zip(proxy_state['fisher_diag'], grads, trainable_params):
-                    if grad is None:
-                        new_fisher = torch.zeros_like(param)
-                    else:
-                        new_fisher = grad.detach().pow(2)
-                    # 使用 fisher_eps 作为下界，避免 Fisher 对角衰减到数值零
-                    updated_fisher = proxy_state['ema_beta'] * old_fisher + (1.0 - proxy_state['ema_beta']) * new_fisher
-                    updated_fisher = torch.clamp(updated_fisher, min=proxy_state['fisher_eps'])
-                    fisher_diag.append(updated_fisher)
-                proxy_state['fisher_diag'] = fisher_diag
-
-            # 参数偏移的 Fisher 加权平方范数
-            penalty_terms = []
-            fisher_means = []
-            drift_means = []
-            for param, ref_param, fisher in zip(trainable_params, proxy_state['ref_params'], proxy_state['fisher_diag']):
-                delta = param - ref_param
-                penalty_terms.append((fisher * delta.pow(2)).mean())
-                fisher_means.append(fisher.mean())
-                drift_means.append(delta.pow(2).mean())
-
-            if len(penalty_terms) > 0:
-                fisher_penalty = torch.stack(penalty_terms).mean()
-                fisher_diag_mean = torch.stack(fisher_means).mean()
-                param_drift_mean = torch.stack(drift_means).mean()
-            else:
-                fisher_penalty = dummy_loss.clone()
-                fisher_diag_mean = dummy_loss.clone()
-                param_drift_mean = dummy_loss.clone()
-
-            capsize_proxy_penalty = fisher_penalty
-            capsize_loss = safe_loss + proxy_state['proxy_scale'] * fisher_penalty
-
-    
-    # 占位符监控指标
-    angle_range_ratio = 1.0
-    mean_norm_sq = 1.0
-    angle_norm_error = torch.tensor(0.0, device=device)
-    main_loss_pos = main_loss
-    main_loss_ang = torch.tensor(0.0, device=device)
-    
-    # 如果需要计算辅助损失（例如平滑性），可以从控制点重建轨迹
-    # 但为了训练效率，暂时跳过
-    skip_angle_losses = True  # 控制点阶段跳过角度相关损失
     
     # main_loss 数值稳定性保护（尤其在 stage2 main=0 时避免无关分支污染）
     if isinstance(main_loss, torch.Tensor) and (not torch.isfinite(main_loss)):
         print("⚠ Warning: main_loss is NaN/Inf, fallback to 0 for this batch")
         main_loss = dummy_loss.clone()
 
-    # 混合损失
-    if loss_weights['main'] <= 0.0:
-        total_loss = loss_weights['tangent'] * tangent_loss \
-                    + loss_weights['capsize'] * capsize_loss
-    else:
-        total_loss = loss_weights['main'] * main_loss \
-                    + loss_weights['tangent'] * tangent_loss \
-                    + loss_weights['capsize'] * capsize_loss
+    total_loss = loss_weights.get('main', 1.0) * main_loss \
+                 + loss_weights.get('tangent', 0.0) * tangent_loss
     
     # 检查损失异常：不中断训练，回退为零损失并跳过本 batch 更新
     if not torch.isfinite(total_loss):
@@ -1080,72 +723,155 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # 返回各项损失用于记录
     loss_dict = {
         'main': main_loss.item(),
-        'smoothness': smoothness_loss.item(),
-        'curvature': curvature_loss.item(),
-        'angle_smoothness': angle_smoothness_loss.item(),
-        'angle_consistency': angle_consistency_loss.item(),
-        'uniformity': uniformity_loss.item(),
         'tangent': tangent_loss.item(),
-        'capsize': capsize_loss.item(),
-        'capsize_safe': capsize_safe_loss.item(),
-        'capsize_proxy_penalty': capsize_proxy_penalty.item(),
-        'fisher_diag_mean': fisher_diag_mean.item(),
-        'param_drift_mean': param_drift_mean.item(),
-        'consistency': consistency_loss.item(),
-        'angle_norm_mean': mean_norm_sq ** 0.5,
-        'angle_norm_error': angle_norm_error.item() if isinstance(angle_norm_error, torch.Tensor) else 0.0,
-        'main_loss_pos': main_loss_pos.item() if isinstance(main_loss_pos, torch.Tensor) else 0.0,
-        'main_loss_ang': main_loss_ang.item() if isinstance(main_loss_ang, torch.Tensor) else 0.0,
+        **langevin_stats,
     }
     
-    # 调整返回的样本数：如果在第二阶段进行了混合，返回原始batch size
-    n_samples = B // 2 if stage2_mix_loss else B
+    # stage2 的训练 batch 来自 replay buffer，统计样本数就是本次 pMF batch size。
+    n_samples = condition_count
     
     return total_loss, 0, n_samples, loss_dict
 
-def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weights=None, current_stage=1, total_stage_epochs=50, ema_models=None, use_dense_trajectory=False, num_dense_points=100):
+def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weights=None, current_stage=1, ema_models=None):
     """
     单轮训练函数
     
     Args:
         ema_models: EMA模型列表，用于更新EMA参数（可选）
-        use_dense_trajectory: bool - 是否使用密集轨迹计算主损失
-        num_dense_points: int - 密集轨迹的点数
     """
     model.train()
     total_loss = 0
     total_samples = 0
+
+    if current_stage == 2:
+        buffer_size = int(loss_weights.get('langevin_buffer_size', 4096))
+        if (
+            not hasattr(train_epoch, '_langevin_buffer') or
+            train_epoch._langevin_buffer.max_size != buffer_size
+        ):
+            train_epoch._langevin_buffer = LangevinReplayBuffer(max_size=buffer_size)
+            train_epoch._langevin_step = 0
+            train_epoch._langevin_last_stats = {}
+        langevin_buffer = train_epoch._langevin_buffer
+    else:
+        langevin_buffer = None
     
     # 累积各项损失
     loss_accumulator = {
         'main': 0, 
-        'smoothness': 0, 
-        'curvature': 0,
-        'angle_smoothness': 0, 
-        'angle_consistency': 0, 
-        'uniformity': 0, 
         'tangent': 0, 
-        'capsize': 0, 
-        'capsize_safe': 0,
-        'capsize_proxy_penalty': 0,
-        'fisher_diag_mean': 0,
-        'param_drift_mean': 0,
-        'consistency': 0,
+        'langevin_T': 0,
+        'langevin_delta_cost': 0,
+        'langevin_G': 0,
+        'langevin_eta_grad': 0,
+        'langevin_eta_noise': 0,
+        'langevin_eta': 0,
+        'langevin_eta_at_max': 0,
+        'langevin_gmax': 0,
+        'langevin_grad_step_norm': 0,
+        'langevin_noise_step_norm': 0,
+        'langevin_step_snr': 0,
+        'langevin_D_before': 0,
+        'langevin_D_after': 0,
+        'langevin_diversity_ratio': 0,
+        'langevin_cov_trace_before': 0,
+        'langevin_cov_trace_after': 0,
+        'langevin_cov_trace_ratio': 0,
+        'langevin_cost_before': 0,
+        'langevin_cost_after': 0,
+        'langevin_cost_grad_only': 0,
+        'langevin_cost_delta': 0,
+        'langevin_cost_delta_grad_only': 0,
+        'langevin_buffer_size': 0,
     }
     
     pbar = tqdm(trainingData, mininterval=2, desc=f"Training Epoch {stage_epoch} (Stage {current_stage})")
     for batch_idx, batch in enumerate(pbar):
         optimizer.zero_grad()
-        
-        loss, _, n_samples, loss_dict = diffusion_loss(
-            model, batch, device, loss_weights, 
-            epoch=stage_epoch, total_epochs=total_stage_epochs,
-            is_training=True,  # 训练模式：capsize loss使用回归损失
-            current_stage=current_stage,  # 传递当前阶段
-            use_dense_trajectory=use_dense_trajectory,
-            num_dense_points=num_dense_points,
-            prediction_type=prediction_type
-        )
+
+        generation_stats = None
+        if current_stage == 2:
+            refresh_interval = max(1, int(loss_weights.get('langevin_refresh_interval', 5)))
+            train_batch_size = int(loss_weights.get('langevin_train_batch_size', 0))
+            if train_batch_size <= 0:
+                train_batch_size = int(batch['map'].shape[0])
+
+            need_refresh = (
+                len(langevin_buffer) < train_batch_size or
+                (train_epoch._langevin_step % refresh_interval == 0)
+            )
+
+            if need_refresh:
+                map_input_gen = batch['map'].float().to(device)
+                start_pose_gen = batch['start_pose'].to(device)
+                goal_pose_gen = batch['goal_pose'].to(device)
+
+                start_normalized_gen = torch.zeros(start_pose_gen.shape[0], 4, device=device)
+                start_normalized_gen[:, :2] = torch.clamp(start_pose_gen[:, :2] / 20.0, -1.0, 1.0)
+                start_normalized_gen[:, 2] = torch.cos(start_pose_gen[:, 2])
+                start_normalized_gen[:, 3] = torch.sin(start_pose_gen[:, 2])
+
+                goal_normalized_gen = torch.zeros(goal_pose_gen.shape[0], 4, device=device)
+                goal_normalized_gen[:, :2] = torch.clamp(goal_pose_gen[:, :2] / 20.0, -1.0, 1.0)
+                goal_normalized_gen[:, 2] = torch.cos(goal_pose_gen[:, 2])
+                goal_normalized_gen[:, 3] = torch.sin(goal_pose_gen[:, 2])
+
+                target_middle_cp, generation_stats = stage2_optimize_control_points(
+                    model=model,
+                    map_input=map_input_gen,
+                    start_normalized=start_normalized_gen,
+                    goal_normalized=goal_normalized_gen,
+                    start_pose=start_pose_gen,
+                    goal_pose=goal_pose_gen,
+                    stability_cost_map=batch['cost_map'].to(device),
+                    map_info={
+                        'resolution': 0.4,
+                        'origin': (-20.0, -20.0, -np.pi),
+                        'size': (100, 100, 36)
+                    },
+                    device=device,
+                    num_iterations=int(loss_weights.get('langevin_steps', 10)),
+                    num_particles=int(loss_weights.get('langevin_gen_particles', 1)),
+                    temperature_kappa=float(loss_weights.get('langevin_kappa', 1.0)),
+                    rho_grad=float(loss_weights.get('langevin_rho_grad', 0.05)),
+                    rho_noise=float(loss_weights.get('langevin_rho_noise', 0.02)),
+                    rho_max=float(loss_weights.get('langevin_rho_max', 0.1)),
+                    temperature_min=float(loss_weights.get('langevin_temperature_min', 1e-6)),
+                    eta_min=float(loss_weights.get('langevin_eta_min', 1e-5)),
+                    eta_max=float(loss_weights.get('langevin_eta_max', 10.0)),
+                    noise_scale=float(loss_weights.get('langevin_noise_scale', 0.3)),
+                    stats_ema_alpha=float(loss_weights.get('langevin_stats_ema_alpha', 0.05)),
+                    diagnostics=bool(loss_weights.get('langevin_diagnostics', True)),
+                )
+
+                gen_particles = max(1, target_middle_cp.shape[0] // batch['map'].shape[0])
+                langevin_buffer.add_batch(
+                    batch['map'].float().repeat_interleave(gen_particles, dim=0),
+                    batch['start_pose'].repeat_interleave(gen_particles, dim=0),
+                    batch['goal_pose'].repeat_interleave(gen_particles, dim=0),
+                    target_middle_cp
+                )
+                if torch.device(device).type == 'cuda' and loss_weights.get('langevin_empty_cache_after_refresh', True):
+                    torch.cuda.empty_cache()
+
+            train_epoch._langevin_step += 1
+            train_batch = langevin_buffer.sample(train_batch_size, device=device)
+            loss, _, n_samples, loss_dict = diffusion_loss(
+                model, train_batch, device, loss_weights,
+                current_stage=current_stage,
+                prediction_type=prediction_type
+            )
+            if generation_stats is not None:
+                train_epoch._langevin_last_stats = generation_stats
+            if getattr(train_epoch, '_langevin_last_stats', None):
+                loss_dict.update(train_epoch._langevin_last_stats)
+            loss_dict['langevin_buffer_size'] = float(len(langevin_buffer))
+        else:
+            loss, _, n_samples, loss_dict = diffusion_loss(
+                model, batch, device, loss_weights, 
+                current_stage=current_stage,  # 传递当前阶段
+                prediction_type=prediction_type
+            )
 
         # 先检查 loss 再统计，避免把 NaN 累积进 epoch 指标
         if not torch.isfinite(loss):
@@ -1184,9 +910,6 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
         if ema_models is not None:
             for ema_m in ema_models:
                 ema_m.update(model)
-
-        # 注意：不在每步刷新参考参数，参考参数在切换到 Stage 2 时固定为
-        # 从 Stage 1 加载的初始参数（见切换逻辑处初始化）
         
         # 更新进度条
         grad_info = f'{original_grad_norm:.2f}→{clip_value}' if was_clipped else f'{original_grad_norm:.2f}'
@@ -1197,7 +920,6 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
             pbar.set_postfix({
                 'Total': f'{loss.item():.5f}',
                 'Main': f'{loss_dict["main"]:.5f}',
-                # 'Smooth': f'{loss_dict["smoothness"]:.4f}',
                 'Tangent': f'{loss_dict["tangent"]:.4f}',
                 'GradNorm': grad_info
             })
@@ -1206,11 +928,11 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
             pbar.set_postfix({
                 'Total': f'{loss.item():.5f}',
                 'Main': f'{loss_dict["main"]:.5f}',
-                'Capsize': f'{loss_dict["capsize"]:.4f}',
-                'Safe': f'{loss_dict["capsize_safe"]:.4f}',
-                'FisherP': f'{loss_dict["capsize_proxy_penalty"]:.3e}',
-                'Fdiag': f'{loss_dict["fisher_diag_mean"]:.3e}',
-                'Drift': f'{loss_dict["param_drift_mean"]:.3e}',
+                'T': f'{loss_dict["langevin_T"]:.2e}',
+                'Eta': f'{loss_dict["langevin_eta"]:.2e}',
+                'SNR': f'{loss_dict["langevin_step_snr"]:.2f}',
+                'dC': f'{loss_dict["langevin_cost_delta"]:.1e}',
+                'Div': f'{loss_dict["langevin_diversity_ratio"]:.2f}',
                 'GradNorm': grad_info
             })
     
@@ -1222,13 +944,10 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
     return avg_loss, 0, total_samples, avg_loss_dict
 
 
-def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_epochs=100, current_stage=1, use_late_timesteps=False, use_dense_trajectory=False, num_dense_points=100):
+def eval_epoch(model, validationData, device, loss_weights=None, current_stage=1):
     """
     单轮评估函数
     
-    Args:
-        use_dense_trajectory: bool - 是否使用密集轨迹计算主损失
-        num_dense_points: int - 密集轨迹的点数
     """
     model.eval()
     total_loss = 0
@@ -1237,31 +956,99 @@ def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_
     # 累积各项损失
     loss_accumulator = {
         'main': 0, 
-        'smoothness': 0, 
-        'curvature': 0,
-        'angle_smoothness': 0, 
-        'angle_consistency': 0, 
-        'uniformity': 0, 
         'tangent': 0, 
-        'capsize': 0,
-        'capsize_safe': 0,
-        'capsize_proxy_penalty': 0,
-        'fisher_diag_mean': 0,
-        'param_drift_mean': 0,
+        'langevin_T': 0,
+        'langevin_delta_cost': 0,
+        'langevin_G': 0,
+        'langevin_eta_grad': 0,
+        'langevin_eta_noise': 0,
+        'langevin_eta': 0,
+        'langevin_eta_at_max': 0,
+        'langevin_gmax': 0,
+        'langevin_grad_step_norm': 0,
+        'langevin_noise_step_norm': 0,
+        'langevin_step_snr': 0,
+        'langevin_D_before': 0,
+        'langevin_D_after': 0,
+        'langevin_diversity_ratio': 0,
+        'langevin_cov_trace_before': 0,
+        'langevin_cov_trace_after': 0,
+        'langevin_cov_trace_ratio': 0,
+        'langevin_cost_before': 0,
+        'langevin_cost_after': 0,
+        'langevin_cost_grad_only': 0,
+        'langevin_cost_delta': 0,
+        'langevin_cost_delta_grad_only': 0,
     }
+
+    def evaluate_stage2_cost(batch):
+        from grad_optimizer import cost_on_dense_trajectory
+
+        if 'cost_map' not in batch:
+            raise ValueError("Stage 2 validation requires batch['cost_map'] to compute cost.")
+
+        effective_loss_weights = loss_weights or {}
+        map_input = batch['map'].float().to(device)
+        start_pose = batch['start_pose'].to(device)
+        goal_pose = batch['goal_pose'].to(device)
+        B = map_input.shape[0]
+
+        start_normalized = torch.zeros(B, 4, device=device)
+        start_normalized[:, :2] = torch.clamp(start_pose[:, :2] / 20.0, -1.0, 1.0)
+        start_normalized[:, 2] = torch.cos(start_pose[:, 2])
+        start_normalized[:, 3] = torch.sin(start_pose[:, 2])
+
+        goal_normalized = torch.zeros(B, 4, device=device)
+        goal_normalized[:, :2] = torch.clamp(goal_pose[:, :2] / 20.0, -1.0, 1.0)
+        goal_normalized[:, 2] = torch.cos(goal_pose[:, 2])
+        goal_normalized[:, 3] = torch.sin(goal_pose[:, 2])
+
+        val_samples = max(1, int(effective_loss_weights.get('stage2_val_samples', 1)))
+        sample_steps = max(1, int(effective_loss_weights.get('stage2_val_sample_steps', 3)))
+        sample_model = model.module if hasattr(model, 'module') else model
+        sampled_traj = sample_model.sample(
+            map_input,
+            start_normalized,
+            goal_normalized,
+            num_samples=val_samples,
+            num_steps=sample_steps,
+            solver='pmf_refined',
+            reconstruct_trajectory=True,
+            num_traj_points=100
+        )
+
+        start_pose_expanded = start_pose.repeat_interleave(val_samples, dim=0)
+        goal_pose_expanded = goal_pose.repeat_interleave(val_samples, dim=0)
+        map_info = {
+            'resolution': 0.4,
+            'origin': (-20.0, -20.0, -np.pi),
+            'size': (100, 100, 36)
+        }
+        cost = cost_on_dense_trajectory(
+            sampled_traj,
+            start_pose_expanded,
+            goal_pose_expanded,
+            batch['cost_map'].to(device),
+            map_info,
+            device
+        )
+
+        loss_dict = {key: 0.0 for key in loss_accumulator}
+        loss_dict['main'] = cost.item()
+        loss_dict['langevin_cost_before'] = cost.item()
+        loss_dict['langevin_cost_after'] = cost.item()
+        return cost, 0, B, loss_dict
     
     with torch.no_grad():
         for batch in tqdm(validationData, mininterval=2, desc="Validation"):
-            
-            loss, _, n_samples, loss_dict = diffusion_loss(
-                model, batch, device, loss_weights,
-                epoch=epoch, total_epochs=total_epochs,
-                is_training=False,  # 验证模式：capsize loss返回实际cost值
-                current_stage=current_stage,  # 传递当前阶段
-                use_dense_trajectory=use_dense_trajectory,
-                num_dense_points=num_dense_points,
-                prediction_type=prediction_type
-            )
+            if current_stage == 2:
+                loss, _, n_samples, loss_dict = evaluate_stage2_cost(batch)
+            else:
+                loss, _, n_samples, loss_dict = diffusion_loss(
+                    model, batch, device, loss_weights,
+                    current_stage=current_stage,
+                    prediction_type=prediction_type
+                )
                 
             total_loss += loss.item()
             total_samples += n_samples
@@ -1281,26 +1068,6 @@ def check_data_folders(folder):
     """检查数据文件夹结构"""
     assert osp.isdir(osp.join(folder, 'train')), "Cannot find training data"  # 检查train子文件夹是否存在
     assert osp.isdir(osp.join(folder, 'val')), "Cannot find validation data"  # 检查val子文件夹是否存在
-
-def print_model_parameters(model, stage_info=""):
-    """打印模型参数的训练状态"""
-    print(f"{stage_info} - Model Parameter Status:")
-    total_params = 0
-    trainable_params = 0
-    
-    for name, param in model.named_parameters():
-        total_params += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-            print(f"  ✓ {name}: {param.numel()} parameters (trainable)")
-        else:
-            print(f"  ✗ {name}: {param.numel()} parameters (frozen)")
-    
-    print(f"  Total parameters: {total_params:,}")
-    print(f"  Trainable parameters: {trainable_params:,}")
-    print(f"  Frozen parameters: {total_params - trainable_params:,}")
-    print(f"  Trainable ratio: {trainable_params/total_params:.1%}")
-    print()
 
 def load_checkpoint(model, checkpoint_path, device):
     """加载检查点"""
@@ -1442,79 +1209,61 @@ if __name__ == "__main__":
         
         print(f"✓ EMA启用 (decays={ema_decays})")
     
-    # =================== 密集轨迹配置 ===================
-    use_dense_trajectory = False  # 是否使用密集轨迹计算主损失
-    num_dense_points = 100  # 密集轨迹的点数
-    
-    print(f"✓ 密集轨迹: {'启用' if use_dense_trajectory else '禁用'}")
-    if use_dense_trajectory:
-        print(f"  - 密集点数: {num_dense_points}")
-    
     # =================== 两阶段训练配置 ===================
-    # 阶段1配置：注重基础轨迹预测
-    # stage1_config = {
-    #     'epochs': args.stage1_epochs,
-    #     'lr_mul': 1e-1,  # 学习率倍增器
-    #     'loss_weights': {
-    #         'smoothness': 1e-5,   # 平滑性损失
-    #         'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
-    #         'angle_smoothness': 1e-2,  # 角度平滑性损失
-    #         'angle_consistency': 0e-6,  # 角度一致性损失(防止倒车)
-    #         'uniformity': 0e-4,   # 均匀性损失（点间距离方差）
-    #         'sincos_norm': 1e-1,   # sin/cos归一化损失（确保sin²+cos²≈1）
-    #         'capsize': 0.0        # 倾覆监督损失（第一阶段不启用）
-    #     }
-    # }
     stage1_config = {
         'epochs': args.stage1_epochs,
         'lr_mul': 1e-1,  # 学习率倍增器
         'loss_weights': {
             'main': 1e-2,          # 主预测损失
-            'smoothness': 0e-5,   # 平滑性损失
-            'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
-            'angle_smoothness': 0e-2,  # 角度平滑性损失
-            'angle_consistency': 0e-6,  # 角度一致性损失(防止倒车)
-            'uniformity': 0e-4,   # 均匀性损失（点间距离方差）
             'tangent': 0e3,   # 切线约束损失（确保起点和终点方向一致）
-            'capsize': 0.0        # 倾覆监督损失（第一阶段不启用）
         }
     }
     
-    # 阶段2配置：通过梯度优化学习低cost轨迹
-    # **核心改变**：使用完整DDIM采样链计算cost，而非单步预测
-    # **关键**：保留main loss作为正则化，capsize loss作为优化目标
+    # 阶段2配置：Langevin 分布迁移
+    # 目标分布 q_T(x|c) ∝ exp[-C(x,c) / T]。
+    # main loss 的目标只来自 Langevin 迁移控制点；
+    # cost 只通过 Langevin 内循环塑造目标样本，不再作为直接最小化项压到网络上。
     stage2_config = {
         'epochs': args.stage2_epochs,
         'lr_mul': 1e-3,  # 小学习率微调（不是从头训练！）
         'loss_weights': {
-            'main': 0e-2,        # 保留主损失作为正则化（不能为0！）
-            'smoothness': 0e-5,   # 平滑性损失
-            'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
-            'angle_smoothness': 0e-2,  # 角度平滑性损失
-            'angle_consistency': 0e-6,  # 角度一致性损失
-            'uniformity': 0e-4,   # 均匀性损失
+            'main': 1e-2,        # 保留主损失作为正则化（不能为0！）
             'tangent': 0e-2,   # 切线约束损失（确保起点和终点方向一致）
-            'capsize': 1e-2,
-            'consistency': 0.0,   # 时间一致性损失（当前不启用）
+            'langevin_gen_particles': 1,    # k_small：每次 refresh 每个条件生成的粒子数
+            'langevin_refresh_interval': 5, # 每隔多少个 pMF step 刷新一批 Langevin 样本
+            'langevin_train_batch_size': 0, # 0 表示使用当前 dataloader batch size
+            'langevin_buffer_size': 4096,   # detached CPU replay buffer 容量
+            'langevin_empty_cache_after_refresh': True,
+            'langevin_stats_ema_alpha': 0.05,
+            'langevin_kappa': 1.0,          # T = (P90(C)-P10(C)) / kappa，先从1开始
+            'langevin_steps': 10,           # M：初期建议5~10，稳定后再加到20
+            'langevin_rho_grad': 0.05,      # eta_grad = rho_grad * D / G
+            'langevin_rho_noise': 0.02,     # eta_noise = (rho_noise * D)^2 / (2*T*d)
+            'langevin_rho_max': 0.1,        # g_max = rho_max * D / eta
+            'langevin_temperature_min': 1e-6,
+            'langevin_eta_min': 1e-5,
+            'langevin_eta_max': 10.0,       # 0.05 会让 cost 漂移过弱；由 g_max 控制单步最大位移
+            'langevin_noise_scale': 0.3,    # 诊断显示 noise=1 容易抵消很弱的梯度漂移
+            'langevin_diagnostics': True,   # 额外记录纯梯度链、步长 SNR 等指标
+            'stage2_val_samples': 1,        # 验证时每个条件采样几条轨迹来计算 cost
+            'stage2_val_sample_steps': 3,   # 验证采样的 pMF refine 步数，越大越慢但更稳定
         }
     }
     
     # 初始化当前阶段（在数据加载前）
     current_stage = args.stage
     
-    # 根据当前阶段决定是否计算stability map（第二阶段需要倾覆损失时启用）
+    # 第二阶段 Langevin 迁移需要 cost map
     if current_stage == 1:
         loss_weights = stage1_config['loss_weights']
     else:
         loss_weights = stage2_config['loss_weights']
 
     if current_stage == 2 and loss_weights.get('main', 0.0) <= 0.0:
-        print("⚠ Warning: Stage 2 main loss weight <= 0, training is capsize-only and may collapse.")
+        print("⚠ Warning: Stage 2 main loss weight <= 0; pMF distillation may not learn the Langevin targets.")
     
     compute_stability = (
-        current_stage == 2 and (
-            loss_weights.get('capsize', 0.0) > 0
-        )
+        current_stage == 2 and loss_weights.get('langevin_steps', 0) > 0
     )
     
     trainDataset = UnevenPathDataLoader(
@@ -1582,13 +1331,13 @@ if __name__ == "__main__":
     
     # 根据阶段配置参数冻结
     if current_stage == 1:
-        # 阶段1：全参数训练（包括map cross-attention）
+        # 阶段1：基础 pMF 训练
         if isinstance(model, nn.DataParallel):
             model.module.unfreeze_for_stage1()
         else:
             model.unfreeze_for_stage1()
     else:
-        # 阶段2：只fine-tune map cross-attention + 主预测头
+        # 阶段2：按照模型内部策略设置可训练参数
         if isinstance(model, nn.DataParallel):
             model.module.freeze_for_stage2()
         else:
@@ -1775,7 +1524,7 @@ if __name__ == "__main__":
                     else:
                         print(f"  Note: EMA checkpoint not found: {osp.basename(ema_checkpoint_path)}, will use current EMA state")
             
-            # 【关键】阶段2：只训练map cross-attention + 主预测头
+            # 阶段2：按照模型内部策略设置可训练参数
             if isinstance(model, nn.DataParallel):
                 model.module.freeze_for_stage2()
                 trainable_params = model.module.get_trainable_parameters()
@@ -1783,17 +1532,10 @@ if __name__ == "__main__":
                 model.freeze_for_stage2()
                 trainable_params = model.get_trainable_parameters()
             
-            # 在切换到 Stage 2 时，将参考锚点设置为此处加载的 Stage1 模型参数
-            # 使得后续的 Fisher 近端惩罚以 Stage1 参数为固定参考（类似 KL 约束）
-            proxy_state = _get_stage2_fisher_proxy_state()
-            proxy_state['ref_params'] = [p.detach().clone() for p in trainable_params]
-            # 初始化 fisher_diag 为与参数同形状的全 1 张量，随后由 batch EMA 更新
-            proxy_state['fisher_diag'] = [torch.ones_like(p) for p in trainable_params]
-
             trainable_count = sum(p.numel() for p in trainable_params)
             print(f"✓ 阶段2训练参数量: {trainable_count:,}")
             
-            # 更新优化器（只优化cross-attention + 主预测头）
+            # 更新优化器
             old_lr_mul = optimizer.lr_mul
             optimizer = Optim.ScheduledOptim(
                 optim.AdamW(
@@ -1807,7 +1549,14 @@ if __name__ == "__main__":
                 n_warmup_steps=50
             )
             print(f"✓ Reset optimizer with new learning rate: {old_lr_mul} → {stage2_config['lr_mul']}")
-            print(f"✓ Enabled capsize loss: {stage2_config['loss_weights']['capsize']}")
+            print(
+                "✓ Enabled Langevin migration: "
+                f"k_small={stage2_config['loss_weights']['langevin_gen_particles']}, "
+                f"buffer={stage2_config['loss_weights']['langevin_buffer_size']}, "
+                f"refresh={stage2_config['loss_weights']['langevin_refresh_interval']}, "
+                f"M={stage2_config['loss_weights']['langevin_steps']}, "
+                f"kappa={stage2_config['loss_weights']['langevin_kappa']}"
+            )
             print()
 
             
@@ -1878,19 +1627,15 @@ if __name__ == "__main__":
         else:
             stage_epoch = epoch - stage1_config['epochs']
         
-        # 计算当前阶段的总epoch数
-        total_stage_epochs = stage1_config['epochs'] if current_stage == 1 else stage2_config['epochs']
-        
         # 训练
         train_loss, _, _, train_loss_dict = train_epoch(
-            model, trainingData, optimizer, device, stage_epoch, loss_weights, current_stage, total_stage_epochs,
-            ema_models=ema_models if use_ema else None, use_dense_trajectory=use_dense_trajectory, num_dense_points=num_dense_points
+            model, trainingData, optimizer, device, stage_epoch, loss_weights, current_stage,
+            ema_models=ema_models if use_ema else None
         )
         
         # 验证（使用主模型）
         val_loss, _, _, val_loss_dict = eval_epoch(
-            model, validationData, device, loss_weights, stage_epoch, total_stage_epochs, 
-            current_stage=current_stage, use_dense_trajectory=use_dense_trajectory, num_dense_points=num_dense_points
+            model, validationData, device, loss_weights, current_stage=current_stage
         )
         
         # 验证EMA模型
@@ -1899,8 +1644,7 @@ if __name__ == "__main__":
         if use_ema and len(ema_models) > 0:
             for i, ema_m in enumerate(ema_models):
                 ema_val_loss, _, _, ema_val_loss_dict = eval_epoch(
-                    ema_m.module, validationData, device, loss_weights, stage_epoch, total_stage_epochs,
-                    current_stage=current_stage, use_dense_trajectory=use_dense_trajectory, num_dense_points=num_dense_points
+                    ema_m.module, validationData, device, loss_weights, current_stage=current_stage
                 )
                 ema_val_losses.append(ema_val_loss)
                 ema_val_loss_dicts.append(ema_val_loss_dict)
@@ -1912,72 +1656,83 @@ if __name__ == "__main__":
         print(f"\n[Stage {current_stage}] Epoch {stage_epoch}:")
         print(f"  Train Loss: {train_loss:.9f}")
         print(f"    - Main: {train_loss_dict['main']:.6f}")
-        # print(f"    - Smoothness: {train_loss_dict['smoothness']:.6f}")
-        # print(f"    - Curvature: {train_loss_dict['curvature']:.6f}")
-        # print(f"    - Angle Smoothness: {train_loss_dict['angle_smoothness']:.6f}")
-        # print(f"    - Angle Consistency: {train_loss_dict['angle_consistency']:.6f}")
-        # print(f"    - Uniformity: {train_loss_dict['uniformity']:.6f}")
         print(f"    - Tangent: {train_loss_dict['tangent']:.6f}")
-        print(f"    - Capsize: {train_loss_dict['capsize']:.9f}")
-        print(f"    - Capsize Safe: {train_loss_dict['capsize_safe']:.9f}")
-        print(f"    - Fisher Penalty: {train_loss_dict['capsize_proxy_penalty']:.3e}")
-        print(f"    - Fisher Diag Mean: {train_loss_dict['fisher_diag_mean']:.3e}")
-        print(f"    - Param Drift Mean: {train_loss_dict['param_drift_mean']:.3e}")
-        print(f"  Val Loss:   {val_loss:.9f}")
-        print(f"    - Main: {val_loss_dict['main']:.6f}")
-        # print(f"    - Smoothness: {val_loss_dict['smoothness']:.6f}")
-        # print(f"    - Curvature: {val_loss_dict['curvature']:.6f}")
-        # print(f"    - Angle Smoothness: {val_loss_dict['angle_smoothness']:.6f}")
-        # print(f"    - Angle Consistency: {val_loss_dict['angle_consistency']:.6f}")
-        # print(f"    - Uniformity: {val_loss_dict['uniformity']:.6f}")
-        print(f"    - Tangent: {val_loss_dict['tangent']:.6f}")
-        print(f"    - Capsize: {val_loss_dict['capsize']:.9f}")
-        print(f"    - Capsize Safe: {val_loss_dict['capsize_safe']:.9f}")
+        if current_stage == 2:
+            print(
+                "    - Langevin: "
+                f"T={train_loss_dict.get('langevin_T', 0.0):.3e}, "
+                f"eta={train_loss_dict.get('langevin_eta', 0.0):.3e}, "
+                f"SNR={train_loss_dict.get('langevin_step_snr', 0.0):.2f}, "
+                f"gmax={train_loss_dict.get('langevin_gmax', 0.0):.3e}, "
+                f"cost {train_loss_dict.get('langevin_cost_before', 0.0):.3e}"
+                f"→{train_loss_dict.get('langevin_cost_after', 0.0):.3e}, "
+                f"gd-only={train_loss_dict.get('langevin_cost_grad_only', 0.0):.3e}, "
+                f"ΔC={train_loss_dict.get('langevin_cost_delta', 0.0):.2e}, "
+                f"D ratio={train_loss_dict.get('langevin_diversity_ratio', 0.0):.3f}, "
+                f"buffer={train_loss_dict.get('langevin_buffer_size', 0.0):.0f}"
+            )
+            print(
+                "    - Langevin step scale: "
+                f"G={train_loss_dict.get('langevin_G', 0.0):.3e}, "
+                f"grad_step={train_loss_dict.get('langevin_grad_step_norm', 0.0):.3e}, "
+                f"noise_step={train_loss_dict.get('langevin_noise_step_norm', 0.0):.3e}, "
+                f"eta_grad={train_loss_dict.get('langevin_eta_grad', 0.0):.3e}, "
+                f"eta_noise={train_loss_dict.get('langevin_eta_noise', 0.0):.3e}, "
+                f"eta_at_max={train_loss_dict.get('langevin_eta_at_max', 0.0):.0f}"
+            )
+        if current_stage == 2:
+            print(f"  Val Cost:   {val_loss:.9f}")
+            print(f"    - Sample Cost: {val_loss_dict['main']:.6f}")
+        else:
+            print(f"  Val Loss:   {val_loss:.9f}")
+            print(f"    - Main: {val_loss_dict['main']:.6f}")
+            print(f"    - Tangent: {val_loss_dict['tangent']:.6f}")
         
         # 打印EMA验证损失
         if use_ema and len(ema_val_losses) > 0:
             for i, (ema_val_loss, decay) in enumerate(zip(ema_val_losses, ema_decays)):
-                print(f"  EMA Val Loss (decay={decay}): {ema_val_loss:.6f}")
+                ema_metric_name = "EMA Val Cost" if current_stage == 2 else "EMA Val Loss"
+                print(f"  {ema_metric_name} (decay={decay}): {ema_val_loss:.6f}")
         
         # TensorBoard - 总损失（使用阶段内epoch）
         writer.add_scalar('Loss/train', train_loss, stage_epoch)
         writer.add_scalar('Loss/val', val_loss, stage_epoch)
+        if current_stage == 2:
+            writer.add_scalar('Cost/val_sample_cost', val_loss, stage_epoch)
         
         # TensorBoard - 各项损失
         writer.add_scalar('Loss/train_main', train_loss_dict['main'], stage_epoch)
-        writer.add_scalar('Loss/train_smoothness', train_loss_dict['smoothness'], stage_epoch)
-        writer.add_scalar('Loss/train_curvature', train_loss_dict['curvature'], stage_epoch)
-        writer.add_scalar('Loss/train_angle_smoothness', train_loss_dict['angle_smoothness'], stage_epoch)
-        writer.add_scalar('Loss/train_angle_consistency', train_loss_dict['angle_consistency'], stage_epoch)
-        writer.add_scalar('Loss/train_uniformity', train_loss_dict['uniformity'], stage_epoch)
         writer.add_scalar('Loss/train_tangent', train_loss_dict['tangent'], stage_epoch)
-        writer.add_scalar('Loss/train_capsize', train_loss_dict['capsize'], stage_epoch)
-        writer.add_scalar('Loss/train_capsize_safe', train_loss_dict['capsize_safe'], stage_epoch)
-        writer.add_scalar('Loss/train_fisher_penalty', train_loss_dict['capsize_proxy_penalty'], stage_epoch)
-        writer.add_scalar('Loss/train_fisher_diag_mean', train_loss_dict['fisher_diag_mean'], stage_epoch)
-        writer.add_scalar('Loss/train_param_drift_mean', train_loss_dict['param_drift_mean'], stage_epoch)
-        
-        # ===== R² × S¹ 监控指标 =====
-        writer.add_scalar('Manifold/train_angle_norm_mean', train_loss_dict.get('angle_norm_mean', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/train_angle_norm_error', train_loss_dict.get('angle_norm_error', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/train_main_loss_pos', train_loss_dict.get('main_loss_pos', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/train_main_loss_ang', train_loss_dict.get('main_loss_ang', 0.0), stage_epoch)
+
+        for key in [
+            'langevin_T',
+            'langevin_delta_cost',
+            'langevin_G',
+            'langevin_eta_grad',
+            'langevin_eta_noise',
+            'langevin_eta',
+            'langevin_eta_at_max',
+            'langevin_gmax',
+            'langevin_grad_step_norm',
+            'langevin_noise_step_norm',
+            'langevin_step_snr',
+            'langevin_D_before',
+            'langevin_D_after',
+            'langevin_diversity_ratio',
+            'langevin_cov_trace_before',
+            'langevin_cov_trace_after',
+            'langevin_cov_trace_ratio',
+            'langevin_cost_before',
+            'langevin_cost_after',
+            'langevin_cost_grad_only',
+            'langevin_cost_delta',
+            'langevin_cost_delta_grad_only',
+            'langevin_buffer_size',
+        ]:
+            writer.add_scalar(f'Langevin/train_{key}', train_loss_dict.get(key, 0.0), stage_epoch)
         
         writer.add_scalar('Loss/val_main', val_loss_dict['main'], stage_epoch)
-        writer.add_scalar('Loss/val_smoothness', val_loss_dict['smoothness'], stage_epoch)
-        writer.add_scalar('Loss/val_curvature', val_loss_dict['curvature'], stage_epoch)
-        writer.add_scalar('Loss/val_angle_smoothness', val_loss_dict['angle_smoothness'], stage_epoch)
-        writer.add_scalar('Loss/val_angle_consistency', val_loss_dict['angle_consistency'], stage_epoch)
-        writer.add_scalar('Loss/val_uniformity', val_loss_dict['uniformity'], stage_epoch)
         writer.add_scalar('Loss/val_tangent', val_loss_dict['tangent'], stage_epoch)
-        writer.add_scalar('Loss/val_capsize', val_loss_dict['capsize'], stage_epoch)
-        writer.add_scalar('Loss/val_capsize_safe', val_loss_dict['capsize_safe'], stage_epoch)
-        
-        # ===== R² × S¹ 监控指标（验证集）=====
-        writer.add_scalar('Manifold/val_angle_norm_mean', val_loss_dict.get('angle_norm_mean', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/val_angle_norm_error', val_loss_dict.get('angle_norm_error', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/val_main_loss_pos', val_loss_dict.get('main_loss_pos', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/val_main_loss_ang', val_loss_dict.get('main_loss_ang', 0.0), stage_epoch)
         
         # TensorBoard - EMA验证损失
         if use_ema and len(ema_val_losses) > 0:
@@ -1986,12 +1741,6 @@ if __name__ == "__main__":
         
         writer.add_scalar('LR', optimizer._optimizer.param_groups[0]['lr'], stage_epoch)
         
-        # 保存最佳标准模型
-        # # Stage 2：以验证集安全率为主（越高越好），main仅作为次级tie-break
-        # if current_stage == 2:
-        #     current_val_metric = -val_loss_dict.get('reward_rate', 0.0) + 1e-3 * val_loss_dict['main']
-        # else:
-        #     current_val_metric = val_loss
         current_val_metric = val_loss
         if current_val_metric < best_val_loss:
             best_val_loss = current_val_metric
@@ -2013,29 +1762,21 @@ if __name__ == "__main__":
                 'n_steps': optimizer.n_steps,
                 'train_loss': train_loss,
                 'val_loss': current_val_metric,
+                'val_metric_name': 'cost' if current_stage == 2 else 'loss',
                 'stage1_best_loss': stage1_best_loss,
                 'torch_seed': torch_seed
             }
             
             torch.save(checkpoint, best_model_path)
-            if current_stage == 2:
-                print(
-                    f"  ✓ Saved best model for Stage {current_stage} to {osp.basename(best_model_path)} "
-                    # f"(val_safe_rate={val_loss_dict.get('reward_rate', 0.0):.4f}, val_main={val_loss_dict['main']:.6f}, metric={current_val_metric:.6f})"
-                )
-            else:
-                print(f"  ✓ Saved best model for Stage {current_stage} to {osp.basename(best_model_path)} (val_loss={current_val_metric:.6f})")
+            metric_name = 'val_cost' if current_stage == 2 else 'val_loss'
+            print(
+                f"  ✓ Saved best model for Stage {current_stage} to "
+                f"{osp.basename(best_model_path)} ({metric_name}={current_val_metric:.6f})"
+            )
         
         # 分别保存每个EMA模型（基于各自的训练指标在Stage 2）
         if use_ema and len(ema_models) > 0:
             for i, (ema_m, decay, ema_val_loss) in enumerate(zip(ema_models, ema_decays, ema_val_losses)):
-                # if current_stage == 2:
-                #     # 同样使用训练集指标（EMA是基于training trajectory学出来的）
-                #     # 注意：这里我们还没有EMA模型的训练时指标，只能用val指标
-                #     # 但理想情况下应该在训练阶段累积EMA模型的reward_rate
-                #     ema_val_metric = -ema_val_loss_dicts[i].get('reward_rate', 0.0) + 1e-3 * ema_val_loss_dicts[i]['main']
-                # else:
-                #     ema_val_metric = ema_val_loss
                 ema_val_metric = ema_val_loss
                 if ema_val_metric < ema_best_val_losses[i]:
                     ema_best_val_losses[i] = ema_val_metric
@@ -2056,17 +1797,16 @@ if __name__ == "__main__":
                         'ema_decay': decay,
                         'train_loss': train_loss,
                         'val_loss': ema_val_metric,
+                        'val_metric_name': 'cost' if current_stage == 2 else 'loss',
                         'stage1_best_loss': stage1_best_loss,
                         'torch_seed': torch_seed
                     }
                     torch.save(ema_checkpoint, ema_model_path)
-                    if current_stage == 2:
-                        print(
-                            f"  ✓ Saved best EMA model (decay={decay}) to {ema_model_filename} "
-                            # f"(val_safe_rate={ema_val_loss_dicts[i].get('reward_rate', 0.0):.4f}, val_main={ema_val_loss_dicts[i]['main']:.6f}, metric={ema_val_metric:.6f})"
-                        )
-                    else:
-                        print(f"  ✓ Saved best EMA model (decay={decay}) to {ema_model_filename} (val_loss={ema_val_metric:.6f})")
+                    metric_name = 'val_cost' if current_stage == 2 else 'val_loss'
+                    print(
+                        f"  ✓ Saved best EMA model (decay={decay}) to "
+                        f"{ema_model_filename} ({metric_name}={ema_val_metric:.6f})"
+                    )
         
         # 定期保存检查点（每5个epoch）- 作为备份
         if (stage_epoch + 1) % 5 == 0:
@@ -2085,6 +1825,7 @@ if __name__ == "__main__":
                 'n_steps': optimizer.n_steps,
                 'train_loss': train_loss,
                 'val_loss': val_loss,
+                'val_metric_name': 'cost' if current_stage == 2 else 'loss',
                 'stage1_best_loss': stage1_best_loss,
                 'torch_seed': torch_seed
             }, checkpoint_path)
@@ -2104,6 +1845,7 @@ if __name__ == "__main__":
                         'ema_decay': decay,
                         'train_loss': train_loss,
                         'val_loss': val_loss,
+                        'val_metric_name': 'cost' if current_stage == 2 else 'loss',
                         'stage1_best_loss': stage1_best_loss,
                         'torch_seed': torch_seed
                     }, ema_checkpoint_path)
@@ -2125,7 +1867,8 @@ if __name__ == "__main__":
     print("Training completed!")
     if current_stage == 2:
         print(f"Stage 1 best validation loss: {stage1_best_loss:.6f}")
-    print(f"Stage {current_stage} best validation loss: {best_val_loss:.6f}")
+    best_metric_name = 'cost' if current_stage == 2 else 'loss'
+    print(f"Stage {current_stage} best validation {best_metric_name}: {best_val_loss:.6f}")
     print(f"Best model saved to: {best_model_path}")
     print(f"{'='*60}\n")
     
@@ -2138,6 +1881,7 @@ if __name__ == "__main__":
     final_model_path = osp.join(trainDataFolder, 'final_model.pth')
     final_stage = 2 if n_epochs > stage1_config['epochs'] else 1
     final_stage_epoch = (n_epochs - 1) if final_stage == 1 else (n_epochs - 1 - stage1_config['epochs'])
+    final_metric_name = 'cost' if final_stage == 2 else 'loss'
     
     # 保存标准最终模型
     torch.save({
@@ -2148,6 +1892,7 @@ if __name__ == "__main__":
         'n_steps': optimizer.n_steps,
         'train_loss': train_losses[-1],
         'val_loss': val_losses[-1],
+        'val_metric_name': final_metric_name,
         'stage1_best_loss': stage1_best_loss,
         'torch_seed': torch_seed
     }, final_model_path)
@@ -2168,6 +1913,7 @@ if __name__ == "__main__":
                 'ema_decay': decay,
                 'train_loss': train_losses[-1],
                 'val_loss': val_losses[-1],
+                'val_metric_name': final_metric_name,
                 'stage1_best_loss': stage1_best_loss,
                 'torch_seed': torch_seed
             }, final_ema_path)
