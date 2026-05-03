@@ -265,6 +265,18 @@ def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, m
         jerk_yaw = ddyaw_full[:, 2:] - ddyaw_full[:, 1:-1]
         jerk_cost = torch.mean(jerk_x**2 + jerk_y**2 + 1e0 * jerk_yaw**2, dim=1)
 
+        # out of bound penalty: 轨迹点必须在地图边界内至少 g_safe 个像素的范围内
+        g_safe = 1  # 安全边界，单位像素
+        x_min = float(origin[0]) + g_safe * resolution
+        x_max = float(origin[0] + (W - 1) * resolution) - g_safe * resolution
+        y_min = float(origin[1]) + g_safe * resolution
+        y_max = float(origin[1] + (H - 1) * resolution) - g_safe * resolution
+        g_x_low = F.relu(x_min - x)
+        g_x_high = F.relu(x - x_max)
+        g_y_low = F.relu(y_min - y)
+        g_y_high = F.relu(y - y_max)
+        out_of_bound_cost = torch.mean(g_x_low + g_x_high + g_y_low + g_y_high, dim=1) * 1e3
+
         # 6. 权重组合
         weights = {
             'obstacle': 1e-1,
@@ -272,6 +284,7 @@ def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, m
             'curvature': 1e-3,
             'endpoints': 1e-3,
             'jerk': 1e-4,
+            'out_of_bound': 1e-3,
         }
 
         total_cost = (
@@ -279,7 +292,8 @@ def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, m
             weights['smoothness'] * smoothness_cost +
             weights['curvature'] * curvature_cost +
             weights['endpoints'] * yaw_endpoint_cost +
-            weights['jerk'] * jerk_cost
+            weights['jerk'] * jerk_cost +
+            weights['out_of_bound'] * out_of_bound_cost
         )
 
         # 支持返回逐样本代价（GR-AWF 组内相对优势）或 batch 均值（兼容原逻辑）
@@ -1277,7 +1291,8 @@ if __name__ == "__main__":
     # from dataLoader_uneven import UnevenPathDataLoader
     from dataLoader_dit import UnevenPathDataLoader
     env_list = ['env000010']
-    dataFolder = '/home/yrf/MPT/data/sim_dataset/val'
+    # dataFolder = '/home/yrf/MPT/data/sim_dataset/val'
+    dataFolder = '/home/sdu/MPT/data/sim_dataset/val'
     # dataset = UnevenPathDataLoader(env_list, dataFolder)
     dataset = UnevenPathDataLoader(env_list, dataFolder, True)
     path_index = 43
