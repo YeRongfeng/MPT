@@ -410,8 +410,8 @@ if __name__ == "__main__":
     # 'pmf_onestep': 一步预测方法（快速）
     # 'euler': 一阶Euler方法（快速，但精度较低）
     # 'heun': 二阶Heun方法（较慢，但精度更高）
-    # solver = 'pmf_onestep'  # 快速的一步预测方法
-    solver = 'pmf_refined'
+    solver = 'pmf_onestep'  # 快速的一步预测方法
+    # solver = 'pmf_refined'
     # solver = 'euler'  # 可选：速度更快
     diffusion_step = 3
     # solver = 'heun'  # 推荐：精度更高
@@ -469,8 +469,8 @@ if __name__ == "__main__":
     # path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
     # path_index_list = list([28, 29, 30, 31, 32, 33])  # 测试前5条路径
     # path_index_list = list([34, 35, 36, 37, 38, 39])  # 测试前5条路径
-    # path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
-    path_index_list = list([46, 47, 48, 49, 44, 45])  # 测试前5条路径
+    path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
+    # path_index_list = list([46, 47, 48, 49, 44, 45])  # 测试前5条路径
     # print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
 

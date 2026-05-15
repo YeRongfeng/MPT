@@ -454,8 +454,8 @@ def main():
     guidance_start_step = 0.7  # 开始引导的时间点 (推荐: 0.5-0.7)
 
     # ODE 求解器配置（与新模型接口对齐）
-    solver = 'pmf_refined'  # 'pmf_onestep' | 'pmf_refined' | 'euler' | 'heun'
-    # solver = 'pmf_onestep'  # 'pmf_onestep' | 'pmf_refined' | 'euler' | 'heun'
+    # solver = 'pmf_refined'  # 'pmf_onestep' | 'pmf_refined' | 'euler' | 'heun'
+    solver = 'pmf_onestep'  # 'pmf_onestep' | 'pmf_refined' | 'euler' | 'heun'
     diffusion_step = 3
     reconstruct_trajectory = True
     num_traj_points = 100
