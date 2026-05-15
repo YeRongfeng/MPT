@@ -466,10 +466,14 @@ if __name__ == "__main__":
     # path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
     # path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
     # path_index_list = list([16, 17, 18, 19, 20, 21])  # 测试前5条路径
-    # path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
+    path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
     # path_index_list = list([28, 29, 30, 31, 32, 33])  # 测试前5条路径
     # path_index_list = list([34, 35, 36, 37, 38, 39])  # 测试前5条路径
+<<<<<<< HEAD
     path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
+=======
+    # path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
+>>>>>>> 8cb805ad61f4b935445901c7a8da6e47e34bf22b
     # path_index_list = list([46, 47, 48, 49, 44, 45])  # 测试前5条路径
     # print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")
