@@ -1,0 +1,60 @@
+{
+  "checkpoint": "/home/yrf/MPT/data/sim/stage1_best_model.pth",
+  "environment": "env000010",
+  "path_ids": [
+    40
+  ],
+  "optimization_seed": 0,
+  "perturb_seed": 2026,
+  "sigmas": [
+    0.05
+  ],
+  "samples_per_center": 1,
+  "num_conditions": 1,
+  "num_centers": 32,
+  "total_perturbed_trajectories": 32,
+  "aggregate_by_sigma": [
+    {
+      "sigma": 0.05,
+      "num_centers": 32,
+      "num_trajectories": 32,
+      "success_rate": 0.96875,
+      "center_success_rate": {
+        "min": 0.0,
+        "median": 1.0,
+        "mean": 0.96875,
+        "p90": 1.0,
+        "max": 1.0
+      },
+      "center_cost_multiplier": {
+        "min": 0.9991018176078796,
+        "median": 1.0079549551010132,
+        "mean": 1.0645899772644043,
+        "p90": 1.179748296737671,
+        "max": 1.5979911088943481
+      },
+      "centers_with_at_least_80pct_success": 31,
+      "centers_with_at_least_80pct_success_rate": 0.96875
+    }
+  ],
+  "per_condition": [
+    {
+      "path_id": 40,
+      "sigma": 0.05,
+      "num_centers": 32,
+      "samples_per_center": 1,
+      "num_trajectories": 32,
+      "success_count": 31,
+      "success_rate": 0.96875,
+      "center_success_rate_mean": 0.96875,
+      "center_success_rate_median": 1.0,
+      "centers_with_at_least_80pct_success": 31,
+      "centers_with_at_least_80pct_success_rate": 0.96875,
+      "cost_mean": 0.004001582972705364,
+      "cost_median": 0.003724243026226759,
+      "cost_multiplier_mean": 1.0645899772644043,
+      "cost_multiplier_median": 1.0079549551010132,
+      "noise_energy_per_dim_mean": 1.936980128288269
+    }
+  ]
+}

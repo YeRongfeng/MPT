@@ -1,0 +1,20 @@
+metric,value,unit,source
+条件数,8,condition,sweep_summary/summary.json
+每条件 restart,32,trajectory,sweep_summary/summary.json
+随机噪声成功率,0.26171875,fraction,sweep_summary/summary.json
+优化噪声成功率,0.97265625,fraction,sweep_summary/summary.json
+随机 cost/GT 均值,1.4234616422161186,ratio,sweep_summary/summary.json
+优化 cost/GT 均值,0.5950127840144726,ratio,sweep_summary/summary.json
+逐样本平均相对代价下降,0.5604965314945534,fraction,sweep_summary/summary.json
+初始噪声能量/维均值,0.9709970448166132,ratio,sweep_summary/summary.json
+优化噪声能量/维均值,2.8468522150069475,ratio,sweep_summary/summary.json
+优化噪声能量/维最大值,7.203365325927734,ratio,sweep_summary/summary.json
+平均噪声位移,9.32260663062334,L2,sweep_summary/summary.json
+sigma=0.05 扰动成功率,0.94921875,fraction,perturbation_summary/summary.json
+sigma=0.1 扰动成功率,0.9111328125,fraction,perturbation_summary/summary.json
+sigma=0.2 扰动成功率,0.82421875,fraction,perturbation_summary/summary.json
+sigma=0.5 扰动成功率,0.526123046875,fraction,perturbation_summary/summary.json
+平均径向移动,1.6604846833453641,L2,noise_geometry/summary.json
+平均正交移动,9.098095607619594,L2,noise_geometry/summary.json
+径向位移能量占比,0.045109521272817615,fraction,noise_geometry/summary.json
+条件×噪声交互能量占比,0.6495453023101522,fraction,noise_geometry/summary.json

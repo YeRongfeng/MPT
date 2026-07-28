@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 import torch.optim as optim
@@ -13,6 +15,14 @@ from bspline_utils import (
     fit_bspline_least_squares,
     reconstruct_from_control_points,
     DifferentiableBSpline
+)
+from map_config import (
+    MAP_BOUNDS,
+    MAP_CONFIG,
+    MAP_HALF_EXTENT,
+    MAP_RESOLUTION,
+    MAP_YAW_BINS,
+    SAFETY_COST_CONFIG,
 )
 
 # 从xy坐标计算theta（通过差分计算切向量）
@@ -69,7 +79,12 @@ def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, m
             trajectory = trajectory.to(device)
 
         # 数值稳定性：清理上游偶发 NaN/Inf，避免传播导致整批损失失效
-        trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=20.0, neginf=-20.0)
+        trajectory = torch.nan_to_num(
+            trajectory,
+            nan=0.0,
+            posinf=MAP_HALF_EXTENT,
+            neginf=-MAP_HALF_EXTENT,
+        )
 
         if trajectory.ndim == 2:  # 单条轨迹情况
             trajectory = trajectory.unsqueeze(0)  # 添加 batch 维度
@@ -304,6 +319,392 @@ def cost_on_dense_trajectory(trajectory, start_pose, goal_pose, occupancy_map, m
         # 注意：外部训练还会乘以 loss_weights['capsize']，这里不再额外缩小
         return torch.mean(total_cost)
 
+
+def top_tail_mean(values, ratio=0.05):
+    """返回每个样本最坏 ``ratio`` 比例点的均值。
+
+    Args:
+        values: 形状为 (B, N) 的逐点代价/违规量。
+        ratio: 轨迹尾部比例，范围为 (0, 1]。
+    """
+    if values.ndim != 2:
+        raise ValueError(f"values must have shape (B, N), got {tuple(values.shape)}")
+    if values.shape[1] == 0:
+        raise ValueError("values must contain at least one trajectory point")
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(f"ratio must be in (0, 1], got {ratio}")
+
+    k = max(1, math.ceil(values.shape[1] * ratio))
+    return torch.topk(values, k=k, dim=1, largest=True, sorted=False).values.mean(dim=1)
+
+
+def discrete_turning_curvature(traj_xy, eps=1e-12):
+    """用“相邻线段转角 / 局部弧长”计算离散曲率。
+
+    相比三点外接圆公式，该定义在三点共线但运动方向相反时不会
+    退化为零：正向直线的转角为 0，180 度掉头的转角为 pi。
+
+    Args:
+        traj_xy: (B, N, 2) 轨迹。
+
+    Returns:
+        (B, N-2) 离散曲率。
+    """
+    if traj_xy.ndim != 3 or traj_xy.shape[-1] != 2:
+        raise ValueError(f"traj_xy must have shape (B,N,2), got {tuple(traj_xy.shape)}")
+    if traj_xy.shape[1] < 3:
+        raise ValueError("traj_xy must contain at least three points")
+
+    incoming = traj_xy[:, 1:-1, :] - traj_xy[:, :-2, :]
+    outgoing = traj_xy[:, 2:, :] - traj_xy[:, 1:-1, :]
+    incoming_length = torch.linalg.vector_norm(incoming, dim=-1)
+    outgoing_length = torch.linalg.vector_norm(outgoing, dim=-1)
+
+    cross = incoming[..., 0] * outgoing[..., 1] - incoming[..., 1] * outgoing[..., 0]
+    dot = torch.sum(incoming * outgoing, dim=-1)
+    turning_angle = torch.atan2(torch.abs(cross), dot)  # [0, pi]
+    local_arc_length = 0.5 * (incoming_length + outgoing_length)
+    return turning_angle / local_arc_length.clamp_min(eps)
+
+
+def _match_cost_map_batch(occ, batch_size, device):
+    """将 (B_map, C, D, H, W) 代价图对齐到轨迹 batch。"""
+    b_map = occ.shape[0]
+    if b_map == batch_size:
+        return occ
+    if b_map == 1:
+        return occ.expand(batch_size, -1, -1, -1, -1)
+    if batch_size % b_map == 0:
+        repeats_per_map = batch_size // b_map
+        map_idx = torch.arange(batch_size, device=device) // repeats_per_map
+        return occ[map_idx]
+
+    raise ValueError(
+        f"occupancy-map batch ({b_map}) cannot be aligned with trajectory batch "
+        f"({batch_size})"
+    )
+
+
+def _sample_cost_map_on_dense_trajectory(traj_xy, occupancy_map, map_info, device):
+    """
+    根据 xy 切向计算 yaw，并在 (x, y, yaw) 代价图上可微采样。
+
+    Returns:
+        x, y, yaw, occ_vals，形状均为 (B, N)。
+    """
+    batch_size, num_points, _ = traj_xy.shape
+    origin = map_info['origin']
+    resolution = float(map_info['resolution'])
+    W, H, D = map_info['size']
+
+    if resolution <= 0.0:
+        raise ValueError(f"map resolution must be positive, got {resolution}")
+    if min(W, H, D) < 2:
+        raise ValueError(f"map dimensions must all be at least 2, got {(W, H, D)}")
+
+    x = traj_xy[:, :, 0]
+    y = traj_xy[:, :, 1]
+    yaw = compute_theta_from_xy(traj_xy).to(device)
+
+    x_idx = torch.clamp((x - origin[0]) / resolution, 0.0, float(W - 1))
+    y_idx = torch.clamp((y - origin[1]) / resolution, 0.0, float(H - 1))
+    yaw_rel = torch.remainder(yaw - origin[2], 2.0 * np.pi)
+    yaw_idx = torch.clamp(yaw_rel / (2.0 * np.pi / D), 0.0, float(D - 1))
+
+    grid = torch.stack([
+        (x_idx / (W - 1)) * 2.0 - 1.0,
+        (y_idx / (H - 1)) * 2.0 - 1.0,
+        (yaw_idx / (D - 1)) * 2.0 - 1.0,
+    ], dim=-1).view(batch_size, num_points, 1, 1, 3)
+
+    occ = torch.as_tensor(occupancy_map, dtype=traj_xy.dtype, device=device)
+
+    # 兼容 (D,H,W)/(H,W,D) 以及它们的 batch 形式。
+    if occ.ndim == 3:
+        if occ.shape[-1] == D and occ.shape[0] == H and occ.shape[1] == W:
+            occ = occ.permute(2, 0, 1).contiguous()
+        if tuple(occ.shape) != (D, H, W):
+            raise ValueError(
+                f"occupancy_map spatial shape must be (D,H,W) or (H,W,D), got "
+                f"{tuple(occ.shape)}"
+            )
+        occ = occ.unsqueeze(0).unsqueeze(0)
+    elif occ.ndim == 4:
+        if occ.shape[-1] == D and occ.shape[1] == H and occ.shape[2] == W:
+            occ = occ.permute(0, 3, 1, 2).contiguous()
+        if tuple(occ.shape[1:]) != (D, H, W):
+            raise ValueError(
+                f"batched occupancy_map spatial shape must be (D,H,W) or (H,W,D), "
+                f"got {tuple(occ.shape[1:])}"
+            )
+        occ = occ.unsqueeze(1)
+    elif occ.ndim == 5:
+        if occ.shape[1] != 1 or tuple(occ.shape[2:]) != (D, H, W):
+            raise ValueError(
+                "5D occupancy_map must have shape (B_map,1,D,H,W), got "
+                f"{tuple(occ.shape)}"
+            )
+    else:
+        raise ValueError(f"Unsupported occupancy_map shape: {tuple(occ.shape)}")
+
+    occ = _match_cost_map_batch(occ, batch_size, device)
+    occ_vals = F.grid_sample(
+        occ,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True,
+    )
+    occ_vals = occ_vals[:, 0, :, 0, 0]
+    return x, y, yaw, occ_vals
+
+
+def _pose_yaw_for_batch(pose, batch_size, dtype, device, name):
+    """提取 pose yaw，并兼容单值、batch 以及每场景多轨迹的 batch。"""
+    pose = torch.as_tensor(pose, dtype=dtype, device=device)
+    if pose.ndim == 1:
+        if pose.numel() < 3:
+            raise ValueError(f"{name} must contain at least (x, y, yaw)")
+        return pose[2]
+    if pose.ndim != 2 or pose.shape[1] < 3:
+        raise ValueError(f"{name} must have shape (3,) or (B,3), got {tuple(pose.shape)}")
+
+    yaw = pose[:, 2]
+    if yaw.shape[0] == batch_size:
+        return yaw
+    if batch_size % yaw.shape[0] == 0:
+        return yaw.repeat_interleave(batch_size // yaw.shape[0])
+    raise ValueError(
+        f"{name} batch ({yaw.shape[0]}) cannot be aligned with trajectory batch "
+        f"({batch_size})"
+    )
+
+
+def cost_on_dense_trajectory_tail_risk(
+    trajectory,
+    start_pose,
+    goal_pose,
+    occupancy_map,
+    map_info,
+    device='cpu',
+    return_per_sample=False,
+    *,
+    tail_ratio=SAFETY_COST_CONFIG.tail_ratio,
+    curvature_tail_ratio=SAFETY_COST_CONFIG.curvature_tail_ratio,
+    out_of_bound_tail_ratio=SAFETY_COST_CONFIG.out_of_bound_tail_ratio,
+    d_safe=SAFETY_COST_CONFIG.d_safe_meters,
+    alpha=SAFETY_COST_CONFIG.softplus_alpha,
+    curvature_limit=SAFETY_COST_CONFIG.curvature_limit,
+    boundary_safe_pixels=SAFETY_COST_CONFIG.boundary_safe_pixels,
+    obstacle_weight=SAFETY_COST_CONFIG.obstacle_weight,
+    curvature_weight=SAFETY_COST_CONFIG.curvature_weight,
+    out_of_bound_weight=SAFETY_COST_CONFIG.out_of_bound_weight,
+    endpoint_weight=SAFETY_COST_CONFIG.endpoint_weight,
+    quality_weight=SAFETY_COST_CONFIG.quality_weight,
+    quality_term=SAFETY_COST_CONFIG.quality_term,
+    return_components=False,
+):
+    """
+    面向“整条轨迹必须可行”的稠密轨迹 tail-risk cost。
+
+    与 :func:`cost_on_dense_trajectory` 的主要区别：
+
+    1. 障碍、曲率和越界量均按物理阈值无量纲化；
+    2. 安全、曲率和越界分别使用自己的 tail 比例，避免为覆盖不稳定点
+       而增大的安全 tail 同时把曲率过度平滑；
+    3. 曲率使用转角/局部弧长及线性相对超限，能识别共线掉头；
+    4. 可行性项使用显式权重组合，轨迹质量只作为小权重正则项。
+
+    ``occupancy_map`` 延续原函数的语义：值越大表示安全余度越大，
+    低于 ``d_safe`` 视为风险。
+
+    Args:
+        trajectory: (N,2/3) 或 (B,N,2/3) 稠密轨迹。传入的 yaw 不使用，
+            yaw 由 xy 切向可微计算。
+        tail_ratio: 安全余度使用的最坏点比例，由共享安全配置给出。
+        curvature_tail_ratio: 曲率使用的最坏点比例。
+        out_of_bound_tail_ratio: 越界距离使用的最坏点比例。
+        quality_term: ``'jerk'``、``'smoothness'`` 或 ``'none'``。
+        return_components: 为 True 时返回 ``(cost, components)`` 便于诊断。
+
+    Returns:
+        默认返回 batch 均值标量；``return_per_sample=True`` 时返回 (B,)。
+    """
+    if d_safe <= 0.0:
+        raise ValueError(f"d_safe must be positive, got {d_safe}")
+    tail_ratios = {
+        'tail_ratio': tail_ratio,
+        'curvature_tail_ratio': curvature_tail_ratio,
+        'out_of_bound_tail_ratio': out_of_bound_tail_ratio,
+    }
+    for name, ratio in tail_ratios.items():
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError(f"{name} must be in (0, 1], got {ratio}")
+    if alpha <= 0.0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+    if curvature_limit <= 0.0:
+        raise ValueError(f"curvature_limit must be positive, got {curvature_limit}")
+    if boundary_safe_pixels < 0:
+        raise ValueError(
+            f"boundary_safe_pixels must be non-negative, got {boundary_safe_pixels}"
+        )
+    feasibility_weights = {
+        'obstacle_weight': obstacle_weight,
+        'curvature_weight': curvature_weight,
+        'out_of_bound_weight': out_of_bound_weight,
+        'endpoint_weight': endpoint_weight,
+    }
+    for name, weight in feasibility_weights.items():
+        if weight < 0.0:
+            raise ValueError(f"{name} must be non-negative, got {weight}")
+    if quality_weight < 0.0:
+        raise ValueError(f"quality_weight must be non-negative, got {quality_weight}")
+    if quality_term not in {'jerk', 'smoothness', 'none'}:
+        raise ValueError(
+            "quality_term must be one of {'jerk', 'smoothness', 'none'}, "
+            f"got {quality_term!r}"
+        )
+
+    if not torch.is_tensor(trajectory):
+        trajectory = torch.tensor(trajectory, dtype=torch.float32, device=device)
+    else:
+        trajectory = trajectory.to(device=device, dtype=torch.float32)
+    trajectory = torch.nan_to_num(
+        trajectory,
+        nan=0.0,
+        posinf=MAP_HALF_EXTENT,
+        neginf=-MAP_HALF_EXTENT,
+    )
+
+    if trajectory.ndim == 2:
+        trajectory = trajectory.unsqueeze(0)
+    if trajectory.ndim != 3 or trajectory.shape[-1] < 2:
+        raise ValueError(
+            f"trajectory must have shape (N,2/3) or (B,N,2/3), got "
+            f"{tuple(trajectory.shape)}"
+        )
+    if trajectory.shape[1] < 3:
+        raise ValueError("trajectory must contain at least three points")
+
+    traj_xy = trajectory[:, :, :2]
+    batch_size = traj_xy.shape[0]
+    x, y, yaw, occ_vals = _sample_cost_map_on_dense_trajectory(
+        traj_xy, occupancy_map, map_info, device
+    )
+
+    # 1) 无量纲障碍/安全余度违规。
+    obs_violation = F.softplus(alpha * (d_safe - occ_vals)) / (alpha * d_safe)
+    obstacle_cost = top_tail_mean(obs_violation, tail_ratio)
+
+    # 2) 无量纲线性曲率超限。转角定义避免外接圆公式将共线掉头误判为零曲率。
+    geom_curvature = discrete_turning_curvature(traj_xy)
+    curvature_violation = F.relu(geom_curvature / curvature_limit - 1.0)
+    curvature_cost = top_tail_mean(curvature_violation, curvature_tail_ratio)
+
+    # 3) 越界距离按一个地图像素的物理长度归一化。
+    origin = map_info['origin']
+    resolution = float(map_info['resolution'])
+    W, H, _ = map_info['size']
+    x_min = float(origin[0]) + boundary_safe_pixels * resolution
+    x_max = float(origin[0] + (W - 1) * resolution) - boundary_safe_pixels * resolution
+    y_min = float(origin[1]) + boundary_safe_pixels * resolution
+    y_max = float(origin[1] + (H - 1) * resolution) - boundary_safe_pixels * resolution
+    out_violation = (
+        F.relu(x_min - x)
+        + F.relu(x - x_max)
+        + F.relu(y_min - y)
+        + F.relu(y - y_max)
+    ) / resolution
+    out_of_bound_cost = top_tail_mean(out_violation, out_of_bound_tail_ratio)
+
+    # 4) endpoint yaw 按最大角距 pi 归一化，并使用线性误差。
+    start_yaw = _pose_yaw_for_batch(
+        start_pose, batch_size, trajectory.dtype, device, 'start_pose'
+    )
+    goal_yaw = _pose_yaw_for_batch(
+        goal_pose, batch_size, trajectory.dtype, device, 'goal_pose'
+    )
+    yaw_diff_start = torch.atan2(
+        torch.sin(yaw[:, 0] - start_yaw), torch.cos(yaw[:, 0] - start_yaw)
+    )
+    yaw_diff_end = torch.atan2(
+        torch.sin(yaw[:, -1] - goal_yaw), torch.cos(yaw[:, -1] - goal_yaw)
+    )
+    endpoint_cost = (torch.abs(yaw_diff_start) + torch.abs(yaw_diff_end)) / np.pi
+
+    weighted_obstacle_cost = obstacle_weight * obstacle_cost
+    weighted_curvature_cost = curvature_weight * curvature_cost
+    weighted_out_of_bound_cost = out_of_bound_weight * out_of_bound_cost
+    weighted_endpoint_cost = endpoint_weight * endpoint_cost
+    feasible_cost = (
+        weighted_obstacle_cost
+        + weighted_curvature_cost
+        + weighted_out_of_bound_cost
+        + weighted_endpoint_cost
+    )
+
+    # 质量项不当作硬约束；它仅用小权重打破可行轨迹之间的平局。
+    dx = x[:, 1:] - x[:, :-1]
+    dy = y[:, 1:] - y[:, :-1]
+    dyaw = torch.atan2(
+        torch.sin(yaw[:, 1:] - yaw[:, :-1]),
+        torch.cos(yaw[:, 1:] - yaw[:, :-1]),
+    )
+    ddx = dx[:, 1:] - dx[:, :-1]
+    ddy = dy[:, 1:] - dy[:, :-1]
+    ddyaw = torch.atan2(
+        torch.sin(dyaw[:, 1:] - dyaw[:, :-1]),
+        torch.cos(dyaw[:, 1:] - dyaw[:, :-1]),
+    )
+    smoothness_cost = torch.mean(ddx ** 2 + ddy ** 2 + ddyaw ** 2, dim=1)
+
+    if trajectory.shape[1] >= 4:
+        jerk_x = ddx[:, 1:] - ddx[:, :-1]
+        jerk_y = ddy[:, 1:] - ddy[:, :-1]
+        jerk_yaw = torch.atan2(
+            torch.sin(ddyaw[:, 1:] - ddyaw[:, :-1]),
+            torch.cos(ddyaw[:, 1:] - ddyaw[:, :-1]),
+        )
+        jerk_cost = torch.mean(jerk_x ** 2 + jerk_y ** 2 + jerk_yaw ** 2, dim=1)
+    else:
+        jerk_cost = torch.zeros_like(feasible_cost)
+
+    if quality_term == 'jerk':
+        quality_cost = jerk_cost
+    elif quality_term == 'smoothness':
+        quality_cost = smoothness_cost
+    else:
+        quality_cost = torch.zeros_like(feasible_cost)
+
+    total_cost = feasible_cost + quality_weight * quality_cost
+    components = {
+        'obstacle': obstacle_cost,
+        'curvature': curvature_cost,
+        'curvature_max': torch.max(geom_curvature, dim=1).values,
+        'out_of_bound': out_of_bound_cost,
+        'endpoint': endpoint_cost,
+        'weighted_obstacle': weighted_obstacle_cost,
+        'weighted_curvature': weighted_curvature_cost,
+        'weighted_out_of_bound': weighted_out_of_bound_cost,
+        'weighted_endpoint': weighted_endpoint_cost,
+        'feasible': feasible_cost,
+        'smoothness': smoothness_cost,
+        'jerk': jerk_cost,
+        'quality': quality_cost,
+        'total': total_cost,
+    }
+
+    if return_per_sample:
+        result = total_cost
+        result_components = components
+    else:
+        result = total_cost.mean()
+        result_components = {name: value.mean() for name, value in components.items()}
+
+    if return_components:
+        return result, result_components
+    return result
+
 def cost_on_dense_trajectory_phr_alm(
     trajectory,
     start_pose,
@@ -350,7 +751,12 @@ def cost_on_dense_trajectory_phr_alm(
             trajectory = torch.tensor(trajectory, dtype=torch.float32, device=device)
         else:
             trajectory = trajectory.to(device)
-        trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=20.0, neginf=-20.0)
+        trajectory = torch.nan_to_num(
+            trajectory,
+            nan=0.0,
+            posinf=MAP_HALF_EXTENT,
+            neginf=-MAP_HALF_EXTENT,
+        )
         if trajectory.ndim == 2:
             trajectory = trajectory.unsqueeze(0)
 
@@ -607,8 +1013,7 @@ def visualize_terrain_trajectory(ax, trajectory, elev, nx, ny, nz, positions=Non
     height_map = elev
     
     # 显示地形
-    # im = ax.imshow(height_map, cmap='terrain', extent=[-5, 5, -5, 5], origin='lower')
-    im = ax.imshow(height_map, cmap='terrain', extent=[-20, 20, -20, 20], origin='lower')
+    im = ax.imshow(height_map, cmap='terrain', extent=MAP_BOUNDS, origin='lower')
     plt.colorbar(im, ax=ax, label='Terrain Height')
     
     # 绘制密集轨迹（最醒目，线宽加粗，zorder最高，颜色可选深蓝/黑/自定义）
@@ -624,7 +1029,7 @@ def visualize_terrain_trajectory(ax, trajectory, elev, nx, ny, nz, positions=Non
     if yaws is not None and trajectory is not None and len(yaws) == len(trajectory):
         arrow_gap = max(1, len(trajectory)//12)  # 箭头更密集
         for i in range(0, len(trajectory), arrow_gap):
-            arrow_length = 0.45
+            arrow_length = 0.0225 * MAP_CONFIG.size_meters
             dx = arrow_length * np.cos(yaws[i])
             dy = arrow_length * np.sin(yaws[i])
             ax.arrow(trajectory[i, 0], trajectory[i, 1], dx, dy,
@@ -683,6 +1088,7 @@ def _default_phr_alm_constraints(traj_xy, start_pose, goal_pose, curvature_limit
         'ineq': {'curvature': g_curv},
         'eq': {'yaw_endpoint': h_yaw}
     }
+
 
 def optimize_control_points_multistep(
     middle_control_points, 
@@ -778,7 +1184,8 @@ def optimize_control_points_multistep(
             traj_xy = bspline_layer(control_points)
             
             # 计算cost
-            cost = cost_on_dense_trajectory(
+            # cost = cost_on_dense_trajectory(
+            cost = cost_on_dense_trajectory_tail_risk(
                 traj_xy, start_pose, goal_pose,
                 stability_cost_map, map_info, device
             )
@@ -1033,7 +1440,7 @@ def generate_stability_cost_map(nx, ny, nz, map_info, device='cuda'):
             res_chunk = compute_esdf_batch(nx_dev, ny_dev, nz_dev, q_chunk,
                                            resolution=resolution,
                                            origin=(origin[0], origin[1]),
-                                           yaw_weight=1.4,
+                                           yaw_weight=SAFETY_COST_CONFIG.yaw_esdf_weight,
                                            search_radius=5.0,
                                            chunk_cells=1000,
                                            device=device)
@@ -1051,7 +1458,7 @@ def generate_stability_cost_map(nx, ny, nz, map_info, device='cuda'):
             res_chunk = compute_esdf_batch(nx_cpu, ny_cpu, nz_cpu, q_chunk_cpu,
                                            resolution=resolution,
                                            origin=(origin[0], origin[1]),
-                                           yaw_weight=1.4,
+                                           yaw_weight=SAFETY_COST_CONFIG.yaw_esdf_weight,
                                            search_radius=5.0,
                                            chunk_cells=500,
                                            device='cpu')
@@ -1157,6 +1564,16 @@ def generate_stability_cost_map(nx, ny, nz, map_info, device='cuda'):
     print("Stability cost map generated.")
     return cost_map
 
+def _stability_grid_indices(x, y, yaw, yaw_bins=MAP_YAW_BINS):
+    """Convert a world SE(2) pose to configured stability-map indices."""
+    origin_x, origin_y, origin_yaw = MAP_CONFIG.cost_map_origin
+    x_idx = int(np.floor((float(x) - origin_x) / MAP_RESOLUTION))
+    y_idx = int(np.floor((float(y) - origin_y) / MAP_RESOLUTION))
+    yaw_step = 2.0 * np.pi / int(yaw_bins)
+    yaw_idx = int(np.floor((float(yaw) - origin_yaw) / yaw_step)) % int(yaw_bins)
+    return x_idx, y_idx, yaw_idx
+
+
 def check_trajectory_reachability(trajectory_points, yaw_values, yaw_stability):
     """
     使用与 data_clean.py 一致的方法检查轨迹点的可达性
@@ -1175,14 +1592,13 @@ def check_trajectory_reachability(trajectory_points, yaw_values, yaw_stability):
         x, y = trajectory_points[i]
         yaw = yaw_values[i]
         
-        # 与 data_clean.py 完全一致的坐标转换
-        x_idx = int((x + 20) / 0.4)
-        y_idx = int((y + 20) / 0.4)
-        yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
+        x_idx, y_idx, yaw_idx = _stability_grid_indices(
+            x, y, yaw, yaw_stability.shape[2]
+        )
         
         # 边界检查和稳定性判断
-        if 0 <= x_idx < yaw_stability.shape[0] and 0 <= y_idx < yaw_stability.shape[1]:
-            yaw_stability_value = yaw_stability[x_idx, y_idx, yaw_idx]
+        if 0 <= y_idx < yaw_stability.shape[0] and 0 <= x_idx < yaw_stability.shape[1]:
+            yaw_stability_value = yaw_stability[y_idx, x_idx, yaw_idx]
             is_unreachable = (yaw_stability_value == 0)
         else:
             is_unreachable = True  # 超出地图边界
@@ -1209,20 +1625,27 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=5, diffu
     Returns:
         trajectories: (num_paths, N, 3) 轨迹 [x, y, theta]
             - 如果reconstruct_trajectory=True: N=num_traj_points
-            - 如果reconstruct_trajectory=False: N=n_path_steps（控制点数）
+            - 如果reconstruct_trajectory=False: N=26（含起终点的完整控制点）
     """
     model.eval()
-    
+    base_model = model.module if hasattr(model, 'module') else model
+    coordinate_scale = float(base_model.coordinate_scale)
+    if not np.isclose(coordinate_scale, MAP_HALF_EXTENT, rtol=0.0, atol=1e-6):
+        raise ValueError(
+            f"模型 coordinate_scale={coordinate_scale}，"
+            f"当前地图配置要求 {MAP_HALF_EXTENT}"
+        )
+
     # 归一化起点终点并转换为4维 (x, y, cos(θ), sin(θ))
     start_normalized = torch.zeros(4, device=start_point.device)
-    start_normalized[:2] = start_point[:2] / 20.0  # x,y归一化
+    start_normalized[:2] = start_point[:2] / coordinate_scale
     start_normalized[2] = torch.cos(start_point[2])  # cos(θ)
     start_normalized[3] = torch.sin(start_point[2])  # sin(θ)
     start_normalized[:2] = torch.clamp(start_normalized[:2], -1.0, 1.0)
     start_normalized = start_normalized.unsqueeze(0)  # (1, 4)
     
     goal_normalized = torch.zeros(4, device=goal_point.device)
-    goal_normalized[:2] = goal_point[:2] / 20.0
+    goal_normalized[:2] = goal_point[:2] / coordinate_scale
     goal_normalized[2] = torch.cos(goal_point[2])  # cos(θ)
     goal_normalized[3] = torch.sin(goal_point[2])  # sin(θ)
     goal_normalized[:2] = torch.clamp(goal_normalized[:2], -1.0, 1.0)
@@ -1284,18 +1707,48 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=5, diffu
     
     return trajectories
 
+
+def extract_middle_control_points(full_control_points, expected_middle_points=24):
+    """从含起终点的完整 B 样条控制点中提取网络输出的中间点。
+
+    ``model.sample(..., reconstruct_trajectory=False)`` 返回的是
+    ``[start, middle_1, ..., middle_24, goal]``，而不是单独的 24 个中间点。
+    """
+    if not torch.is_tensor(full_control_points):
+        full_control_points = torch.as_tensor(full_control_points, dtype=torch.float32)
+    if full_control_points.ndim != 2 or full_control_points.shape[1] < 2:
+        raise ValueError(
+            "full_control_points must have shape (num_control_points,2/3), got "
+            f"{tuple(full_control_points.shape)}"
+        )
+
+    expected_full_points = expected_middle_points + 2
+    if full_control_points.shape[0] != expected_full_points:
+        raise ValueError(
+            f"expected {expected_full_points} complete control points "
+            f"(1+{expected_middle_points}+1), got {full_control_points.shape[0]}"
+        )
+    return full_control_points[1:-1, :2]
+
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # --- 0. 加载地形数据 ---
     # from dataLoader_uneven import UnevenPathDataLoader
     from dataLoader_dit import UnevenPathDataLoader
-    env_list = ['env000010']
-    # dataFolder = '/home/yrf/MPT/data/sim_dataset/val'
-    dataFolder = '/home/sdu/MPT/data/sim_dataset/val'
+    # env_list = ['env000010']
+    envNum = np.random.randint(0, 99)
+    env_list = [f'env{envNum:06d}']
+    dataFolder = str(MAP_CONFIG.dataset_root / 'val')
     # dataset = UnevenPathDataLoader(env_list, dataFolder)
     dataset = UnevenPathDataLoader(env_list, dataFolder, True)
-    path_index = 43
+    requested_path_index = 42
+    path_index = min(requested_path_index, len(dataset) - 1)
+    if path_index != requested_path_index:
+        print(
+            f"Requested path index {requested_path_index} exceeds dataset size "
+            f"{len(dataset)}; using {path_index} instead."
+        )
     sample = dataset[path_index]
     if sample is None:
         raise ValueError(f"Sample at index {path_index} is invalid.")
@@ -1308,14 +1761,10 @@ if __name__ == "__main__":
     nz = torch.abs(nz)  # 使用法向量的绝对值
 
     # --- 1. 定义代价地图参数并生成地图 ---
-    map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
-    resolution = 0.4
-    origin = (-20.0, -20.0, -np.pi) # x, y, yaw
-    map_info = {
-        'resolution': resolution,
-        'origin': origin,
-        'size': map_size
-    }
+    map_info = MAP_CONFIG.cost_map_info()
+    map_size = map_info['size']
+    resolution = map_info['resolution']
+    origin = map_info['origin']
 
     # !! 核心步骤：生成稳定性代价地图 !!
     # stability_cost_map = generate_stability_cost_map(nx, ny, nz, map_info, device)
@@ -1345,8 +1794,8 @@ if __name__ == "__main__":
     # 'pmf_onestep': 一步预测方法（快速）
     # 'euler': 一阶Euler方法（快速，但精度较低）
     # 'heun': 二阶Heun方法（较慢，但精度更高）
-    # solver = 'pmf_onestep'  # 快速的一步预测方法
-    solver = 'pmf_refined'
+    solver = 'pmf_onestep'  # 快速的一步预测方法
+    # solver = 'pmf_refined'
     # solver = 'euler'  # 可选：速度更快
     diffusion_step = 3
     # solver = 'heun'  # 推荐：精度更高
@@ -1365,10 +1814,16 @@ if __name__ == "__main__":
     _ = model.to(device)
     
     if best:
-        checkpoint = torch.load(osp.join(modelFolder, f'stage{stage}_best_model.pth'))
+        checkpoint = torch.load(
+            osp.join(modelFolder, f'stage{stage}_best_model.pth'),
+            map_location=device,
+        )
         print(f"Loaded best stage {stage} model.")
     else:
-        checkpoint = torch.load(osp.join(modelFolder, f'checkpoint_stage{stage}_epoch_{epoch}.pth'))
+        checkpoint = torch.load(
+            osp.join(modelFolder, f'checkpoint_stage{stage}_epoch_{epoch}.pth'),
+            map_location=device,
+        )
         print(f"Loaded stage {stage} model from epoch {epoch}.")
     
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -1388,15 +1843,15 @@ if __name__ == "__main__":
     ), axis=2), dtype=torch.float32)  # [H, W, 3]
 
     predTrajs = generate_paths(model, 
-                                  map_input=encoder_input.permute(2, 0, 1)[None, :].cuda(),
+                                  map_input=encoder_input.permute(2, 0, 1)[None, :].to(device),
                                   start_point=torch.tensor(start_pos).float().to(device),
                                   goal_point=torch.tensor(goal_pos).float().to(device),
                                   num_paths=1,  # 生成多条轨迹
                                   diffusion_step=diffusion_step,
-                                  reconstruct_trajectory=False,  # 从控制点重建轨迹
-                                  num_traj_points=100,  # 重建为100个点
+                                  reconstruct_trajectory=False,  # 直接返回含起终点的完整控制点
+                                  num_traj_points=100,  # 此模式下不使用
                                   solver=solver  # 传递求解器类型
-                                 )  # (num_pred_paths, 100, 3) - 100个重建的轨迹点
+                                 )  # (num_pred_paths, 26, 3) - 完整控制点
         
     
     predTraj = predTrajs[0]
@@ -1413,18 +1868,19 @@ if __name__ == "__main__":
     start_t = torch.tensor(start_pos, dtype=torch.float32, device=device).unsqueeze(0)
     goal_t  = torch.tensor(goal_pos,  dtype=torch.float32, device=device).unsqueeze(0)
 
-    # --- 3. 初始化并运行优化器 (使用 TrajectoryOptimizerSE2) ---
+    # --- 3. 初始化并运行优化器 ---
     B = 1  # batch size
-    # Ensure middle control points are only (x,y) and have batch dim: (B, N, 2)
-    if torch.is_tensor(pred_traj_t):
-        if pred_traj_t.ndim == 2 and pred_traj_t.shape[1] >= 2:
-            middle_control_points = pred_traj_t[:, :2].unsqueeze(0).clone()
-        else:
-            middle_control_points = pred_traj_t.unsqueeze(0).clone()
-    else:
-        # fallback: convert to tensor then take first two dims
-        tmp = torch.tensor(np.asarray(pred_traj_t), dtype=torch.float32, device=device)
-        middle_control_points = tmp[:, :2].unsqueeze(0).clone()
+    base_model = model.module if hasattr(model, 'module') else model
+    # n_path_steps is the number of physical edges (25), so decoding produces
+    # 26 complete control points and therefore 24 optimizable middle points.
+    expected_middle_points = int(base_model.n_path_steps) - 1
+
+    # sample(reconstruct_trajectory=False) 已经返回 [start, 24 middle, goal]。
+    # 优化器的输入只能是中间24点，后续再拼接固定起终点。
+    middle_control_points = extract_middle_control_points(
+        pred_traj_t,
+        expected_middle_points=expected_middle_points,
+    ).unsqueeze(0).to(device).clone()  # (B,24,2)
 
     # Extract start/goal x,y correctly (start_t/goal_t have shape (1,3)) -> (1,2)
     start_cp = start_t[:, :2].detach() # 起点，取出坐标(x,y)
@@ -1446,9 +1902,14 @@ if __name__ == "__main__":
     # start_cp and goal_cp already have batch dim (1,2), so unsqueeze at dim=1 to get (1,1,2)
     control_points = torch.cat([
         start_cp.unsqueeze(1),  # (B,1,2)
-        middle_control_points,   # (B, N, 2)
+        middle_control_points,   # (B,24,2)
         goal_cp.unsqueeze(1)     # (B,1,2)
-    ], dim=1)  # 得到 (B, num_control_points, 2)
+    ], dim=1)  # (B,26,2)
+    if control_points.shape[1] != expected_middle_points + 2:
+        raise RuntimeError(
+            f"invalid full control-point count: expected {expected_middle_points + 2}, "
+            f"got {control_points.shape[1]}"
+        )
     
     initial_traj = bspline_layer(control_points)  # (B,100,2)
     # compute yaw (theta) from xy and append as third dimension -> (B,100,3)
@@ -1537,12 +1998,14 @@ if __name__ == "__main__":
     print("="*100 + "\n")
     
     # 计算 yaw_stability 地图（用于评估）
-    from dataLoader_uneven import compute_map_yaw_bins
-    yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=36)  # [H, W, 36]
+    from dataLoader_dit import compute_map_yaw_bins
+    yaw_stability = compute_map_yaw_bins(
+        nx, ny, nz, yaw_bins=MAP_YAW_BINS
+    )
     
     # 将 yaw_stability 从 (H, W, D) 转置为 (D, H, W) 格式供评估器使用
-    # compute_map_yaw_bins 返回 (H, W, 36)，评估器期望 (36, H, W)
-    yaw_stability_transposed = yaw_stability.permute(2, 0, 1)  # (36, H, W)
+    # compute_map_yaw_bins 返回 (H, W, D)，评估器期望 (D, H, W)
+    yaw_stability_transposed = yaw_stability.permute(2, 0, 1)
     
     # 创建评估器
     evaluator = TrajectoryEvaluator(
@@ -1577,10 +2040,9 @@ if __name__ == "__main__":
             x, y = trajectory_points[i]
             yaw = yaw_values[i]
             
-            # 坐标转换
-            x_idx = int((x + 20) / 0.4)
-            y_idx = int((y + 20) / 0.4)
-            yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
+            x_idx, y_idx, yaw_idx = _stability_grid_indices(
+                x, y, yaw, yaw_stability.shape[2]
+            )
             
             # 边界检查和稳定性判断
             # yaw_stability 的形状是 (H, W, D)，其中 H=y方向, W=x方向, D=yaw方向
@@ -1628,9 +2090,9 @@ if __name__ == "__main__":
     for i in range(min(5, len(initial_mid_points))):
         x, y = initial_mid_points[i]
         yaw = initial_mid_yaws[i]
-        x_idx = int((x + 20) / 0.4)
-        y_idx = int((y + 20) / 0.4)
-        yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
+        x_idx, y_idx, yaw_idx = _stability_grid_indices(
+            x, y, yaw, yaw_stability.shape[2]
+        )
         
         if 0 <= y_idx < yaw_stability.shape[0] and 0 <= x_idx < yaw_stability.shape[1]:
             stability_val = yaw_stability[y_idx, x_idx, yaw_idx].item() if torch.is_tensor(yaw_stability[y_idx, x_idx, yaw_idx]) else yaw_stability[y_idx, x_idx, yaw_idx]
@@ -1761,7 +2223,7 @@ if __name__ == "__main__":
     except Exception:
         yaw_idx = D // 2
     cost_slice_to_show = stability_cost_map[yaw_idx].cpu().numpy()  # (H, W)
-    map_extent = [origin[0], origin[0] + map_size[0]*resolution, origin[1], origin[1] + map_size[1]*resolution]
+    map_extent = list(MAP_BOUNDS)
 
     # --- 先单独检测一下原轨迹的控制点，是否存在会倾覆的点 ---
     initial_yaw_dense = initial_traj[0, :, 2]  # 初始轨迹的 yaw_dense
@@ -1773,7 +2235,7 @@ if __name__ == "__main__":
 
     # yaw_stability 已在评估部分计算，此处无需重复
     # from dataLoader_uneven import compute_map_yaw_bins
-    # yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=36)  # [H, W, 36]
+    # yaw_stability = compute_map_yaw_bins(nx, ny, nz, yaw_bins=MAP_YAW_BINS)
 
     def check_trajectory_reachability_consistent(trajectory_points, yaw_values, yaw_stability):
         """使用与 data_clean.py 完全一致的方法检查轨迹点的可达性"""
@@ -1783,10 +2245,9 @@ if __name__ == "__main__":
             x, y = trajectory_points[i]
             yaw = yaw_values[i]
             
-            # 与 data_clean.py 完全一致的坐标转换
-            x_idx = int((x + 20) / 0.4)
-            y_idx = int((y + 20) / 0.4)
-            yaw_idx = int((yaw + np.pi) / (2 * np.pi / 36)) % 36
+            x_idx, y_idx, yaw_idx = _stability_grid_indices(
+                x, y, yaw, yaw_stability.shape[2]
+            )
             
             # 边界检查和稳定性判断
             # yaw_stability 的形状是 (H, W, D)，其中 H=y方向, W=x方向, D=yaw方向

@@ -1,0 +1,25 @@
+{
+  "source_output": "diagnostics/stage2_coupling_abcd/per_sample.csv",
+  "teacher_pairs": "diagnostics/stage2_coupling_C250/optimizer_pairs.npz",
+  "pair_identity_check": {
+    "source_noise_equal": true,
+    "stage1_residual_equal": true,
+    "condition_id_equal": true,
+    "source_id_equal": true
+  },
+  "train": {
+    "sample_count": 36,
+    "valid_recovery_count": 36,
+    "safe_cost_median": 0.9156194627285004,
+    "safe_recovery_median": 1.1328107806014902,
+    "mode_preservation_rate": 0.7777777777777778
+  },
+  "heldout": {
+    "sample_count": 24,
+    "valid_recovery_count": 24,
+    "safe_cost_median": 5.473121404647827,
+    "safe_recovery_median": 0.2706504035123081,
+    "mode_preservation_rate": 0.8333333333333334
+  },
+  "recovery_formula": "(stage1_safe_cost - B_safe_cost) / (stage1_safe_cost - trust_region_teacher_safe_cost)"
+}

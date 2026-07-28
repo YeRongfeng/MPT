@@ -1,0 +1,2 @@
+path_id,sigma,num_centers,samples_per_center,num_trajectories,success_count,success_rate,center_success_rate_mean,center_success_rate_median,centers_with_at_least_80pct_success,centers_with_at_least_80pct_success_rate,cost_mean,cost_median,cost_multiplier_mean,cost_multiplier_median,noise_energy_per_dim_mean
+40,0.05,32,1,32,31,0.96875,0.96875,1.0,31,0.96875,0.004001582972705364,0.003724243026226759,1.0645899772644043,1.0079549551010132,1.936980128288269

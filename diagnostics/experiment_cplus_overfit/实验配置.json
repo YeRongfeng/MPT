@@ -1,0 +1,157 @@
+{
+  "实验": "C+ 小数据过拟合：C1 cost-only 对比 C2 teacher",
+  "参数": {
+    "dataset": "/home/yrf/MPT/data/dataset0/val",
+    "model_dir": "data/sim",
+    "checkpoint": "stage1_best_model.pth",
+    "num_envs": 3,
+    "paths_per_env": 20,
+    "select": 32,
+    "seed": 2026,
+    "teacher_steps": 300,
+    "teacher_lr": 0.01,
+    "teacher_grad_clip": 1.0,
+    "lambda_dev": 0.2,
+    "dev_scale_m": 1.0,
+    "lambda_len": 200.0,
+    "length_ratio_limit": 1.15,
+    "train_steps": 400,
+    "train_batch_size": 4,
+    "train_lr": 2e-05,
+    "train_grad_clip": 1.0,
+    "teacher_huber_beta": 0.1,
+    "lambda_teacher_safe": 0.01,
+    "trace_steps": [
+      0,
+      1,
+      5,
+      10,
+      20,
+      40,
+      80,
+      160,
+      240,
+      320,
+      400
+    ],
+    "eval_batch_size": 4,
+    "checkpoint_every": 80,
+    "resume_variant_checkpoints": false,
+    "plot_examples": 6,
+    "output_dir": "diagnostics/experiment_cplus_overfit",
+    "device": "cuda"
+  },
+  "地图配置": {
+    "dataset_root": "/home/yrf/MPT/data/dataset0",
+    "expected_environments": 100,
+    "size_meters": 20.0,
+    "grid_size": 100,
+    "yaw_bins": 36,
+    "half_extent": 10.0,
+    "resolution": 0.2,
+    "bounds": [
+      -10.0,
+      10.0,
+      -10.0,
+      10.0
+    ],
+    "cost_map_size": [
+      100,
+      100,
+      36
+    ],
+    "cost_map_origin": [
+      -10.0,
+      -10.0,
+      -3.141592653589793
+    ]
+  },
+  "安全代价配置": {
+    "map_size_meters": 20.0,
+    "reference_map_size_meters": 40.0,
+    "tail_ratio": 0.15,
+    "curvature_tail_ratio": 0.05,
+    "out_of_bound_tail_ratio": 0.05,
+    "d_safe_meters": 0.15,
+    "softplus_alpha": 10.0,
+    "curvature_limit": 1.4,
+    "boundary_safe_pixels": 1,
+    "obstacle_weight": 1.0,
+    "reference_curvature_weight": 1.0,
+    "out_of_bound_weight": 1.0,
+    "endpoint_weight": 1.0,
+    "quality_weight": 0.0001,
+    "quality_term": "jerk",
+    "yaw_esdf_weight": 1.4,
+    "curvature_weight": 0.25
+  },
+  "修正目标": {
+    "公式": "J=C_safe+lambda_dev*mean(||traj-traj0||^2/dev_scale^2)+lambda_len*ReLU(L/L0-gamma)^2",
+    "lambda_dev": 0.2,
+    "dev_scale_m": 1.0,
+    "lambda_len": 200.0,
+    "gamma": 1.15
+  },
+  "训练控制": {
+    "固定噪声": true,
+    "固定样本": true,
+    "shuffle": false,
+    "Fisher": false,
+    "学习率调度": false,
+    "dropout": false,
+    "weight_decay": 0.0,
+    "训练参数范围": "当前生成器全部参数",
+    "C1与C2初始化": "同一个Stage1 checkpoint"
+  },
+  "checkpoint": {
+    "路径": "data/sim/stage1_best_model.pth",
+    "sha256": "9b96dafcae27743c419b38470f00dcb5c7349230b3f3fb2cf120c7a9e75b1a92",
+    "epoch": 31,
+    "stage": 1
+  },
+  "环境": [
+    "env000015",
+    "env000040",
+    "env000064"
+  ],
+  "代码版本": {
+    "commit": "fb892dabebbf7ed30f458e20bbbf73445454deb4",
+    "branch": "sim",
+    "dirty": true,
+    "status": [
+      "M README.md",
+      " M dataLoader_dit.py",
+      " M dataset_visualize.py",
+      " M dit/Models.py",
+      " M eval_dit.py",
+      " M evaluation_results/detailed_evaluation_results.csv",
+      " M evaluation_results/evaluation_summary.json",
+      " M evaluation_results/metrics_comparison.csv",
+      " M evaluator.py",
+      " M grad_optimizer.py",
+      " M terrain_visualize.py",
+      " M train_dit.py",
+      " M train_fisher.py",
+      " M train_grpo.py",
+      " M train_langevin.py",
+      " M vis_dit.py",
+      "?? analyze_stage1_noise_geometry.py",
+      "?? build_stage1_diagnostic_report.py",
+      "?? diagnose_stage1_latent.py",
+      "?? diagnose_stage1_noise_perturb.py",
+      "?? diagnostics/",
+      "?? experiment_a_representation.py",
+      "?? experiment_cplus_overfit.py",
+      "?? map_config.py",
+      "?? run_stage1_noise_sweep.py",
+      "?? summarize_stage1_noise_sweep.py",
+      "?? test_radial_feasible_residual.py"
+    ]
+  },
+  "运行环境": {
+    "torch": "2.1.1+cu118",
+    "cuda": "11.8",
+    "device": "cuda",
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU"
+  }
+}

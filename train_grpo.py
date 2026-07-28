@@ -45,7 +45,7 @@ def trajectory_to_control_points(trajectory, num_middle_points=24):
     【语义说明】
     - 完整B样条需要26个控制点 = 起点(1) + 中间点(24) + 终点(1)
     - 起点和终点是固定的，由start_pose和goal_pose决定
-    - 网络只需要预测中间24个自由控制点
+    - 本函数只负责提取24个中间点；训练时会再拼回真实首尾，组成26点监督目标
     
     Args:
         trajectory: (B, N, 3) 轨迹张量 [x, y, theta]
@@ -488,7 +488,12 @@ def generate_gr_awf_pseudo_targets(
     goal_norm_stacked = goal_normalized.repeat_interleave(K, dim=0)
     start_pose_stacked = start_pose.repeat_interleave(K, dim=0)
     goal_pose_stacked = goal_pose.repeat_interleave(K, dim=0)
-    x0_anchor = middle_cp_normalized.repeat_interleave(K, dim=0)
+    full_cp_normalized = torch.cat([
+        start_normalized[:, None, :2],
+        middle_cp_normalized,
+        goal_normalized[:, None, :2],
+    ], dim=1)
+    x0_anchor = full_cp_normalized.repeat_interleave(K, dim=0)
 
     prev_training = model.training
     model.eval()
@@ -514,14 +519,15 @@ def generate_gr_awf_pseudo_targets(
         ).detach()
         x0_pseudo = torch.clamp(x0_pseudo, -1.0, 1.0)
 
+        # 伪标签生成属于推理过程：网络先输出完整26点，再覆盖真实首尾。
+        x0_pseudo[:, 0, :] = start_norm_stacked[:, :2]
+        x0_pseudo[:, -1, :] = goal_norm_stacked[:, :2]
+
     # 恢复原训练状态
     model.train(prev_training)
 
     # ===== Stage-2: 组内相对优势打分（黑盒 cost） =====
-    x0_pseudo_denorm = x0_pseudo * 20.0
-    start_cp = start_pose_stacked[:, :2].unsqueeze(1)
-    goal_cp = goal_pose_stacked[:, :2].unsqueeze(1)
-    full_control_points = torch.cat([start_cp, x0_pseudo_denorm, goal_cp], dim=1)  # (B*K, 26, 2)
+    full_control_points = x0_pseudo * 20.0  # (B*K, 26, 2)
 
     bspline_layer = DifferentiableBSpline(
         num_control_points=26,
@@ -564,7 +570,8 @@ def generate_gr_awf_pseudo_targets(
             weights = (1.0 - uniform_mix) * weights + uniform_mix * (torch.ones_like(weights) / K)
 
     # ===== Stage-3: 组内重采样/选择为新的 pseudo GT（detach） =====
-    x0_group = x0_pseudo.view(B, K, N, D)
+    # GR-AWF只替换训练数据的24个中间点；端点由原始条件继续提供。
+    x0_group = x0_pseudo[:, 1:-1, :].view(B, K, N, D)
 
     # Top-M 截断（工程折中）：去掉明显劣质轨迹，再在幸存者内重采样
     if top_m is None:
@@ -704,8 +711,8 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # =================== B样条控制点转换 ===================
     # 【语义说明】
     # - 完整B样条：26个控制点 = 起点(1) + 中间点(24) + 终点(1)
-    # - 起点/终点：固定的，从start_pose/goal_pose提取
-    # - 中间24个点：网络预测的自由控制点
+    # - 起点/终点：从start_pose/goal_pose提取并加入训练目标
+    # - 网络对完整26点统一加噪、统一预测；推理结束后才覆盖真实首尾
     # 
     # 【第二阶段特殊处理】
     # - 第一阶段（current_stage==1）：仅使用模仿学习数据
@@ -838,6 +845,13 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
             + pseudo_replace_ratio * pseudo_cp_normalized
         )
         stage2_relabel_active = True
+
+    # pMF状态包含完整26个控制点；首尾也参与加噪和主损失。
+    control_cp_normalized = torch.cat([
+        start_normalized[:, None, :2],
+        middle_cp_normalized,
+        goal_normalized[:, None, :2],
+    ], dim=1)
     
     # ===== pixel Mean Flow: 连续时间采样 =====
     # 采样 t 和 r (0 <= r <= t <= 1)
@@ -847,7 +861,7 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         t = model.sample_timesteps(B, device=device)
     t = torch.clamp(t, min=1e-4, max=1.0 - 1e-4) # 避免极端值
     r = torch.rand_like(t) * t
-    noise_cp = torch.randn_like(middle_cp_normalized)
+    noise_cp = torch.randn_like(control_cp_normalized)
 
     # 准备 JVP 需要的 functional 环境
     if hasattr(model, 'module'):
@@ -901,14 +915,14 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         return (z_arg - p_x0) / (t_v + 1e-5)
 
     # 2. 准备 JVP 的输入 (Primals) 和 变化率 (Tangents)
-    target_v = noise_cp - middle_cp_normalized # dz/dt 的真值
+    target_v = noise_cp - control_cp_normalized  # 完整26点的 dz/dt 真值
 
     # noisy_cp 必须在 requires_grad 环境下生成，确保导数链条完整
     with torch.enable_grad():
         t.requires_grad_(True)
         t_v = t.view(-1, 1, 1)
         # 显式重算 noisy_cp 确保它是 t 的函数
-        z_t = (1.0 - t_v) * middle_cp_normalized + t_v * noise_cp
+        z_t = (1.0 - t_v) * control_cp_normalized + t_v * noise_cp
         
         # Primals: 当前点
         primals = (z_t, t, r)
@@ -929,19 +943,19 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     V_theta = u_out + (t.view(-1, 1, 1) - r.view(-1, 1, 1)).detach() * du_dt_full.detach()
 
     if loss_type == 'v':
-        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 24, 2)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 26, 2)
     elif loss_type == 'x0':
         # x0_rec = z_t - t * V_theta
         pred_x0_corrected = z_t - t.view(-1, 1, 1) * V_theta
-        main_loss_all = F.mse_loss(pred_x0_corrected, middle_cp_normalized, reduction='none')  # (B, 24, 2)
+        main_loss_all = F.mse_loss(pred_x0_corrected, control_cp_normalized, reduction='none')  # (B, 26, 2)
     else:
         # epsilon 空间的 pMF 修正写法：pred_eps_corrected = V_theta + pred_x0_corrected
         # 但推荐统一使用 v-loss 以符合论文实现
-        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none') # (B, 24, 2)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 26, 2)
     
     # 【第二阶段特殊处理】分离模仿和优化两部分的损失，然后加权
     if stage2_mix_loss:
-        # 分离损失：(2B, 24, 2) -> (B, 24, 2) + (B, 24, 2)
+        # 分离损失：(2B, 26, 2) -> (B, 26, 2) + (B, 26, 2)
         main_loss_imitation = main_loss_all[:len(main_loss_all)//2].mean()  # 前半部分
         main_loss_optimized = main_loss_all[len(main_loss_all)//2:].mean()   # 后半部分
         
@@ -990,12 +1004,14 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     if (not is_training) and current_stage == 2 and ('cost_map' in batch):
         from grad_optimizer import cost_on_dense_trajectory
 
-        x0_middle_pred = z_t - t.view(-1, 1, 1) * u_out  # (B, 24, 2), normalized
-        x0_middle_denorm = torch.clamp(x0_middle_pred, -1.0, 1.0) * 20.0
-
-        start_cp = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
-        goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
-        full_ctrl_points = torch.cat([start_cp, x0_middle_denorm, goal_cp], dim=1)  # (B, 26, 2)
+        full_ctrl_points = torch.clamp(
+            z_t - t.view(-1, 1, 1) * u_out, -1.0, 1.0
+        )  # (B, 26, 2), normalized
+        # 验证属于推理过程，生成完成后覆盖真实端点。
+        full_ctrl_points = full_ctrl_points.clone()
+        full_ctrl_points[:, 0, :] = start_normalized[:, :2]
+        full_ctrl_points[:, -1, :] = goal_normalized[:, :2]
+        full_ctrl_points = full_ctrl_points * 20.0
 
         bspline_layer = DifferentiableBSpline(
             num_control_points=26,
@@ -1373,7 +1389,7 @@ if __name__ == "__main__":
         n_position=15*15,
         dropout=0.1,
         train_shape=[12, 12],
-        n_path_steps=24,  # 24个B样条控制点 (x,y)
+        n_path_steps=24,  # 24个中间点；pMF状态和网络输出为完整26点
         diffusion_steps=50,
         prediction_type=prediction_type,  # 'epsilon', 'x0', or 'v' - 模型输出什么
         loss_type=loss_type  # 与prediction_type保持一致

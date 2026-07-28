@@ -39,7 +39,7 @@ def trajectory_to_control_points(trajectory, num_middle_points=24):
     【语义说明】
     - 完整B样条需要26个控制点 = 起点(1) + 中间点(24) + 终点(1)
     - 起点和终点是固定的，由start_pose和goal_pose决定
-    - 网络只需要预测中间24个自由控制点
+    - 本函数只负责提取24个中间点；训练时会再拼回真实首尾，组成26点监督目标
     
     Args:
         trajectory: (B, N, 3) 轨迹张量 [x, y, theta]
@@ -474,8 +474,8 @@ def diffusion_loss(model, batch, device, loss_weights=None, current_stage=1, pre
     # =================== B样条控制点转换 ===================
     # 【语义说明】
     # - 完整B样条：26个控制点 = 起点(1) + 中间点(24) + 终点(1)
-    # - 起点/终点：固定的，从start_pose/goal_pose提取
-    # - 中间24个点：网络预测的自由控制点
+    # - 起点/终点：从start_pose/goal_pose提取并加入训练目标
+    # - 网络对完整26点统一加噪、统一预测；推理结束后才覆盖真实首尾
     # 
     # 【两阶段目标】
     # - 第一阶段（current_stage==1）：使用数据轨迹做模仿学习。
@@ -596,6 +596,13 @@ def diffusion_loss(model, batch, device, loss_weights=None, current_stage=1, pre
     goal_normalized[:, 2] = torch.cos(goal_pose[:, 2])  # cos(θ)
     goal_normalized[:, 3] = torch.sin(goal_pose[:, 2])  # sin(θ)
     goal_normalized[:, :2] = torch.clamp(goal_normalized[:, :2], -1.0, 1.0)
+
+    # pMF状态包含完整26个控制点；首尾也参与加噪和主损失。
+    control_cp_normalized = torch.cat([
+        start_normalized[:, None, :2],
+        middle_cp_normalized,
+        goal_normalized[:, None, :2],
+    ], dim=1)
     
     # ===== pixel Mean Flow: 连续时间采样 =====
     # 采样 t 和 r (0 <= r <= t <= 1)
@@ -605,7 +612,7 @@ def diffusion_loss(model, batch, device, loss_weights=None, current_stage=1, pre
         t = model.sample_timesteps(B, device=device)
     t = torch.clamp(t, min=1e-4, max=1.0 - 1e-4) # 避免极端值
     r = torch.rand_like(t) * t
-    noise_cp = torch.randn_like(middle_cp_normalized)
+    noise_cp = torch.randn_like(control_cp_normalized)
 
     # 准备 JVP 需要的 functional 环境
     if hasattr(model, 'module'):
@@ -659,14 +666,14 @@ def diffusion_loss(model, batch, device, loss_weights=None, current_stage=1, pre
         return (z_arg - p_x0) / (t_v + 1e-5)
 
     # 2. 准备 JVP 的输入 (Primals) 和 变化率 (Tangents)
-    target_v = noise_cp - middle_cp_normalized # dz/dt 的真值
+    target_v = noise_cp - control_cp_normalized  # 完整26点的 dz/dt 真值
 
     # noisy_cp 必须在 requires_grad 环境下生成，确保导数链条完整
     with torch.enable_grad():
         t.requires_grad_(True)
         t_v = t.view(-1, 1, 1)
         # 显式重算 noisy_cp 确保它是 t 的函数
-        z_t = (1.0 - t_v) * middle_cp_normalized + t_v * noise_cp
+        z_t = (1.0 - t_v) * control_cp_normalized + t_v * noise_cp
         
         # Primals: 当前点
         primals = (z_t, t, r)
@@ -687,15 +694,15 @@ def diffusion_loss(model, batch, device, loss_weights=None, current_stage=1, pre
     V_theta = u_out + (t.view(-1, 1, 1) - r.view(-1, 1, 1)).detach() * du_dt_full.detach()
 
     if loss_type == 'v':
-        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 24, 2)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 26, 2)
     elif loss_type == 'x0':
         # x0_rec = z_t - t * V_theta
         pred_x0_corrected = z_t - t.view(-1, 1, 1) * V_theta
-        main_loss_all = F.mse_loss(pred_x0_corrected, middle_cp_normalized, reduction='none')  # (B, 24, 2)
+        main_loss_all = F.mse_loss(pred_x0_corrected, control_cp_normalized, reduction='none')  # (B, 26, 2)
     else:
         # epsilon 空间的 pMF 修正写法：pred_eps_corrected = V_theta + pred_x0_corrected
         # 但推荐统一使用 v-loss 以符合论文实现
-        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none') # (B, 24, 2)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 26, 2)
     
     # 阶段1的 target 是 imitation 控制点；阶段2的 target 是 Langevin 粒子。
     main_loss = main_loss_all.mean()
@@ -1146,7 +1153,7 @@ if __name__ == "__main__":
         n_position=15*15,
         dropout=0.1,
         train_shape=[12, 12],
-        n_path_steps=24,  # 24个B样条控制点 (x,y)
+        n_path_steps=24,  # 24个中间点；pMF状态和网络输出为完整26点
         diffusion_steps=50,
         prediction_type=prediction_type,  # 'epsilon', 'x0', or 'v' - 模型输出什么
         loss_type=loss_type  # 与prediction_type保持一致

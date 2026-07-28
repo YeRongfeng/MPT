@@ -1,0 +1,9 @@
+n_map,variant,train_recovery_median,heldout_recovery_median,heldout_teacher_error_median,heldout_mode_preservation,heldout_safe_at_k,heldout_abnormal_rate
+3,B_cost_only,0.563123,0.028105,1.004537,0.925,0.0,0.05
+3,D_induced_coupling,0.230165,0.002934,0.999648,0.975,0.0,0.0
+10,B_cost_only,0.684376,-0.083951,1.037472,0.950,0.0,0.0
+10,D_induced_coupling,0.402388,0.042348,0.999431,0.975,0.0,0.025
+30,B_cost_only,0.908847,0.038504,1.085714,0.875,0.0,0.25
+30,D_induced_coupling,0.628058,0.092930,1.007412,0.875,0.0,0.15
+60,B_cost_only,0.949322,0.163129,1.149009,0.725,0.0,0.35
+60,D_induced_coupling,0.610252,0.213845,1.005485,0.825,0.0,0.10

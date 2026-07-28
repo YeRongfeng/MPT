@@ -1,0 +1,10 @@
+{
+  "split": "test",
+  "complete_seeds": [],
+  "incomplete_seeds": {},
+  "control_checks": {},
+  "invalid_control_seeds": [],
+  "aggregate": {},
+  "scorer_decision_rule_result": "insufficient_results",
+  "warning": "No research conclusion is emitted unless a seed has all four controlled variants."
+}

@@ -78,13 +78,16 @@ python3 train_cdit.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=dat
 python3 train_grpo.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2
 python3 train_fisher.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2
 
-<<<<<<< HEAD
+python3 train_fisher.py --batchSize=20 --fileDir=data/sim 
+python3 train_fisher.py --batchSize=20 --fileDir=data/sim --resume data/sim/stage1_best_model.pth
+python3 train_fisher.py --batchSize=20 --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2
+python3 train_fisher.py --batchSize=20 --fileDir=data/sim --resume data/sim/stage2_best_model.pth --stage2_anchor data/sim/stage1_best_model.pth --stage 2
+
+python3 train_fisher.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage2_best_model.pth --stage2_anchor data/sim/stage1_best_model.pth --stage 2
+
 python3 train_fisher.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2 --fisher_mode none
 
 python3 train_fisher.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage2_best_model.pth --stage2_anchor data/sim/stage1_best_model.pth --stage 2 --fisher_mode none 
-=======
-python3 train_fisher.py --batchSize=20 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage2_best_model.pth --stage 2
->>>>>>> 8cb805ad61f4b935445901c7a8da6e47e34bf22b
 
 python3 train_langevin.py --batchSize=2 --dataFolder=data/sim_dataset --fileDir=data/sim --resume data/sim/stage1_best_model.pth --stage 2
 

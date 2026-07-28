@@ -223,7 +223,8 @@ if __name__ == "__main__":
     # envList = ['env000009']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     # dataset_path = 'data/terrain/train'
     envList = ['env000015']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    dataset_path = 'data/sim_dataset/train'
+    # dataset_path = 'data/sim_dataset/train'
+    dataset_path = 'data/dataset20/train'
     
     env_path = osp.join(dataset_path, envList[0])
     

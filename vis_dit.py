@@ -19,11 +19,11 @@ from dit.Models import PathDiffusionTransformer
 from dataLoader_uneven import get_encoder_input, receptive_field
 from eval_model_uneven import getHashTable, get_patch
 import torch
+from map_config import MAP_BOUNDS, MAP_CONFIG
 
 from relative_motion_utils import relative_motion_to_trajectory
 
-dataset_path = 'data/sim_dataset/val'
-# dataset_path = 'data/sim_dataset/train'
+dataset_path = str(MAP_CONFIG.dataset_root / "val")
 
 diffusion_step = None
 
@@ -44,20 +44,22 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=5,
     Returns:
         trajectories: (num_paths, N, 3) 轨迹 [x, y, theta]
             - 如果reconstruct_trajectory=True: N=num_traj_points
-            - 如果reconstruct_trajectory=False: N=n_path_steps（控制点数）
+            - 如果reconstruct_trajectory=False: N=26（完整控制点数，首尾已替换）
     """
     model.eval()
+    base_model = model.module if hasattr(model, "module") else model
+    coordinate_scale = base_model.coordinate_scale
     
     # 归一化起点终点并转换为4维 (x, y, cos(θ), sin(θ))
     start_normalized = torch.zeros(4, device=start_point.device)
-    start_normalized[:2] = start_point[:2] / 20.0  # x,y归一化
+    start_normalized[:2] = start_point[:2] / coordinate_scale
     start_normalized[2] = torch.cos(start_point[2])  # cos(θ)
     start_normalized[3] = torch.sin(start_point[2])  # sin(θ)
     start_normalized[:2] = torch.clamp(start_normalized[:2], -1.0, 1.0)
     start_normalized = start_normalized.unsqueeze(0)  # (1, 4)
     
     goal_normalized = torch.zeros(4, device=goal_point.device)
-    goal_normalized[:2] = goal_point[:2] / 20.0
+    goal_normalized[:2] = goal_point[:2] / coordinate_scale
     goal_normalized[2] = torch.cos(goal_point[2])  # cos(θ)
     goal_normalized[3] = torch.sin(goal_point[2])  # sin(θ)
     goal_normalized[:2] = torch.clamp(goal_normalized[:2], -1.0, 1.0)
@@ -75,6 +77,15 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=5,
             reconstruct_trajectory=reconstruct_trajectory,
             num_traj_points=num_traj_points
         )  # (num_paths, N, 2) - 只有(x,y)，已经是真实坐标（非归一化）
+
+    expected_points = (
+        num_traj_points if reconstruct_trajectory else base_model.num_control_points
+    )
+    if sampled_traj_xy.ndim != 3 or sampled_traj_xy.shape[1:] != (expected_points, 2):
+        raise RuntimeError(
+            f"Unexpected sampled trajectory shape {tuple(sampled_traj_xy.shape)}; "
+            f"expected (num_paths, {expected_points}, 2)"
+        )
     
     # 从xy坐标计算theta（通过差分计算切向量）
     def compute_theta_from_xy(traj_xy):
@@ -137,8 +148,7 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTrajs=None, out
         use_bezier_interpolate: 是否使用样条插值平滑轨迹（变量名保持兼容）
     """
     # 显示地形图
-    # ax.imshow(elevation_masked, extent=[-5, 5, -5, 5],
-    ax.imshow(elevation_masked, extent=[-20, 20, -20, 20],
+    ax.imshow(elevation_masked, extent=MAP_BOUNDS,
               origin='lower', cmap='terrain', aspect='equal')
     ax.grid(True, alpha=0.3)
     
@@ -169,9 +179,9 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTrajs=None, out
             # 预测轨迹已经通过sample方法中的B样条重建完成，直接使用
             # 将predTraj从(x,y,theta)格式转换为只包含(x,y)的格式用于绘制路径
             predTraj_xy = np.array([[point[0], point[1]] for point in predTraj])
-            # 先为预测轨迹补足起点和终点，只使用x,y坐标
-            predTraj_path = np.vstack((start_pos[:2], predTraj_xy, goal_pos[:2]))
-            output_dim = predTraj_path.shape[0]  # 已经包括起点和终点
+            # Models.py::sample() 已经覆盖首尾，不能在可视化层重复拼接。
+            predTraj_path = predTraj_xy
+            output_dim = predTraj_path.shape[0]
             
             # 绘制轨迹线段
             for i in range(output_dim-1):
@@ -321,7 +331,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_path
         ), axis=2), dtype=torch.float32)  # [H, W, 3]
 
         predTrajs = generate_paths(model, 
-                                  map_input=encoder_input.permute(2, 0, 1)[None, :].cuda(),
+                                  map_input=encoder_input.permute(2, 0, 1)[None, :].to(device),
                                   start_point=torch.tensor(start_pos).float().to(device),
                                   goal_point=torch.tensor(goal_pos).float().to(device),
                                   num_paths=num_pred_paths,  # 生成多条轨迹
@@ -347,7 +357,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_path
         
         # 创建左侧子图 - 预测轨迹
         ax_pred = fig.add_subplot(gs[row, col])
-        # 为预测轨迹补足起点和终点
+        # 预测轨迹已在Models.py::sample()中覆盖首尾。
         plot_single_trajectory(ax_pred, elevation_masked, trajectory, predTrajs, output_dim, is_pred=True, use_bezier_interpolate=use_bezier_interpolate)
         
         # 创建右侧子图 - 真实轨迹
@@ -388,7 +398,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_path
 if __name__ == "__main__":
     best = True
     # best = False
-    epoch = 9
+    epoch = 174
     stage = 2
     
     # ema = True
@@ -399,8 +409,8 @@ if __name__ == "__main__":
     # =================== 多轨迹配置 ===================
     # 设置为1: 只生成单条轨迹（确定性预测）
     # 设置为>1: 生成多条轨迹（展示扩散模型的多峰性）
-    # num_pred_paths = 100  # 每个场景生成100条不同的轨迹
-    num_pred_paths = 20  # 每个场景生成20条不同的轨迹
+    num_pred_paths = 100  # 每个场景生成100条不同的轨迹
+    # num_pred_paths = 20  # 每个场景生成20条不同的轨迹
     # num_pred_paths = 10  # 每个场景生成5条不同的轨迹
     # num_pred_paths = 5  # 每个场景生成5条不同的轨迹
     # num_pred_paths = 1  # 单条轨迹模式
@@ -414,6 +424,7 @@ if __name__ == "__main__":
     # solver = 'pmf_refined'
     # solver = 'euler'  # 可选：速度更快
     diffusion_step = 3
+    # diffusion_step = 30
     # solver = 'heun'  # 推荐：精度更高
     # diffusion_step = 50
     # ==================================================
@@ -427,8 +438,8 @@ if __name__ == "__main__":
     # 注意：变量名保持为 use_bezier_interpolate 以兼容现有代码，实际使用样条插值
 
     envNum = np.random.randint(0, 99)  # 随机选择环境id
-    # envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
-    envType_list = ['env000010']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    envType_list = [f'env{envNum:06d}']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
+    # envType_list = ['env000070']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     save_path = 'predictions'
 
     modelFolder = 'data/sim'
@@ -461,19 +472,16 @@ if __name__ == "__main__":
     # path_index_list = list(np.random.choice(range(200), size=6, replace=False))
     # path_index_list = list([163, 119, 340, 416, 148, 260])
     # path_index_list = list([0, 1, 2, 3, 4, 5])
+    path_index_list = list([0, 3, 6, 9, 12, 15])
     # path_index_list = list([2, 3, 7, 17, 23, 25])
     # path_index_list = list([0, 1, 2, 3, 4, 4])  # 测试前5条路径
     # path_index_list = list([5, 6, 7, 8, 9, 10])  # 测试前5条路径
     # path_index_list = list([10, 11, 12, 13, 14, 15])  # 测试前5条路径
     # path_index_list = list([16, 17, 18, 19, 20, 21])  # 测试前5条路径
-    path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
+    # path_index_list = list([22, 23, 24, 25, 26, 27])  # 测试前5条路径
     # path_index_list = list([28, 29, 30, 31, 32, 33])  # 测试前5条路径
     # path_index_list = list([34, 35, 36, 37, 38, 39])  # 测试前5条路径
-<<<<<<< HEAD
-    path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
-=======
     # path_index_list = list([40, 41, 42, 43, 44, 45])  # 测试前5条路径
->>>>>>> 8cb805ad61f4b935445901c7a8da6e47e34bf22b
     # path_index_list = list([46, 47, 48, 49, 44, 45])  # 测试前5条路径
     # print(f"Evaluating environment: {envType_random}")
     print(f"Evaluating path index: {path_index_list}")

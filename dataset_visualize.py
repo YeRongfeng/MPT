@@ -15,7 +15,8 @@ import torch
 import torch.nn.functional as F
 import json
 
-dataset_path = 'data/sim_dataset/train'
+dataset_path = 'data/dataset20/train'
+# dataset_path = 'data/sim_dataset/train'
 # dataset_path = 'data/sim_dataset/val'
 
 is_dense = True  # 数据集是否为密集采样轨迹
@@ -421,7 +422,7 @@ def plot_trajectory_heatmap(envType, save_path='predictions', grid_size=100):
     print(f"Saved: {save_file}")
 
 if __name__ == "__main__":
-    envType = 'env000014'  # 指定环境
+    envType = 'env000000'  # 指定环境
     save_path = 'predictions'
     
     print(f"Visualizing dataset for environment: {envType}")

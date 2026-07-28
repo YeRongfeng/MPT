@@ -1,0 +1,146 @@
+{
+  "args": {
+    "dataset": "/home/yrf/MPT/data/dataset0/val",
+    "model_dir": "data/sim",
+    "checkpoint": "stage1_best_model.pth",
+    "num_envs": 20,
+    "paths_per_env": 10,
+    "select": 50,
+    "iterations": 300,
+    "lr_grid": [
+      0.003,
+      0.01,
+      0.03
+    ],
+    "grad_clip": 1.0,
+    "seed": 2026,
+    "trace_steps": [
+      0,
+      1,
+      5,
+      10,
+      25,
+      50,
+      100,
+      200,
+      300
+    ],
+    "output_dir": "diagnostics/experiment_a_representation",
+    "plot_examples": 6,
+    "device": "cpu"
+  },
+  "map_config": {
+    "dataset_root": "/home/yrf/MPT/data/dataset0",
+    "expected_environments": 100,
+    "size_meters": 20.0,
+    "grid_size": 100,
+    "yaw_bins": 36,
+    "half_extent": 10.0,
+    "resolution": 0.2,
+    "bounds": [
+      -10.0,
+      10.0,
+      -10.0,
+      10.0
+    ],
+    "cost_map_size": [
+      100,
+      100,
+      36
+    ],
+    "cost_map_origin": [
+      -10.0,
+      -10.0,
+      -3.141592653589793
+    ]
+  },
+  "safety_cost_config": {
+    "map_size_meters": 20.0,
+    "reference_map_size_meters": 40.0,
+    "tail_ratio": 0.15,
+    "curvature_tail_ratio": 0.05,
+    "out_of_bound_tail_ratio": 0.05,
+    "d_safe_meters": 0.15,
+    "softplus_alpha": 10.0,
+    "curvature_limit": 1.4,
+    "boundary_safe_pixels": 1,
+    "obstacle_weight": 1.0,
+    "reference_curvature_weight": 1.0,
+    "out_of_bound_weight": 1.0,
+    "endpoint_weight": 1.0,
+    "quality_weight": 0.0001,
+    "quality_term": "jerk",
+    "yaw_esdf_weight": 1.4,
+    "curvature_weight": 0.25
+  },
+  "git": {
+    "commit": "fb892dabebbf7ed30f458e20bbbf73445454deb4",
+    "branch": "sim",
+    "dirty": true,
+    "status": [
+      "M README.md",
+      " M dataLoader_dit.py",
+      " M dataset_visualize.py",
+      " M dit/Models.py",
+      " M eval_dit.py",
+      " M evaluation_results/detailed_evaluation_results.csv",
+      " M evaluation_results/evaluation_summary.json",
+      " M evaluation_results/metrics_comparison.csv",
+      " M evaluator.py",
+      " M grad_optimizer.py",
+      " M terrain_visualize.py",
+      " M train_dit.py",
+      " M train_fisher.py",
+      " M train_grpo.py",
+      " M train_langevin.py",
+      " M vis_dit.py",
+      "?? analyze_stage1_noise_geometry.py",
+      "?? build_stage1_diagnostic_report.py",
+      "?? diagnose_stage1_latent.py",
+      "?? diagnose_stage1_noise_perturb.py",
+      "?? diagnostics/",
+      "?? experiment_a_representation.py",
+      "?? map_config.py",
+      "?? run_stage1_noise_sweep.py",
+      "?? summarize_stage1_noise_sweep.py",
+      "?? test_radial_feasible_residual.py"
+    ]
+  },
+  "torch_version": "2.1.1+cu118",
+  "cuda_version": "11.8",
+  "device": "cpu",
+  "gpu": null,
+  "checkpoint": {
+    "path": "data/sim/stage1_best_model.pth",
+    "epoch": 31,
+    "stage": 1,
+    "val_loss": 0.008742960309609771
+  },
+  "environments": [
+    "env000013",
+    "env000015",
+    "env000028",
+    "env000040",
+    "env000053",
+    "env000056",
+    "env000062",
+    "env000064",
+    "env000065",
+    "env000070",
+    "env000071",
+    "env000073",
+    "env000075",
+    "env000076",
+    "env000079",
+    "env000082",
+    "env000093",
+    "env000096",
+    "env000098",
+    "env000099"
+  ],
+  "optimizer": {
+    "name": "AdamW",
+    "weight_decay": 0.0,
+    "per_sample_grad_clip": 1.0
+  }
+}

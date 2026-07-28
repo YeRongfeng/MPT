@@ -4,6 +4,7 @@ train_dit.py - 训练不平坦地面路径预测模型(基于扩散模型)
 
 import numpy as np
 import pickle
+import random
 from contextlib import nullcontext
 
 import torch
@@ -28,6 +29,7 @@ from timm.utils import ModelEmaV2
 from ESDF3d_atpoint import compute_esdf_batch
 # from grad_optimizer import TrajectoryOptimizerSE2
 from dit.Models import PathDiffusionTransformer
+from map_config import MAP_CONFIG, MAP_HALF_EXTENT, discover_environments
 
 # B样条工具
 from bspline_utils import (
@@ -45,7 +47,7 @@ def trajectory_to_control_points(trajectory, num_middle_points=24):
     【语义说明】
     - 完整B样条需要26个控制点 = 起点(1) + 中间点(24) + 终点(1)
     - 起点和终点是固定的，由start_pose和goal_pose决定
-    - 网络只需要预测中间24个自由控制点
+    - 本函数只提取中间24点；训练时再拼入标签起终点，构成完整26点监督目标
     
     Args:
         trajectory: (B, N, 3) 轨迹张量 [x, y, theta]
@@ -116,320 +118,64 @@ def control_points_to_trajectory(control_points, num_output_points=100):
     return trajectory  # (B, num_output_points, 2)
 
 
-def compute_tangent_loss(pred_middle_cps, start_pose, goal_pose):
+def adaptive_pmf_loss(loss_all, norm_p=1.0, norm_eps=0.01):
     """
-    基于投影距离的切线约束 (比 Cosine Similarity 更强力且稳定)
-    
-    原理:
-    理想情况下，向量 V = P1 - P0 应该与方向向量 D = (cos, sin) 平行。
-    这意味着 V 和 D 的 2D 叉乘 (Cross Product) 应该为 0。
-    Cross = V_x * D_y - V_y * D_x
-    Loss = Cross^2 (本质上是 P1 到理想射线的垂直距离的平方)
-    
-    Args:
-        pred_middle_cps: (B, N, 2) 预测的中间控制点
-        start_pose: (B, 4) -> (x, y, cos, sin)
-        goal_pose:  (B, 4) -> (x, y, cos, sin)
-    """
-    # 1. 提取向量 P0 -> P1
-    p0 = start_pose[:, :2]
-    p1 = pred_middle_cps[:, 0, :]
-    vec_start = p1 - p0  # (B, 2)
-    
-    # 提取方向 D_start
-    d_start = start_pose[:, 2:] # (B, 2) -> (cos, sin)
-    
-    # 2. 提取向量 P_last -> P_goal
-    p_goal = goal_pose[:, :2]
-    p_last = pred_middle_cps[:, -1, :]
-    vec_end = p_goal - p_last # (B, 2)
-    
-    # 提取方向 D_goal
-    d_goal = goal_pose[:, 2:] # (B, 2)
-    
-    # ==========================================
-    # 核心修正 1: 计算 2D 叉乘 (Cross Product)
-    # Cross = |V|*|D|*sin(theta). 当平行时为0。
-    # 这等价于点到直线的垂直距离 (如果 D 是单位向量)
-    # ==========================================
-    
-    # Start 部分
-    # vec_start = (vx, vy), d_start = (dx, dy)
-    # cross = vx * dy - vy * dx
-    cross_start = vec_start[:, 0] * d_start[:, 1] - vec_start[:, 1] * d_start[:, 0]
-    
-    # End 部分 (注意方向是 P_last -> P_goal，应与 Goal 朝向一致)
-    cross_end = vec_end[:, 0] * d_goal[:, 1] - vec_end[:, 1] * d_goal[:, 0]
-    
-    # Loss 1: 垂直距离平方
-    dist_loss = torch.mean(cross_start ** 2) + torch.mean(cross_end ** 2)
-    
-    # ==========================================
-    # 核心修正 2: 防止反向 (Dot Product Constraint)
-    # 我们希望 P1 在 P0 前方，即 Dot > 0
-    # 如果 Dot < 0，说明倒车了，给予惩罚
-    # ==========================================
-    
-    # Start 部分 Dot
-    dot_start = vec_start[:, 0] * d_start[:, 0] + vec_start[:, 1] * d_start[:, 1]
-    # End 部分 Dot
-    dot_end = vec_end[:, 0] * d_goal[:, 0] + vec_end[:, 1] * d_goal[:, 1]
-    
-    # ReLU(-dot): 只有当 dot < 0 (反向) 时才有 loss
-    dir_loss = torch.mean(F.relu(-dot_start)) + torch.mean(F.relu(-dot_end))
-    
-    # 总 Loss
-    return dist_loss + dir_loss
+    Pixel/MeanFlow 风格的 per-sample adaptive weighting。
 
-def compute_smoothness_loss(trajectory, include_angle=False, threshold=None):
-    """
-    改进的平滑性损失 - 只惩罚超过阈值的急转弯
     Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-        include_angle: bool - 是否在平滑性计算中包含角度维度
-        threshold: float - 加速度阈值，只惩罚超过此值的加速度（None则惩罚所有）
+        loss_all: (B, ..., D) unreduced MSE loss
     Returns:
-        smoothness_loss: 标量
+        adp_loss: 用于反传的 adaptive loss
+        raw_loss: 原始 per-sample MSE 均值，仅用于诊断
+        weight_mean: stop-grad 权重均值，仅用于诊断
     """
-    # 位置部分 (x, y) 的一阶和二阶差分
-    pos_first_diff = trajectory[:, 1:, :2] - trajectory[:, :-1, :2]  # (B, N-1, 2)
-    pos_second_diff = pos_first_diff[:, 1:, :] - pos_first_diff[:, :-1, :]  # (B, N-2, 2)
-    
-    # 计算加速度的L2范数
-    acceleration_norm = torch.norm(pos_second_diff, dim=2)  # (B, N-2)
-    
-    if threshold is not None:
-        # 只惩罚超过阈值的加速度（软阈值）
-        # 使用ReLU：max(0, |a| - threshold)^2
-        excess_acceleration = torch.relu(acceleration_norm - threshold)
-        pos_smoothness = torch.mean(excess_acceleration ** 2)
+    loss_per_sample = loss_all.flatten(start_dim=1).mean(dim=1)
+    weight = (loss_per_sample + norm_eps).pow(norm_p).detach()
+    adp_loss = (loss_per_sample / weight).mean()
+    raw_loss = loss_per_sample.mean().detach()
+    weight_mean = weight.mean().detach()
+    return adp_loss, raw_loss, weight_mean
+
+
+def sparse_boundary_violation_loss(
+    points_normalized,
+    safe_bound=0.98,
+):
+    """Only penalize point coordinates that violate the safe box.
+
+    The loss is normalized by the number of active violating coordinates,
+    rather than all B*N*2 coordinates, so rare violations are not diluted.
+    """
+    if points_normalized.ndim != 3 or points_normalized.shape[-1] != 2:
+        raise ValueError(
+            "Expected normalized points shaped (B,N,2), got "
+            f"{tuple(points_normalized.shape)}"
+        )
+    if not 0.0 < safe_bound <= 1.0:
+        raise ValueError(f"safe_bound must be in (0, 1], got {safe_bound}")
+
+    violation = F.relu(points_normalized.abs() - safe_bound)
+    active = violation > 0
+    active_count = active.sum()
+    boundary_loss = (
+        violation.square().sum()
+        / active_count.to(violation.dtype).clamp_min(1.0)
+    )
+
+    per_sample_max = violation.flatten(start_dim=1).amax(dim=1)
+    oob_samples = per_sample_max > 0
+    if bool(oob_samples.any()):
+        oob_sample_loss = per_sample_max[oob_samples].square().mean()
     else:
-        # 原始版本：惩罚所有加速度
-        pos_smoothness = torch.mean(acceleration_norm ** 2)
-    
-    if include_angle:
-        # 角度部分：对theta做周期性感知的差分
-        theta = trajectory[:, :, 2]  # (B, N)
-        angle_first_diff = torch.atan2(torch.sin(theta[:, 1:] - theta[:, :-1]),
-                                       torch.cos(theta[:, 1:] - theta[:, :-1]))  # (B, N-1)
-        angle_second_diff = torch.atan2(torch.sin(angle_first_diff[:, 1:] - angle_first_diff[:, :-1]),
-                                        torch.cos(angle_first_diff[:, 1:] - angle_first_diff[:, :-1]))  # (B, N-2)
-        angle_acc_norm = torch.abs(angle_second_diff)  # (B, N-2)
-        
-        if threshold is not None:
-            angle_threshold = threshold * 0.1
-            excess_angle_acc = torch.relu(angle_acc_norm - angle_threshold)
-            angle_smoothness = torch.mean(excess_angle_acc ** 2)
-        else:
-            angle_smoothness = torch.mean(angle_acc_norm ** 2)
-        
-        smoothness_loss = pos_smoothness + angle_smoothness
-    else:
-        smoothness_loss = pos_smoothness
-    
-    return smoothness_loss
+        oob_sample_loss = violation.sum() * 0.0
 
-def compute_angle_smoothness_loss(trajectory):
-    """
-    计算角度平滑性损失 - 惩罚角速度本身和角加速度
-    使用theta的周期性感知差分计算角速度/角加速度
-    
-    **重要**：当trajectory包含固定的起点和终点时（22个点），
-    排除边界段的角速度约束（索引0和20），避免强制预测点角度向固定的起终点角度靠拢。
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        angle_loss: 标量
-    """
-    theta = trajectory[:, :, 2]  # (B, N)
-    
-    # 相邻点角度差（周期性感知）
-    delta = torch.atan2(torch.sin(theta[:, 1:] - theta[:, :-1]),
-                        torch.cos(theta[:, 1:] - theta[:, :-1]))  # (B, N-1)
-    angular_velocity = torch.abs(delta)  # (B, N-1)
-    
-    # **关键修改**：如果轨迹是22个点（包含起终点），排除边界段的角速度约束
-    N = trajectory.shape[1]
-    velocity_weights = torch.ones_like(angular_velocity)
-    
-    if N == 22:  # 完整轨迹（起点+20预测点+终点）
-        # 完全排除边界段：不约束"起点→第一个预测点"和"最后预测点→终点"的角度变化
-        # 让第一个和最后一个预测点的角度可以自由适应实际运动方向
-        velocity_weights[:, 0] = 0.0   # 排除起点到第一个预测点
-        velocity_weights[:, -1] = 0.0  # 排除最后一个预测点到终点
-    
-    velocity_loss = torch.mean((angular_velocity ** 2) * velocity_weights)
-    
-    # 计算角速度的变化（角加速度）
-    delta_diff = torch.atan2(torch.sin(delta[:, 1:] - delta[:, :-1]),
-                             torch.cos(delta[:, 1:] - delta[:, :-1]))  # (B, N-2)
-    angle_acc = torch.abs(delta_diff)  # (B, N-2)
-    
-    # **角加速度也需要排除边界相关的项**
-    # 对于22个点的轨迹，angle_acc有20个值（索引0-19）
-    # 索引0对应的是"起点→第一预测点→第二预测点"的角加速度
-    # 索引19对应的是"倒数第三预测点→倒数第二预测点→终点"的角加速度
-    if N == 22:
-        acc_weights = torch.ones_like(angle_acc)
-        acc_weights[:, 0] = 0.0   # 排除涉及起点的角加速度
-        acc_weights[:, -1] = 0.0  # 排除涉及终点的角加速度
-        acceleration_loss = torch.mean((angle_acc ** 2) * acc_weights)
-    else:
-        acceleration_loss = torch.mean(angle_acc ** 2)
-    
-    # 混合损失：角速度 + 角加速度
-    # 只约束预测点内部的角度平滑性，不约束与固定起终点的衔接
-    angle_loss = velocity_loss + 0.5 * acceleration_loss
-    
-    return angle_loss
-
-def compute_angle_consistency_loss(trajectory):
-    """
-    计算角度一致性损失 - 防止倒车（使用heading向量与运动方向的点积）
-    该损失确保运动方向与车辆朝向一致（防止倒车）
-    
-    **重要**：当trajectory包含固定的起点和终点时（22个点），
-    只计算预测点内部的角度一致性（索引1到20），排除边界段（0→1和20→21）
-    以避免与固定的起终点角度产生冲突。
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        angle_loss: 标量
-    """
-    # 提取位置和朝向向量
-    positions = trajectory[:, :, :2]  # (B, N, 2)
-    theta = trajectory[:, :, 2]  # (B, N)
-    
-    # 车辆朝向向量：(cos(θ), sin(θ))
-    heading_vectors = torch.stack([torch.cos(theta), torch.sin(theta)], dim=2)  # (B, N, 2)
-    
-    # 归一化朝向向量
-    eps = 1e-6
-    heading_norms = torch.norm(heading_vectors, dim=2, keepdim=True)  # (B, N, 1)
-    heading_vectors_norm = heading_vectors / (heading_norms + eps)  # (B, N, 2)
-    
-    # 计算运动方向向量（从当前点指向下一个点）
-    motion_vectors = positions[:, 1:, :] - positions[:, :-1, :]  # (B, N-1, 2)
-    
-    # 计算运动向量的长度，用于归一化和过滤静止点
-    motion_lengths = torch.norm(motion_vectors, dim=2, keepdim=True)  # (B, N-1, 1)
-    
-    # 只对运动距离足够大的点计算损失
-    valid_mask = (motion_lengths.squeeze(2) > eps)  # (B, N-1)
-    
-    # **关键修改**：如果轨迹是22个点（包含起终点），排除边界段
-    # 只计算索引1到20之间的角度一致性（预测点内部）
-    N = trajectory.shape[1]
-    if N == 22:  # 完整轨迹（起点+20预测点+终点）
-        # 排除第一段（起点→第一个预测点，索引0）和最后一段（最后一个预测点→终点，索引20）
-        boundary_mask = torch.ones_like(valid_mask, dtype=torch.bool)
-        boundary_mask[:, 0] = False   # 排除起点→第一个预测点
-        boundary_mask[:, -1] = False  # 排除最后一个预测点→终点
-        valid_mask = valid_mask & boundary_mask
-    
-    # 如果没有有效的运动点，返回0损失
-    if not valid_mask.any():
-        return torch.tensor(0.0, device=trajectory.device)
-    
-    # 归一化运动向量
-    motion_vectors_norm = motion_vectors / (motion_lengths + eps)  # (B, N-1, 2)
-    
-    # 使用当前点的归一化朝向向量
-    current_headings = heading_vectors_norm[:, :-1, :]  # (B, N-1, 2)
-    
-    # 计算朝向向量与运动向量的点积（余弦相似度）
-    # dot = cos(θ)，当θ=0时（前进）dot=1，当θ=π时（倒车）dot=-1
-    cos_similarity = (current_headings * motion_vectors_norm).sum(dim=2)  # (B, N-1)
-    
-    # 只计算有效点的损失
-    # 使用 (1 - cos_similarity) 作为损失：
-    # - 前进时 cos ≈ 1，损失 ≈ 0
-    # - 倒车时 cos ≈ -1，损失 ≈ 2
-    masked_loss = (1 - cos_similarity) * valid_mask.float()  # (B, N-1)
-    angle_loss = masked_loss.sum() / (valid_mask.sum() + eps)
-    
-    # 最终检查NaN
-    if torch.isnan(angle_loss) or torch.isinf(angle_loss):
-        return torch.tensor(0.0, device=trajectory.device)
-    
-    return angle_loss
-
-def compute_uniformity_loss(trajectory):
-    """
-    计算均匀性损失 - 相邻点之间距离的方差
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        uniformity_loss: 标量
-    """
-    # 计算相邻点的欧几里得距离
-    pos_diff = trajectory[:, 1:, :2] - trajectory[:, :-1, :2]  # (B, N-1, 2)
-    distances = torch.norm(pos_diff, dim=2)  # (B, N-1)
-    # 距离的方差（希望距离均匀）
-    mean_dist = torch.mean(distances, dim=1, keepdim=True)  # (B, 1)
-    uniformity_loss = torch.mean((distances - mean_dist) ** 2)
-    return uniformity_loss
-
-def compute_sincos_normalization_loss(trajectory):
-    """
-    兼容保留：theta范围正则（替代sin/cos归一化损失）
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-    Returns:
-        norm_loss: 标量
-    """
-    theta = trajectory[:, :, 2]  # (B, N)
-    angle_overflow = torch.abs(theta) - torch.pi
-    angle_overflow = torch.clamp(angle_overflow, min=0.0)
-    norm_loss = torch.mean(angle_overflow ** 2)
-    return norm_loss
-
-def compute_curvature_constraint_loss(trajectory, max_curvature=2.0):
-    """
-    曲率约束损失 - 只惩罚超过最大曲率的点
-    使用三点法计算曲率：κ = 2*sin(θ) / d
-    其中θ是转角，d是弦长
-    
-    Args:
-        trajectory: (B, N, 3) - 轨迹序列，格式为(x, y, theta)
-        max_curvature: float - 最大允许曲率（单位：1/米）
-    Returns:
-        curvature_loss: 标量
-    """
-    positions = trajectory[:, :, :2]  # (B, N, 2)
-    
-    # 计算三个连续点形成的向量
-    vec1 = positions[:, 1:-1, :] - positions[:, :-2, :]  # (B, N-2, 2) P1->P2
-    vec2 = positions[:, 2:, :] - positions[:, 1:-1, :]    # (B, N-2, 2) P2->P3
-    
-    # 计算转角（使用向量夹角）
-    # cos(θ) = (v1·v2) / (|v1||v2|)
-    dot_product = (vec1 * vec2).sum(dim=2)  # (B, N-2)
-    norm1 = torch.norm(vec1, dim=2)  # (B, N-2)
-    norm2 = torch.norm(vec2, dim=2)  # (B, N-2)
-    
-    eps = 1e-6
-    cos_angle = dot_product / (norm1 * norm2 + eps)
-    # 数值稳定性：不仅clamp到[-1,1]，还要避免正好在边界（acos梯度无穷大）
-    cos_angle = torch.clamp(cos_angle, -0.9999, 0.9999)
-    angle = torch.acos(cos_angle)  # (B, N-2) 转角 [0, π]
-    
-    # 计算弦长（P1到P3的距离）
-    chord_length = torch.norm(positions[:, 2:, :] - positions[:, :-2, :], dim=2) + eps  # (B, N-2)
-    
-    # 近似曲率：κ ≈ 2*sin(θ/2) / chord_length
-    # 简化：κ ≈ θ / chord_length (小角度近似)
-    curvature = angle / chord_length  # (B, N-2)
-    
-    # 只惩罚超过最大曲率的点
-    excess_curvature = curvature - max_curvature  # (B, N-2)
-    # curvature_loss = torch.mean(torch.relu(excess_curvature) ** 2)
-    curvature_loss = torch.mean(F.softplus(excess_curvature, beta=2.0))
-    
-    return curvature_loss
+    diagnostics = {
+        'oob_sample_loss': oob_sample_loss,
+        'oob_rate': oob_samples.float().mean(),
+        'max_oob': per_sample_max.max(),
+        'active_boundary_fraction': active.float().mean(),
+    }
+    return boundary_loss, diagnostics
 
 
 def stage2_optimize_control_points(
@@ -439,7 +185,7 @@ def stage2_optimize_control_points(
     """
     【第二阶段优化】对每个batch样本进行采样和优化，返回1条优化的控制点
     
-    关键：保证对每个样本返回形状(B, 24, 2)的优化中间控制点
+    在缩放零和边残差空间优化，并在计算B样条代价时解码为26个控制点。
     
     Args:
         model: PathDiffusionTransformer 模型
@@ -462,6 +208,9 @@ def stage2_optimize_control_points(
     
     # 从 start_pose 推导 batch size
     B = start_pose.shape[0]
+    base_model = model.module if hasattr(model, 'module') else model
+    representation = base_model.trajectory_representation
+    coordinate_scale = base_model.coordinate_scale
     
     # B样条层
     bspline_layer = DifferentiableBSpline(
@@ -484,27 +233,26 @@ def stage2_optimize_control_points(
                 num_traj_points=100
             )  # (B, 26, 2)
         
-        # 提取中间控制点（去掉起终点）
-        x0_sample = sampled_control_points[:, 1:-1, :].clone().detach()  # (B, 24, 2)
-        x0_sample.requires_grad_(True)
+        sampled_control_points_normalized = sampled_control_points / coordinate_scale
+        residual_sample = representation.encode(
+            sampled_control_points_normalized,
+            start_normalized[:, :2],
+            goal_normalized[:, :2],
+        ).detach()
+        residual_sample.requires_grad_(True)
         
         # 为整个batch创建优化器
-        optimizer = torch.optim.AdamW([x0_sample], lr=lr)
-        
-        # 起点和终点
-        start_cp = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
-        goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
+        optimizer = torch.optim.AdamW([residual_sample], lr=lr)
         
         # batch级优化循环
         for iter in range(num_iterations):
             optimizer.zero_grad()
             
-            # 拼接完整控制点（整个batch）
-            full_control_points = torch.cat([
-                start_cp,       # (B, 1, 2)
-                x0_sample,      # (B, 24, 2)
-                goal_cp         # (B, 1, 2)
-            ], dim=1)  # (B, 26, 2)
+            full_control_points = representation.decode(
+                residual_sample,
+                start_normalized[:, :2],
+                goal_normalized[:, :2],
+            ) * coordinate_scale
             
             # 使用B样条重建轨迹
             reconstructed_traj = bspline_layer(full_control_points)  # (B, 100, 2)
@@ -523,50 +271,57 @@ def stage2_optimize_control_points(
             cost.backward()
             
             # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_([x0_sample], 1.0)
+            torch.nn.utils.clip_grad_norm_([residual_sample], 1.0)
             
             # 优化步
             optimizer.step()
         
         # 返回优化后的控制点
-        optimized_middle_cp = x0_sample.detach()  # (B, 24, 2)
+        optimized_control_points = representation.decode(
+            residual_sample,
+            start_normalized[:, :2],
+            goal_normalized[:, :2],
+        ) * coordinate_scale
+        optimized_middle_cp = optimized_control_points[:, 1:-1, :].detach()
     
     return optimized_middle_cp
 
 
 
-def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epochs=100, is_training=True, current_stage=1, use_dense_trajectory=False, num_dense_points=100, prediction_type='x0'):
+def diffusion_loss(
+    model,
+    batch,
+    device,
+    loss_weights=None,
+    epoch=0,
+    total_epochs=100,
+    is_training=True,
+    current_stage=1,
+    num_dense_points=100,
+    prediction_type='x0',
+    sampling_generator=None,
+):
     """
-    混合损失函数（绝对坐标版本）
-    包括：
-    - 主损失: epsilon/x0/v预测损失
-    - 平滑性损失: 轨迹的二阶导数（改进版：只惩罚过度弯曲）
-    - 曲率约束: 限制最大曲率
-    - 角度一致性损失: 角度变化的平滑性
-    - 均匀性损失: 点间距离的方差
-    - 倾覆监督损失: 基于稳定性代价地图的损失
+    训练损失：25个物理空间25×缩放零和边残差上的pMF主损失。
     
     Args:
-        loss_weights: dict with keys ['main', 'smoothness', 'curvature', 'angle_smoothness', 'angle_consistency', 'uniformity', 'capsize']
+        loss_weights: dict with keys
+            ['main', 'main_norm_p', 'boundary', 'boundary_safe_bound', 'capsize']
         epoch: 当前epoch（用于动态权重）
         current_stage: 当前训练阶段（1或2），只在阶段2执行高级损失计算
         total_epochs: 总epoch数（用于动态权重）
         is_training: bool - True时使用回归损失，False时返回实际cost值
-        use_dense_trajectory: bool - True时使用密集轨迹计算主损失，False时使用原始控制点
-        num_dense_points: int - 密集轨迹的点数（仅在use_dense_trajectory=True时使用）
+        num_dense_points: int - 感知/安全损失使用的B样条密集采样点数
         prediction_type: str - 预测类型 ('epsilon', 'x0', 'v')
     """
     # 默认权重
     if loss_weights is None:
         loss_weights = {
             'main': 1.0,
-            'smoothness': 0.1,
-            'curvature': 0.0,
-            'angle_smoothness': 0.05,
-            'angle_consistency': 0.05,
-            'uniformity': 0.01,
+            'main_norm_p': 1.0,
+            'boundary': 0.0,
+            'boundary_safe_bound': 0.98,
             'capsize': 0.0,
-            'consistency': 0.1  # 时间一致性损失权重
         }
     map_input = batch['map'].float().to(device)
     trajectory = batch['trajectory'].to(device)  # (B, 100, 3)
@@ -574,12 +329,16 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     goal_pose = batch['goal_pose'].to(device)  # (B, 3)
     
     B = map_input.shape[0]
+    base_model = model.module if hasattr(model, 'module') else model
+    loss_type = getattr(base_model, 'loss_type', prediction_type)
+    representation = base_model.trajectory_representation
+    coordinate_scale = base_model.coordinate_scale
     
     # =================== B样条控制点转换 ===================
     # 【语义说明】
     # - 完整B样条：26个控制点 = 起点(1) + 中间点(24) + 终点(1)
-    # - 起点/终点：固定的，从start_pose/goal_pose提取
-    # - 中间24个点：网络预测的自由控制点
+    # - 标签起终点与中间24点组成完整26点控制点
+    # - pMF状态和网络输出是25条物理边的25×缩放零和残差
     # 
     # 【第二阶段特殊处理】
     # - 第一阶段（current_stage==1）：仅使用模仿学习数据
@@ -598,13 +357,13 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     #     if 'cost_map' in batch and loss_weights.get('capsize', 0.0) > 0:
     #         # 准备归一化的起点和终点（仅用于优化函数）
     #         start_normalized_temp = torch.zeros(B, 4, device=device)
-    #         start_normalized_temp[:, :2] = start_pose[:, :2] / 20.0
+    #         start_normalized_temp[:, :2] = start_pose[:, :2] / coordinate_scale
     #         start_normalized_temp[:, 2] = torch.cos(start_pose[:, 2])
     #         start_normalized_temp[:, 3] = torch.sin(start_pose[:, 2])
     #         start_normalized_temp[:, :2] = torch.clamp(start_normalized_temp[:, :2], -1.0, 1.0)
             
     #         goal_normalized_temp = torch.zeros(B, 4, device=device)
-    #         goal_normalized_temp[:, :2] = goal_pose[:, :2] / 20.0
+    #         goal_normalized_temp[:, :2] = goal_pose[:, :2] / coordinate_scale
     #         goal_normalized_temp[:, 2] = torch.cos(goal_pose[:, 2])
     #         goal_normalized_temp[:, 3] = torch.sin(goal_pose[:, 2])
     #         goal_normalized_temp[:, :2] = torch.clamp(goal_normalized_temp[:, :2], -1.0, 1.0)
@@ -618,11 +377,7 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     #             start_pose=start_pose,
     #             goal_pose=goal_pose,
     #             stability_cost_map=batch['cost_map'].to(device)[0],
-    #             map_info={
-    #                 'resolution': 0.4,
-    #                 'origin': (-20.0, -20.0, -np.pi),
-    #                 'size': (100, 100, 36)
-    #             },
+    #             map_info=MAP_CONFIG.cost_map_info(),
     #             device=device,
     #             prediction_type=prediction_type,
     #             num_iterations=10,
@@ -648,32 +403,75 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     #     B = B * 2  # 更新batch size
     #     stage2_mix_loss = True
     
-    # 归一化控制点：坐标范围通常在 [-20, 20]，归一化到 [-1, 1]
-    middle_cp_normalized = middle_cp / 20.0  # (B, 24, 2) 或 (2B, 24, 2)
+    # 居中地图坐标按统一的半边长归一化到 [-1, 1]。
+    middle_cp_normalized = middle_cp / coordinate_scale
     middle_cp_normalized = torch.clamp(middle_cp_normalized, -1.0, 1.0)
     
     # 归一化起点终点坐标（转换为4维：x, y, cos(θ), sin(θ)） - 用于条件
     start_normalized = torch.zeros(B, 4, device=device)
-    start_normalized[:, :2] = start_pose[:, :2] / 20.0
+    start_normalized[:, :2] = start_pose[:, :2] / coordinate_scale
     start_normalized[:, 2] = torch.cos(start_pose[:, 2])  # cos(θ)
     start_normalized[:, 3] = torch.sin(start_pose[:, 2])  # sin(θ)
     start_normalized[:, :2] = torch.clamp(start_normalized[:, :2], -1.0, 1.0)
     
     goal_normalized = torch.zeros(B, 4, device=device)
-    goal_normalized[:, :2] = goal_pose[:, :2] / 20.0
+    goal_normalized[:, :2] = goal_pose[:, :2] / coordinate_scale
     goal_normalized[:, 2] = torch.cos(goal_pose[:, 2])  # cos(θ)
     goal_normalized[:, 3] = torch.sin(goal_pose[:, 2])  # sin(θ)
     goal_normalized[:, :2] = torch.clamp(goal_normalized[:, :2], -1.0, 1.0)
+
+    full_control_points_normalized = torch.cat(
+        [
+            start_normalized[:, :2].unsqueeze(1),
+            middle_cp_normalized,
+            goal_normalized[:, :2].unsqueeze(1),
+        ],
+        dim=1,
+    )  # (B, 26, 2)
+
+    x0_residual = representation.encode(
+        full_control_points_normalized,
+        start_normalized[:, :2],
+        goal_normalized[:, :2],
+    )  # (B, 25, 2)
     
     # ===== pixel Mean Flow: 连续时间采样 =====
     # 采样 t 和 r (0 <= r <= t <= 1)
     if hasattr(model, 'module'):
-        t = model.module.sample_timesteps(B, device=device)
+        t = model.module.sample_timesteps(
+            B, device=device, generator=sampling_generator
+        )
     else:
-        t = model.sample_timesteps(B, device=device)
+        t = model.sample_timesteps(
+            B, device=device, generator=sampling_generator
+        )
     t = torch.clamp(t, min=1e-4, max=1.0 - 1e-4) # 避免极端值
-    r = torch.rand_like(t) * t
-    noise_cp = torch.randn_like(middle_cp_normalized)
+    r = torch.rand(
+        t.shape,
+        device=t.device,
+        dtype=t.dtype,
+        generator=sampling_generator,
+    ) * t
+    noise_residual = torch.randn(
+        x0_residual.shape,
+        device=x0_residual.device,
+        dtype=x0_residual.dtype,
+        generator=sampling_generator,
+    )
+    noise_residual = representation.project_zero_sum(noise_residual)
+
+    def assert_zero_sum(name, tensor, tolerance=1e-5):
+        # Check the mean rather than the raw sum: the constraint is defined as
+        # mean==0 and the raw sum magnifies harmless float32 roundoff by 25.
+        max_error = tensor.mean(dim=1).abs().max().detach()
+        if not torch.isfinite(max_error) or max_error.item() > tolerance:
+            raise AssertionError(
+                f"{name} left the zero-sum subspace: "
+                f"max mean error={max_error.item():.3e}"
+            )
+
+    assert_zero_sum("x0_residual", x0_residual)
+    assert_zero_sum("noise_residual", noise_residual)
 
     # 准备 JVP 需要的 functional 环境
     if hasattr(model, 'module'):
@@ -693,13 +491,12 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
             # Forward-AD(JVP) 与 CUDA 高效 SDPA(尤其是 efficient/flash kernel)在部分版本不兼容。
             # 这里在 JVP 路径中强制回退到 math kernel，避免：
             # NotImplementedError: forward AD with _scaled_dot_product_efficient_attention
-            sdp_ctx = (
-                torch.backends.cuda.sdp_kernel(
-                    enable_flash=False,
-                    enable_mem_efficient=False,
-                    enable_math=True
-                )
-                if z_arg.is_cuda else nullcontext()
+            # JVP/forward-AD 不支持部分 fused SDPA kernel；CPU后端也可能自动
+            # 选择 fused attention，因此不再只按 is_cuda 条件启用该保护。
+            sdp_ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True
             )
 
             # 使用 functional_call 代替直接 model()
@@ -722,19 +519,29 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
             p_x0 = model_output
         elif prediction_type == 'v':
             p_x0 = z_arg - t_v * model_output
-        
+
+        p_x0 = representation.project_zero_sum(p_x0)
         # 返回平均速度 u = (z_t - x_0) / t
-        return (z_arg - p_x0) / (t_v + 1e-5)
+        return representation.project_zero_sum(
+            (z_arg - p_x0) / (t_v + 1e-5)
+        )
 
     # 2. 准备 JVP 的输入 (Primals) 和 变化率 (Tangents)
-    target_v = noise_cp - middle_cp_normalized # dz/dt 的真值
+    target_v = representation.project_zero_sum(
+        noise_residual - x0_residual
+    )  # dz/dt 的真值
 
     # noisy_cp 必须在 requires_grad 环境下生成，确保导数链条完整
     with torch.enable_grad():
         t.requires_grad_(True)
         t_v = t.view(-1, 1, 1)
         # 显式重算 noisy_cp 确保它是 t 的函数
-        z_t = (1.0 - t_v) * middle_cp_normalized + t_v * noise_cp
+        z_t = (
+            (1.0 - t_v) * x0_residual
+            + t_v * noise_residual
+        )
+        z_t = representation.project_zero_sum(z_t)
+        assert_zero_sum("z_t", z_t)
         
         # Primals: 当前点
         primals = (z_t, t, r)
@@ -745,6 +552,8 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         # u_out: 算出的 u
         # du_dt_full: 算出的全导数 du/dt
         u_out, du_dt_full = jvp(u_fn, primals, tangents)
+        u_out = representation.project_zero_sum(u_out)
+        assert_zero_sum("u_out", u_out)
         
         # 对修正项进行幅度裁剪，增加稳定性
         du_dt_full = torch.clamp(du_dt_full, -5.0, 5.0)
@@ -752,24 +561,43 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # 4. 构建 V_theta 并计算 Loss
     # V = u + (t - r) * stopgrad(du/dt)
     
-    V_theta = u_out + (t.view(-1, 1, 1) - r.view(-1, 1, 1)).detach() * du_dt_full.detach()
+    V_theta = representation.project_zero_sum(
+        u_out
+        + (t.view(-1, 1, 1) - r.view(-1, 1, 1)).detach()
+        * du_dt_full.detach()
+    )
 
     if loss_type == 'v':
-        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 24, 2)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none')  # (B, 25, 2)
     elif loss_type == 'x0':
         # x0_rec = z_t - t * V_theta
-        pred_x0_corrected = z_t - t.view(-1, 1, 1) * V_theta
-        main_loss_all = F.mse_loss(pred_x0_corrected, middle_cp_normalized, reduction='none')  # (B, 24, 2)
+        pred_x0_corrected = representation.project_zero_sum(
+            z_t - t.view(-1, 1, 1) * V_theta
+        )
+        main_loss_all = F.mse_loss(
+            pred_x0_corrected, x0_residual, reduction='none'
+        )
     else:
         # epsilon 空间的 pMF 修正写法：pred_eps_corrected = V_theta + pred_x0_corrected
         # 但推荐统一使用 v-loss 以符合论文实现
-        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none') # (B, 24, 2)
+        main_loss_all = F.mse_loss(V_theta, target_v, reduction='none') # (B, 25, 2)
+
+    # 第一组消融实验只改变主pMF损失的自适应指数；其余损失和网络保持不变。
+    main_norm_p = float(loss_weights.get('main_norm_p', 1.0))
+    main_loss_adp_all, main_raw_mse_all, main_adp_weight_mean_all = adaptive_pmf_loss(
+        main_loss_all, norm_p=main_norm_p
+    )
     
     # 【第二阶段特殊处理】分离模仿和优化两部分的损失，然后加权
     if stage2_mix_loss:
         # 分离损失：(2B, 24, 2) -> (B, 24, 2) + (B, 24, 2)
-        main_loss_imitation = main_loss_all[:len(main_loss_all)//2].mean()  # 前半部分
-        main_loss_optimized = main_loss_all[len(main_loss_all)//2:].mean()   # 后半部分
+        split_idx = len(main_loss_all) // 2
+        main_loss_imitation, main_raw_mse_imitation, main_adp_weight_imitation = adaptive_pmf_loss(
+            main_loss_all[:split_idx], norm_p=main_norm_p
+        )
+        main_loss_optimized, main_raw_mse_optimized, main_adp_weight_optimized = adaptive_pmf_loss(
+            main_loss_all[split_idx:], norm_p=main_norm_p
+        )
         
         # # 根据训练进度动态调整混合系数
         # # 早期更多使用模仿损失，保持在原分布附近
@@ -782,65 +610,106 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
         
         # 加权组合两个损失
         main_loss = alpha_loss * main_loss_imitation + (1.0 - alpha_loss) * main_loss_optimized
+        main_raw_mse = alpha_loss * main_raw_mse_imitation + (1.0 - alpha_loss) * main_raw_mse_optimized
+        main_adp_weight_mean = alpha_loss * main_adp_weight_imitation + (1.0 - alpha_loss) * main_adp_weight_optimized
     else:
         # 第一阶段或第二阶段但没有优化数据：只用模仿数据
-        main_loss = main_loss_all.mean()
-        
-    # if loss_weights['main'] <= 0.0:
-    #     # main_loss = main_loss * 0.0
-    #     main_loss = torch.zeros_like(main_loss)
-        
-    # main_loss = main_loss * 1e-1
-    
-    # =================== 计算辅助损失（可选） ===================
-    # 注意：由于我们现在只预测控制点，辅助损失的计算需要先重建轨迹
-    
-    # 初始化所有损失为零tensor（保持梯度连接）
+        main_loss = main_loss_adp_all
+        main_raw_mse = main_raw_mse_all
+        main_adp_weight_mean = main_adp_weight_mean_all
+
+    # 从u恢复25×缩放零和边残差，再解码到物理控制点。
+    x0_residual_pred = representation.project_zero_sum(
+        z_t - (t.view(-1, 1, 1) + 1e-5) * u_out
+    )
+
+    # State-scale and zero-predictor diagnostics. These are deliberately
+    # unweighted raw MSE statistics, independent of the adaptive pMF loss.
+    residual_rms = x0_residual.detach().square().mean().sqrt()
+    unscaled_residual_rms = residual_rms / representation.residual_scale
+    noise_rms = noise_residual.detach().square().mean().sqrt()
+    zero_pred_mse = x0_residual.detach().square().mean()
+    model_x0_mse = (
+        x0_residual_pred.detach() - x0_residual.detach()
+    ).square().mean()
+    explained_ratio = 1.0 - model_x0_mse / zero_pred_mse.clamp_min(1e-12)
+    noise_to_residual_ratio = noise_rms / residual_rms.clamp_min(1e-12)
+    radial_diagnostics = representation.radial_diagnostics_from_residual(
+        x0_residual_pred,
+        start_normalized[:, :2],
+        goal_normalized[:, :2],
+    )
+    gt_radial_diagnostics = representation.radial_diagnostics_from_residual(
+        x0_residual.detach(),
+        start_normalized[:, :2],
+        goal_normalized[:, :2],
+    )
+    radial_x_norm = radial_diagnostics['x_norm'].detach()
+    radial_rho = radial_diagnostics['rho'].detach()
+    hard_boundary_margin = radial_diagnostics['hard_boundary_margin'].detach()
+    gt_radial_x_norm = gt_radial_diagnostics['x_norm'].detach()
+
+    needs_control_points = (
+        loss_weights.get('boundary', 0.0) > 0.0
+        or (is_training and loss_weights.get('capsize', 0.0) > 0.0)
+    )
+    x0_control_pred = None
+    if needs_control_points:
+        x0_control_pred = representation.decode(
+            x0_residual_pred,
+            start_normalized[:, :2],
+            goal_normalized[:, :2],
+        )
     dummy_loss = main_loss.sum() * 0.0
-    smoothness_loss = dummy_loss.clone()
-    curvature_loss = dummy_loss.clone()
-    angle_smoothness_loss = dummy_loss.clone()
-    angle_consistency_loss = dummy_loss.clone()
-    uniformity_loss = dummy_loss.clone()
+    boundary_loss = dummy_loss.clone()
+    boundary_diagnostics = {
+        'oob_sample_loss': dummy_loss.detach().clone(),
+        'oob_rate': dummy_loss.detach().clone(),
+        'max_oob': dummy_loss.detach().clone(),
+        'active_boundary_fraction': dummy_loss.detach().clone(),
+        'dense_oob_rate': dummy_loss.detach().clone(),
+        'dense_max_oob': dummy_loss.detach().clone(),
+    }
+    pred_dense_normalized = None
+    if loss_weights.get('boundary', 0.0) > 0.0:
+        safe_bound = float(loss_weights.get('boundary_safe_bound', 0.98))
+        boundary_loss, boundary_diagnostics = sparse_boundary_violation_loss(
+            x0_control_pred,
+            safe_bound=safe_bound,
+        )
+        # Control points define the conservative training constraint. The
+        # dense B-spline metrics report actual curve violations separately.
+        bspline_layer = DifferentiableBSpline(
+            num_control_points=26,
+            num_output_points=num_dense_points,
+            degree=3,
+        ).to(device=x0_control_pred.device, dtype=x0_control_pred.dtype)
+        pred_dense_normalized = bspline_layer(x0_control_pred)
+        _, dense_boundary_diagnostics = sparse_boundary_violation_loss(
+            pred_dense_normalized,
+            safe_bound=safe_bound,
+        )
+        boundary_diagnostics['dense_oob_rate'] = dense_boundary_diagnostics['oob_rate']
+        boundary_diagnostics['dense_max_oob'] = dense_boundary_diagnostics['max_oob']
+
     capsize_loss = dummy_loss.clone()
-    tangent_loss = dummy_loss.clone()
-    consistency_loss = dummy_loss.clone()
-    
-    if loss_weights['tangent'] > 0.0:
-        tangent_loss = compute_tangent_loss(middle_cp_normalized, start_normalized, goal_normalized)
-    
-    if loss_weights['capsize'] > 0.0:
+
+    if loss_weights.get('capsize', 0.0) > 0.0:
         # =================== 第二阶段：物理约束 ===================
         # 训练阶段使用“当前前向预测的 x0”重建轨迹，避免随机采样链的高方差导致
         # 任一单项辅助损失都把分布推向单模态（与条件解绑）。
         if is_training:
-            # 从当前训练图得到 x0 预测（归一化坐标），保持与当前条件和时间步一致
-            # x0_middle_pred = z_t - t.view(-1, 1, 1) * V_theta  # (B, 24, 2)
-            x0_middle_pred = z_t - t.view(-1, 1, 1) * u_out  # (B, 24, 2)
-            x0_middle_denorm = torch.clamp(x0_middle_pred, -1.0, 1.0) * 20.0
-
-            # 组合完整控制点并重建密集轨迹
-            start_cp = start_pose[:, :2].unsqueeze(1)  # (B,1,2)
-            goal_cp = goal_pose[:, :2].unsqueeze(1)    # (B,1,2)
-            full_ctrl_points = torch.cat([start_cp, x0_middle_denorm, goal_cp], dim=1)  # (B,26,2)
-
-            bspline_layer = DifferentiableBSpline(
-                num_control_points=24 + 2,
-                num_output_points=100,
-                degree=3
-            ).to(device)
-            reconstructed_traj = bspline_layer(full_ctrl_points)  # (B,100,2)
+            if pred_dense_normalized is None:
+                if x0_control_pred is None:
+                    raise RuntimeError("Decoded control points are required for capsize loss.")
+                bspline_layer = DifferentiableBSpline(
+                    num_control_points=26,
+                    num_output_points=num_dense_points,
+                    degree=3,
+                ).to(device=x0_control_pred.device, dtype=x0_control_pred.dtype)
+                pred_dense_normalized = bspline_layer(x0_control_pred)
+            reconstructed_traj = pred_dense_normalized * coordinate_scale
             
-            # reconstructed_traj = model.sample_differentiable(
-            #     map_input,
-            #     start_normalized,
-            #     goal_normalized,
-            #     num_steps=3,
-            #     solver='pmf_refined',
-            #     reconstruct_trajectory=True,
-            #     num_traj_points=100
-            # )  # (B, 100, 2) - 已经是真实坐标（非归一化）
-
             start_pose_expanded = start_pose
             goal_pose_expanded = goal_pose
         else:
@@ -859,93 +728,10 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
             start_pose_expanded = start_pose.repeat_interleave(10, dim=0)
             goal_pose_expanded = goal_pose.repeat_interleave(10, dim=0)
         
-        # # reconstructed_traj = model.sample_differentiable(
-        # #     map_input,
-        # #     start_normalized,
-        # #     goal_normalized,
-        # #     num_steps=3,
-        # #     solver='pmf_refined',
-        # #     reconstruct_trajectory=True,
-        # #     num_traj_points=100
-        # # )  # (B, N, 2) - 只有(x,y)，已经是真实坐标（非归一化）
-        
         # 使用整批 cost_map，避免错误地只取 batch[0]
         stability_cost_map = batch['cost_map'].to(device)
-        map_size = (100, 100, 36) # W, H, D for (x, y, yaw)
-        resolution = 0.4
-        origin = (-20.0, -20.0, -np.pi) # x, y, yaw
-        map_info = {
-            'resolution': resolution,
-            'origin': origin,
-            'size': map_size
-        }
+        map_info = MAP_CONFIG.cost_map_info()
         
-        # # # =================== 新方法：多步优化 + MSE损失 ===================
-        # # if is_training:
-        # #     # 训练模式：使用多步优化 + MSE损失
-        # #     from grad_optimizer import optimize_control_points_multistep
-            
-        # #     # 对网络预测的控制点进行多步优化
-        # #     optimized_middle_cp, _ = optimize_control_points_multistep(
-        # #         middle_control_points=x0_middle_denorm,  # (B, 24, 2)
-        # #         start_pose=start_pose,
-        # #         goal_pose=goal_pose,
-        # #         stability_cost_map=stability_cost_map,
-        # #         map_info=map_info,
-        # #         iterations=10,
-        # #         lr=0.1,
-        # #         grad_clip_norm=1.0,
-        # #         device=device,
-        # #         verbose=False
-        # #     )
-            
-        # #     # 计算MSE损失：网络预测的控制点 vs 优化后的控制点
-        # #     capsize_loss = F.mse_loss(x0_middle_denorm, optimized_middle_cp.detach())
-            
-        # # else:
-        # #     # 验证模式：使用原来的cost计算方式
-        # #     from grad_optimizer import cost_on_dense_trajectory
-        # #     capsize_loss = cost_on_dense_trajectory(
-        # #         reconstructed_traj, start_pose, goal_pose,
-        # #         stability_cost_map, map_info, device
-        # #     )
-        # if is_training:
-        #     from grad_optimizer import cost_on_dense_trajectory_phr_alm
-
-        #     # 持久化 PHR-ALM 对偶变量（跨 batch）
-        #     if not hasattr(diffusion_loss, '_phr_alm_state'):
-        #         diffusion_loss._phr_alm_state = {
-        #             'lambda_ineq': None,
-        #             'lambda_eq': None,
-        #             'mu': 1.0,
-        #         }
-
-        #     phr_state = diffusion_loss._phr_alm_state
-        #     capsize_loss, _, lambda_ineq_new, lambda_eq_new, mu_new = cost_on_dense_trajectory_phr_alm(
-        #         reconstructed_traj,
-        #         start_pose_expanded,
-        #         goal_pose_expanded,
-        #         stability_cost_map,
-        #         map_info,
-        #         lambda_ineq=phr_state['lambda_ineq'],
-        #         lambda_eq=phr_state['lambda_eq'],
-        #         mu=phr_state['mu'],
-        #         update_dual=True,
-        #         device=device
-        #     )
-
-        #     phr_state['lambda_ineq'] = lambda_ineq_new
-        #     phr_state['lambda_eq'] = lambda_eq_new
-        #     phr_state['mu'] = mu_new
-            
-        #     capsize_loss = capsize_loss * 1e-8
-        # else:
-        #     from grad_optimizer import cost_on_dense_trajectory
-        #     capsize_loss = cost_on_dense_trajectory(
-        #         reconstructed_traj, start_pose_expanded, goal_pose_expanded,
-        #         stability_cost_map, map_info, device
-        #     )
-    
         from grad_optimizer import cost_on_dense_trajectory
         capsize_loss = cost_on_dense_trajectory(
             reconstructed_traj, start_pose_expanded, goal_pose_expanded,
@@ -958,30 +744,16 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
             capsize_loss = dummy_loss.clone()
 
     
-    # 占位符监控指标
-    angle_range_ratio = 1.0
-    mean_norm_sq = 1.0
-    angle_norm_error = torch.tensor(0.0, device=device)
-    main_loss_pos = main_loss
-    main_loss_ang = torch.tensor(0.0, device=device)
-    
-    # 如果需要计算辅助损失（例如平滑性），可以从控制点重建轨迹
-    # 但为了训练效率，暂时跳过
-    skip_angle_losses = True  # 控制点阶段跳过角度相关损失
-    
     # main_loss 数值稳定性保护（尤其在 stage2 main=0 时避免无关分支污染）
     if isinstance(main_loss, torch.Tensor) and (not torch.isfinite(main_loss)):
         print("⚠ Warning: main_loss is NaN/Inf, fallback to 0 for this batch")
         main_loss = dummy_loss.clone()
 
-    # 混合损失
-    if loss_weights['main'] <= 0.0:
-        total_loss = loss_weights['tangent'] * tangent_loss \
-                    + loss_weights['capsize'] * capsize_loss
-    else:
-        total_loss = loss_weights['main'] * main_loss \
-                    + loss_weights['tangent'] * tangent_loss \
-                    + loss_weights['capsize'] * capsize_loss
+    total_loss = (
+        loss_weights['main'] * main_loss
+        + loss_weights.get('boundary', 0.0) * boundary_loss
+        + loss_weights.get('capsize', 0.0) * capsize_loss
+    )
     
     # 检查损失异常：不中断训练，回退为零损失并跳过本 batch 更新
     if not torch.isfinite(total_loss):
@@ -993,18 +765,56 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     # 返回各项损失用于记录
     loss_dict = {
         'main': main_loss.item(),
-        'smoothness': smoothness_loss.item(),
-        'curvature': curvature_loss.item(),
-        'angle_smoothness': angle_smoothness_loss.item(),
-        'angle_consistency': angle_consistency_loss.item(),
-        'uniformity': uniformity_loss.item(),
-        'tangent': tangent_loss.item(),
+        'main_raw_mse': main_raw_mse.item() if isinstance(main_raw_mse, torch.Tensor) else float(main_raw_mse),
+        'main_adp_weight_mean': main_adp_weight_mean.item() if isinstance(main_adp_weight_mean, torch.Tensor) else float(main_adp_weight_mean),
+        'residual_rms': residual_rms.item(),
+        'unscaled_residual_rms': unscaled_residual_rms.item(),
+        'noise_rms': noise_rms.item(),
+        'noise_to_residual_ratio': noise_to_residual_ratio.item(),
+        'radial_x_norm_mean': radial_x_norm.mean().item(),
+        'radial_x_norm_max': radial_x_norm.max().item(),
+        'radial_rho_mean': radial_rho.mean().item(),
+        'radial_rho_min': radial_rho.min().item(),
+        'radial_active_cp_mean': radial_diagnostics[
+            'active_control_point'
+        ].float().mean().item(),
+        'radial_active_y_fraction': radial_diagnostics[
+            'active_coordinate'
+        ].float().mean().item(),
+        'radial_active_upper_fraction': radial_diagnostics[
+            'active_is_upper'
+        ].float().mean().item(),
+        'hard_boundary_margin_mean': hard_boundary_margin.mean().item(),
+        'hard_boundary_margin_min': hard_boundary_margin.min().item(),
+        'gt_radial_x_norm_mean': gt_radial_x_norm.mean().item(),
+        'gt_radial_x_norm_median': torch.quantile(
+            gt_radial_x_norm, 0.50
+        ).item(),
+        'gt_radial_x_norm_p95': torch.quantile(
+            gt_radial_x_norm, 0.95
+        ).item(),
+        'gt_radial_x_norm_p99': torch.quantile(
+            gt_radial_x_norm, 0.99
+        ).item(),
+        'gt_radial_x_norm_max': gt_radial_x_norm.max().item(),
+        'gt_radial_above_090_fraction': (
+            gt_radial_x_norm > 0.90
+        ).float().mean().item(),
+        'gt_radial_above_098_fraction': (
+            gt_radial_x_norm > 0.98
+        ).float().mean().item(),
+        'gt_infeasible_fraction': (gt_radial_x_norm > 1.0 + 1e-5).float().mean().item(),
+        'zero_pred_mse': zero_pred_mse.item(),
+        'model_x0_mse': model_x0_mse.item(),
+        'explained_ratio': explained_ratio.item(),
+        'boundary': boundary_loss.item(),
+        'oob_sample_loss': boundary_diagnostics['oob_sample_loss'].item(),
+        'oob_rate': boundary_diagnostics['oob_rate'].item(),
+        'max_oob': boundary_diagnostics['max_oob'].item(),
+        'active_boundary_fraction': boundary_diagnostics['active_boundary_fraction'].item(),
+        'dense_oob_rate': boundary_diagnostics['dense_oob_rate'].item(),
+        'dense_max_oob': boundary_diagnostics['dense_max_oob'].item(),
         'capsize': capsize_loss.item(),
-        'consistency': consistency_loss.item(),
-        'angle_norm_mean': mean_norm_sq ** 0.5,
-        'angle_norm_error': angle_norm_error.item() if isinstance(angle_norm_error, torch.Tensor) else 0.0,
-        'main_loss_pos': main_loss_pos.item() if isinstance(main_loss_pos, torch.Tensor) else 0.0,
-        'main_loss_ang': main_loss_ang.item() if isinstance(main_loss_ang, torch.Tensor) else 0.0,
     }
     
     # 调整返回的样本数：如果在第二阶段进行了混合，返回原始batch size
@@ -1012,14 +822,25 @@ def diffusion_loss(model, batch, device, loss_weights=None, epoch=0, total_epoch
     
     return total_loss, 0, n_samples, loss_dict
 
-def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weights=None, current_stage=1, total_stage_epochs=50, ema_models=None, use_dense_trajectory=False, num_dense_points=100):
+def train_epoch(
+    model,
+    trainingData,
+    optimizer,
+    device,
+    stage_epoch=0,
+    loss_weights=None,
+    current_stage=1,
+    total_stage_epochs=50,
+    ema_models=None,
+    num_dense_points=100,
+    prediction_type='x0',
+):
     """
     单轮训练函数
     
     Args:
         ema_models: EMA模型列表，用于更新EMA参数（可选）
-        use_dense_trajectory: bool - 是否使用密集轨迹计算主损失
-        num_dense_points: int - 密集轨迹的点数
+        num_dense_points: int - 安全损失所用B样条密集采样点数
     """
     model.train()
     total_loss = 0
@@ -1028,29 +849,82 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
     # 累积各项损失
     loss_accumulator = {
         'main': 0, 
-        'smoothness': 0, 
-        'curvature': 0,
-        'angle_smoothness': 0, 
-        'angle_consistency': 0, 
-        'uniformity': 0, 
-        'tangent': 0, 
+        'main_raw_mse': 0,
+        'main_adp_weight_mean': 0,
+        'residual_rms': 0,
+        'unscaled_residual_rms': 0,
+        'noise_rms': 0,
+        'noise_to_residual_ratio': 0,
+        'radial_x_norm_mean': 0,
+        'radial_x_norm_max': 0,
+        'radial_rho_mean': 0,
+        'radial_rho_min': 0,
+        'radial_active_cp_mean': 0,
+        'radial_active_y_fraction': 0,
+        'radial_active_upper_fraction': 0,
+        'hard_boundary_margin_mean': 0,
+        'hard_boundary_margin_min': 0,
+        'gt_radial_x_norm_mean': 0,
+        'gt_radial_x_norm_median': 0,
+        'gt_radial_x_norm_p95': 0,
+        'gt_radial_x_norm_p99': 0,
+        'gt_radial_x_norm_max': 0,
+        'gt_radial_above_090_fraction': 0,
+        'gt_radial_above_098_fraction': 0,
+        'gt_infeasible_fraction': 0,
+        'zero_pred_mse': 0,
+        'model_x0_mse': 0,
+        'explained_ratio': 0,
+        'boundary': 0,
+        'oob_sample_loss': 0,
+        'oob_rate': 0,
+        'max_oob': 0,
+        'active_boundary_fraction': 0,
+        'dense_oob_rate': 0,
+        'dense_max_oob': 0,
         'capsize': 0, 
-        'consistency': 0,
     }
+    head_gradient_totals = {
+        'raw_v_weight_grad_norm': 0.0,
+        'raw_v_bias_grad_norm': 0.0,
+        'raw_s_weight_grad_norm': 0.0,
+        'raw_s_bias_grad_norm': 0.0,
+    }
+    head_gradient_batches = 0
+    raw_v_norm_first_batch = float('nan')
     
     pbar = tqdm(trainingData, mininterval=2, desc=f"Training Epoch {stage_epoch} (Stage {current_stage})")
     for batch_idx, batch in enumerate(pbar):
         optimizer.zero_grad()
-        
-        loss, _, n_samples, loss_dict = diffusion_loss(
-            model, batch, device, loss_weights, 
-            epoch=stage_epoch, total_epochs=total_stage_epochs,
-            is_training=True,  # 训练模式：capsize loss使用回归损失
-            current_stage=current_stage,  # 传递当前阶段
-            use_dense_trajectory=use_dense_trajectory,
-            num_dense_points=num_dense_points,
-            prediction_type=prediction_type
-        )
+
+        captured_raw_v_norms = []
+        capture_handle = None
+        if batch_idx == 0:
+            base_model = model.module if hasattr(model, 'module') else model
+
+            def capture_raw_v_norm(_module, _inputs, output):
+                raw_v_norm = torch.linalg.vector_norm(
+                    output.detach().flatten(start_dim=1), dim=1
+                ).mean()
+                captured_raw_v_norms.append(raw_v_norm.item())
+
+            capture_handle = base_model.main_pred.register_forward_hook(
+                capture_raw_v_norm
+            )
+        try:
+            loss, _, n_samples, loss_dict = diffusion_loss(
+                model, batch, device, loss_weights,
+                epoch=stage_epoch, total_epochs=total_stage_epochs,
+                is_training=True,  # 训练模式：capsize loss使用回归损失
+                current_stage=current_stage,  # 传递当前阶段
+                num_dense_points=num_dense_points,
+                prediction_type=prediction_type
+            )
+        finally:
+            if capture_handle is not None:
+                capture_handle.remove()
+        if captured_raw_v_norms:
+            raw_v_norm_first_batch = captured_raw_v_norms[-1]
 
         # 先检查 loss 再统计，避免把 NaN 累积进 epoch 指标
         if not torch.isfinite(loss):
@@ -1060,10 +934,34 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
         total_loss += loss.item()
         total_samples += n_samples
         
-        for key in loss_accumulator.keys():
-            loss_accumulator[key] += loss_dict[key]
+        for key, value in loss_dict.items():
+            loss_accumulator.setdefault(key, 0)
+            loss_accumulator[key] += value
         
         loss.backward()
+
+        base_model = model.module if hasattr(model, 'module') else model
+        raw_v_layer = base_model.main_pred[-1]
+        raw_s_layer = base_model.radial_slack_pred[-1]
+
+        def parameter_grad_norm(parameter):
+            if parameter is None or parameter.grad is None:
+                return 0.0
+            return parameter.grad.detach().norm().item()
+
+        head_gradient_totals['raw_v_weight_grad_norm'] += parameter_grad_norm(
+            raw_v_layer.weight
+        )
+        head_gradient_totals['raw_v_bias_grad_norm'] += parameter_grad_norm(
+            raw_v_layer.bias
+        )
+        head_gradient_totals['raw_s_weight_grad_norm'] += parameter_grad_norm(
+            raw_s_layer.weight
+        )
+        head_gradient_totals['raw_s_bias_grad_norm'] += parameter_grad_norm(
+            raw_s_layer.bias
+        )
+        head_gradient_batches += 1
         
         # 梯度裁剪 - 第二阶段使用适中裁剪（采样链梯度累积大）
         if current_stage == 1:
@@ -1095,12 +993,11 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
         
         # 根据当前阶段显示不同的信息
         if current_stage == 1:
-            # 阶段1：显示主损失、平滑性
             pbar.set_postfix({
                 'Total': f'{loss.item():.5f}',
                 'Main': f'{loss_dict["main"]:.5f}',
-                # 'Smooth': f'{loss_dict["smoothness"]:.4f}',
-                'Tangent': f'{loss_dict["tangent"]:.4f}',
+                'Boundary': f'{loss_dict["boundary"]:.5f}',
+                'OOB': f'{100.0 * loss_dict["oob_rate"]:.1f}%',
                 'GradNorm': grad_info
             })
         else:
@@ -1108,6 +1005,8 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
             pbar.set_postfix({
                 'Total': f'{loss.item():.5f}',
                 'Main': f'{loss_dict["main"]:.5f}',
+                'Boundary': f'{loss_dict["boundary"]:.5f}',
+                'OOB': f'{100.0 * loss_dict["oob_rate"]:.1f}%',
                 'Capsize': f'{loss_dict["capsize"]:.4f}',
                 'GradNorm': grad_info
             })
@@ -1116,17 +1015,34 @@ def train_epoch(model, trainingData, optimizer, device, stage_epoch=0, loss_weig
     
     # 计算各项平均损失
     avg_loss_dict = {k: v / len(trainingData) for k, v in loss_accumulator.items()}
+    grad_denominator = max(head_gradient_batches, 1)
+    avg_loss_dict.update({
+        key: value / grad_denominator
+        for key, value in head_gradient_totals.items()
+    })
+    avg_loss_dict['raw_v_norm_first_batch'] = raw_v_norm_first_batch
     
     return avg_loss, 0, total_samples, avg_loss_dict
 
 
-def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_epochs=100, current_stage=1, use_late_timesteps=False, use_dense_trajectory=False, num_dense_points=100):
+def eval_epoch(
+    model,
+    validationData,
+    device,
+    loss_weights=None,
+    epoch=0,
+    total_epochs=100,
+    current_stage=1,
+    use_late_timesteps=False,
+    num_dense_points=100,
+    validation_seed=2026,
+    prediction_type='x0',
+):
     """
     单轮评估函数
     
     Args:
-        use_dense_trajectory: bool - 是否使用密集轨迹计算主损失
-        num_dense_points: int - 密集轨迹的点数
+        num_dense_points: int - 安全损失所用B样条密集采样点数
     """
     model.eval()
     total_loss = 0
@@ -1135,15 +1051,47 @@ def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_
     # 累积各项损失
     loss_accumulator = {
         'main': 0, 
-        'smoothness': 0, 
-        'curvature': 0,
-        'angle_smoothness': 0, 
-        'angle_consistency': 0, 
-        'uniformity': 0, 
-        'tangent': 0, 
+        'main_raw_mse': 0,
+        'main_adp_weight_mean': 0,
+        'residual_rms': 0,
+        'unscaled_residual_rms': 0,
+        'noise_rms': 0,
+        'noise_to_residual_ratio': 0,
+        'radial_x_norm_mean': 0,
+        'radial_x_norm_max': 0,
+        'radial_rho_mean': 0,
+        'radial_rho_min': 0,
+        'radial_active_cp_mean': 0,
+        'radial_active_y_fraction': 0,
+        'radial_active_upper_fraction': 0,
+        'hard_boundary_margin_mean': 0,
+        'hard_boundary_margin_min': 0,
+        'gt_radial_x_norm_mean': 0,
+        'gt_radial_x_norm_median': 0,
+        'gt_radial_x_norm_p95': 0,
+        'gt_radial_x_norm_p99': 0,
+        'gt_radial_x_norm_max': 0,
+        'gt_radial_above_090_fraction': 0,
+        'gt_radial_above_098_fraction': 0,
+        'gt_infeasible_fraction': 0,
+        'zero_pred_mse': 0,
+        'model_x0_mse': 0,
+        'explained_ratio': 0,
+        'boundary': 0,
+        'oob_sample_loss': 0,
+        'oob_rate': 0,
+        'max_oob': 0,
+        'active_boundary_fraction': 0,
+        'dense_oob_rate': 0,
+        'dense_max_oob': 0,
         'capsize': 0,
     }
     
+    # Reset for every validation pass so each epoch and every EMA model see
+    # exactly the same (t, r, epsilon) sequence batch by batch.
+    validation_generator = torch.Generator(device=device)
+    validation_generator.manual_seed(int(validation_seed))
+
     with torch.no_grad():
         for batch in tqdm(validationData, mininterval=2, desc="Validation"):
             
@@ -1152,9 +1100,9 @@ def eval_epoch(model, validationData, device, loss_weights=None, epoch=0, total_
                 epoch=epoch, total_epochs=total_epochs,
                 is_training=False,  # 验证模式：capsize loss返回实际cost值
                 current_stage=current_stage,  # 传递当前阶段
-                use_dense_trajectory=use_dense_trajectory,
                 num_dense_points=num_dense_points,
-                prediction_type=prediction_type
+                prediction_type=prediction_type,
+                sampling_generator=validation_generator,
             )
                 
             total_loss += loss.item()
@@ -1176,6 +1124,26 @@ def check_data_folders(folder):
     assert osp.isdir(osp.join(folder, 'train')), "Cannot find training data"  # 检查train子文件夹是否存在
     assert osp.isdir(osp.join(folder, 'val')), "Cannot find validation data"  # 检查val子文件夹是否存在
 
+
+def build_stage1_config(
+    epochs,
+    main_norm_p=1.0,
+    boundary_weight=0.1,
+    boundary_safe_bound=0.98,
+):
+    """Canonical Stage 1 configuration shared with Fisher training."""
+    return {
+        'epochs': int(epochs),
+        'lr_mul': 1e-1,
+        'loss_weights': {
+            'main': 1e-2,
+            'main_norm_p': float(main_norm_p),
+            'boundary': float(boundary_weight),
+            'boundary_safe_bound': float(boundary_safe_bound),
+        },
+    }
+
+
 def print_model_parameters(model, stage_info=""):
     """打印模型参数的训练状态"""
     print(f"{stage_info} - Model Parameter Status:")
@@ -1196,6 +1164,34 @@ def print_model_parameters(model, stage_info=""):
     print(f"  Trainable ratio: {trainable_params/total_params:.1%}")
     print()
 
+def load_model_state_dict_compat(module, state_dict, strict=True):
+    """
+    加载模型参数。
+
+    strict=True 时保持 PyTorch 默认行为；strict=False 时只加载名称和形状都匹配的参数，
+    方便从旧版 raw-map cross-attention 结构迁移到 regime-latent 结构。
+    """
+    if strict:
+        return module.load_state_dict(state_dict)
+
+    current_state = module.state_dict()
+    compatible_state = {}
+    skipped = []
+    for name, value in state_dict.items():
+        if name in current_state and current_state[name].shape == value.shape:
+            compatible_state[name] = value
+        else:
+            skipped.append(name)
+
+    missing, unexpected = module.load_state_dict(compatible_state, strict=False)
+    print(
+        f"Partial checkpoint load: loaded {len(compatible_state)} tensors, "
+        f"skipped {len(skipped)} incompatible tensors, missing {len(missing)}, unexpected {len(unexpected)}"
+    )
+    if skipped:
+        print("  Skipped examples:", ", ".join(skipped[:8]))
+    return missing, unexpected
+
 def load_checkpoint(model, checkpoint_path, device):
     """加载检查点"""
     if not osp.exists(checkpoint_path):
@@ -1205,10 +1201,11 @@ def load_checkpoint(model, checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     if 'model_state_dict' in checkpoint:
+        model_to_load = model.module if isinstance(model, nn.DataParallel) else model
         if isinstance(model, nn.DataParallel):
-            model.module.load_state_dict(checkpoint['model_state_dict'])
+            load_model_state_dict_compat(model_to_load, checkpoint['model_state_dict'], strict=False)
         else:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            load_model_state_dict_compat(model_to_load, checkpoint['model_state_dict'], strict=False)
     else:
         raise ValueError("Invalid checkpoint format")
     
@@ -1219,14 +1216,52 @@ def load_checkpoint(model, checkpoint_path, device):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--batchSize', help="Batch size per GPU", required=True, type=int)
-    parser.add_argument('--dataFolder', help="Directory with training and validation data", default=None)
+    parser.add_argument(
+        '--dataFolder',
+        help="Directory with training and validation data",
+        default=str(MAP_CONFIG.dataset_root),
+    )
     parser.add_argument('--fileDir', help="Directory to save training data")
     parser.add_argument('--resume', help="Path to checkpoint to resume training", default=None)
     parser.add_argument('--stage', help="Training stage to start from (1 or 2)", type=int, default=1, choices=[1, 2])
     parser.add_argument('--stage1_epochs', help="Number of epochs for stage 1", type=int, default=200)
     parser.add_argument('--stage2_epochs', help="Number of epochs for stage 2", type=int, default=300)
+    parser.add_argument(
+        '--main_norm_p',
+        help="Adaptive exponent for the main pMF loss (first ablation: 1.0, 0.5, 0.0)",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        '--boundary_weight',
+        help="Weight of the sparse active-only control-point boundary loss",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        '--boundary_safe_bound',
+        help="Safe normalized map bound; violations of |coordinate| > bound are penalized",
+        type=float,
+        default=0.98,
+    )
+    parser.add_argument('--seed', help="Fixed random seed for controlled ablations", type=int, default=2026)
+    parser.add_argument(
+        '--checkpoint_every',
+        help="Periodic checkpoint interval; 0 disables periodic backups",
+        type=int,
+        default=25,
+    )
     # parser.add_argument('--prediction_type', help="Model prediction type", type=str, default='v', choices=['epsilon', 'x0', 'v'])
     args = parser.parse_args()
+
+    if not 0.0 <= args.main_norm_p <= 1.0:
+        raise ValueError("--main_norm_p must be in [0, 1]")
+    if args.boundary_weight < 0.0:
+        raise ValueError("--boundary_weight must be >= 0")
+    if not 0.0 < args.boundary_safe_bound <= 1.0:
+        raise ValueError("--boundary_safe_bound must be in (0, 1]")
+    if args.checkpoint_every < 0:
+        raise ValueError("--checkpoint_every must be >= 0")
 
     # 检查数据文件夹
     dataFolder = args.dataFolder
@@ -1249,8 +1284,13 @@ if __name__ == "__main__":
         batch_size = batch_size * torch.cuda.device_count()
     print(f"Total batch size : {batch_size}")
 
-    torch_seed = np.random.randint(low=0, high=1000)  # 生成随机种子
-    torch.manual_seed(torch_seed)  # 设置PyTorch随机种子，确保结果可复现
+    # 单变量消融必须共享模型初始化、噪声序列和DataLoader随机顺序。
+    torch_seed = int(args.seed)
+    random.seed(torch_seed)
+    np.random.seed(torch_seed)
+    torch.manual_seed(torch_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(torch_seed)
     
     # =================== 模型配置 ===================
     # 根据论文发现：模型容量不足时，只有x_pred能训练，epsilon/v_pred会失败
@@ -1273,8 +1313,9 @@ if __name__ == "__main__":
         n_position=15*15,
         dropout=0.1,
         train_shape=[12, 12],
-        n_path_steps=24,  # 24个B样条控制点 (x,y)
+        n_path_steps=25,  # 25条物理边的25×缩放零和残差token
         diffusion_steps=50,
+        coordinate_scale=MAP_HALF_EXTENT,
         prediction_type=prediction_type,  # 'epsilon', 'x0', or 'v' - 模型输出什么
         loss_type=loss_type  # 与prediction_type保持一致
         # 
@@ -1287,11 +1328,14 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print("模型配置")
     print("="*70)
-    print(f"训练方法: Standard Diffusion (DDIM)")
+    print(f"训练方法: pMF / Rectified Flow")
+    print(f"条件结构: Implicit Guidance Encoder")
     print(f"预测类型: {prediction_type}")
     print(f"模型层数: {model_args['n_layers']}")
     print(f"注意力头: {model_args['n_heads']}")
     print(f"模型维度: {model_args['d_model']}")
+    print(f"Guidance tokens: {model_args['n_path_steps']} (aligned to physical edges)")
+    print("轨迹表示: 25×物理零和边残差（严格端点）")
     print("="*70 + "\n")
 
     # 初始化扩散模型
@@ -1309,13 +1353,19 @@ if __name__ == "__main__":
     print(f"Trainable parameters: {trainable_params:,}")
     
     # =================== 数据加载 ===================
-    # env_list = ["env000004", "env000005"]
-    # env_list = ["env000008"]
-    # env_list = ["env000008", "env000009"]
-    # env_list = ["env000010", "env000011"]
-    # env_list = ["env000012", "env000013"]
-    env_list = ["env000012", "env000013",
-                "env000012_optimized", "env000013_optimized"]
+    # 自动发现目录，避免手写环境列表漏掉地图。dataset20 的100张地图全部训练。
+    train_env_list = discover_environments(
+        osp.join(dataFolder, "train"),
+        expected_count=MAP_CONFIG.expected_environments,
+    )
+    val_env_list = discover_environments(
+        osp.join(dataFolder, "val"),
+        expected_count=MAP_CONFIG.expected_environments,
+    )
+    print(
+        f"✓ 数据集环境: train={len(train_env_list)}, "
+        f"val={len(val_env_list)}, root={dataFolder}"
+    )
     
     # =================== EMA配置 ===================
     use_ema = False  # 是否使用EMA
@@ -1336,43 +1386,16 @@ if __name__ == "__main__":
         
         print(f"✓ EMA启用 (decays={ema_decays})")
     
-    # =================== 密集轨迹配置 ===================
-    use_dense_trajectory = False  # 是否使用密集轨迹计算主损失
-    num_dense_points = 100  # 密集轨迹的点数
-    
-    print(f"✓ 密集轨迹: {'启用' if use_dense_trajectory else '禁用'}")
-    if use_dense_trajectory:
-        print(f"  - 密集点数: {num_dense_points}")
+    num_dense_points = 100
+    print(f"✓ 几何/安全损失的B样条密集采样点数: {num_dense_points}")
     
     # =================== 两阶段训练配置 ===================
-    # 阶段1配置：注重基础轨迹预测
-    # stage1_config = {
-    #     'epochs': args.stage1_epochs,
-    #     'lr_mul': 1e-1,  # 学习率倍增器
-    #     'loss_weights': {
-    #         'smoothness': 1e-5,   # 平滑性损失
-    #         'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
-    #         'angle_smoothness': 1e-2,  # 角度平滑性损失
-    #         'angle_consistency': 0e-6,  # 角度一致性损失(防止倒车)
-    #         'uniformity': 0e-4,   # 均匀性损失（点间距离方差）
-    #         'sincos_norm': 1e-1,   # sin/cos归一化损失（确保sin²+cos²≈1）
-    #         'capsize': 0.0        # 倾覆监督损失（第一阶段不启用）
-    #     }
-    # }
-    stage1_config = {
-        'epochs': args.stage1_epochs,
-        'lr_mul': 1e-1,  # 学习率倍增器
-        'loss_weights': {
-            'main': 1e-2,          # 主预测损失
-            'smoothness': 0e-5,   # 平滑性损失
-            'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
-            'angle_smoothness': 0e-2,  # 角度平滑性损失
-            'angle_consistency': 0e-6,  # 角度一致性损失(防止倒车)
-            'uniformity': 0e-4,   # 均匀性损失（点间距离方差）
-            'tangent': 0e3,   # 切线约束损失（确保起点和终点方向一致）
-            'capsize': 0.0        # 倾覆监督损失（第一阶段不启用）
-        }
-    }
+    stage1_config = build_stage1_config(
+        epochs=args.stage1_epochs,
+        main_norm_p=args.main_norm_p,
+        boundary_weight=args.boundary_weight,
+        boundary_safe_bound=args.boundary_safe_bound,
+    )
     
     # 阶段2配置：通过梯度优化学习低cost轨迹
     # **核心改变**：使用完整DDIM采样链计算cost，而非单步预测
@@ -1382,14 +1405,10 @@ if __name__ == "__main__":
         'lr_mul': 1e-3,  # 小学习率微调（不是从头训练！）
         'loss_weights': {
             'main': 1e-2,        # 保留主损失作为正则化（不能为0！）
-            'smoothness': 0e-5,   # 平滑性损失
-            'curvature': 0e-4,    # 曲率约束（限制最大曲率）- 新增
-            'angle_smoothness': 0e-2,  # 角度平滑性损失
-            'angle_consistency': 0e-6,  # 角度一致性损失
-            'uniformity': 0e-4,   # 均匀性损失
-            'tangent': 0e-2,   # 切线约束损失（确保起点和终点方向一致）
+            'main_norm_p': args.main_norm_p,
+            'boundary': args.boundary_weight,
+            'boundary_safe_bound': args.boundary_safe_bound,
             'capsize': 1e-2,
-            'consistency': 0.0,   # 时间一致性损失（当前不启用）
         }
     }
     
@@ -1412,7 +1431,7 @@ if __name__ == "__main__":
     )
     
     trainDataset = UnevenPathDataLoader(
-        env_list=env_list,
+        env_list=train_env_list,
         dataFolder=osp.join(dataFolder, 'train'),
         compute_stability_map=compute_stability
     )
@@ -1425,7 +1444,7 @@ if __name__ == "__main__":
     )
 
     valDataset = UnevenPathDataLoader(
-        env_list=env_list,
+        env_list=val_env_list,
         dataFolder=osp.join(dataFolder, 'val'),
         compute_stability_map=compute_stability
     )
@@ -1463,7 +1482,12 @@ if __name__ == "__main__":
         'model_args': model_args,
         'stage1_config': stage1_config,
         'stage2_config': stage2_config,
-        'total_epochs': n_epochs
+        'total_epochs': n_epochs,
+        'seed': torch_seed,
+        'checkpoint_every': args.checkpoint_every,
+        'map_config': MAP_CONFIG.to_dict(),
+        'train_environment_count': len(train_env_list),
+        'val_environment_count': len(val_env_list),
     }
     json.dump(
         config,
@@ -1473,6 +1497,10 @@ if __name__ == "__main__":
     )
     
     writer = SummaryWriter(log_dir=trainDataFolder)
+    writer.add_scalar('Config/main_norm_p', args.main_norm_p, 0)
+    writer.add_scalar('Config/boundary_weight', args.boundary_weight, 0)
+    writer.add_scalar('Config/boundary_safe_bound', args.boundary_safe_bound, 0)
+    writer.add_scalar('Config/random_seed', torch_seed, 0)
     
     # 根据阶段配置参数冻结
     if current_stage == 1:
@@ -1646,10 +1674,11 @@ if __name__ == "__main__":
             if osp.exists(stage1_best_path):
                 print(f"✓ Loading Stage 1 best model from {osp.basename(stage1_best_path)}...")
                 checkpoint = torch.load(stage1_best_path, map_location=device)
+                model_to_load = model.module if isinstance(model, nn.DataParallel) else model
                 if isinstance(model, nn.DataParallel):
-                    model.module.load_state_dict(checkpoint['model_state_dict'])
+                    load_model_state_dict_compat(model_to_load, checkpoint['model_state_dict'], strict=False)
                 else:
-                    model.load_state_dict(checkpoint['model_state_dict'])
+                    load_model_state_dict_compat(model_to_load, checkpoint['model_state_dict'], strict=False)
                 print(f"✓ Loaded Stage 1 best model successfully")
             else:
                 print(f"⚠ Warning: Stage 1 best model not found, continuing with current parameters")
@@ -1734,7 +1763,7 @@ if __name__ == "__main__":
             # 重新创建数据加载器以启用stability计算
             print("正在重新加载数据集以启用stability map计算...")
             trainDataset = UnevenPathDataLoader(
-                env_list=env_list,
+                env_list=train_env_list,
                 dataFolder=osp.join(dataFolder, 'train'),
                 compute_stability_map=True
             )
@@ -1747,7 +1776,7 @@ if __name__ == "__main__":
             )
             
             valDataset = UnevenPathDataLoader(
-                env_list=env_list,
+                env_list=val_env_list,
                 dataFolder=osp.join(dataFolder, 'val'),
                 compute_stability_map=True
             )
@@ -1771,13 +1800,15 @@ if __name__ == "__main__":
         # 训练
         train_loss, _, _, train_loss_dict = train_epoch(
             model, trainingData, optimizer, device, stage_epoch, loss_weights, current_stage, total_stage_epochs,
-            ema_models=ema_models if use_ema else None, use_dense_trajectory=use_dense_trajectory, num_dense_points=num_dense_points
+            ema_models=ema_models if use_ema else None, num_dense_points=num_dense_points
         )
         
         # 验证（使用主模型）
         val_loss, _, _, val_loss_dict = eval_epoch(
             model, validationData, device, loss_weights, stage_epoch, total_stage_epochs, 
-            current_stage=current_stage, use_dense_trajectory=use_dense_trajectory, num_dense_points=num_dense_points
+            current_stage=current_stage,
+            num_dense_points=num_dense_points,
+            validation_seed=torch_seed,
         )
         
         # 验证EMA模型
@@ -1787,7 +1818,9 @@ if __name__ == "__main__":
             for i, ema_m in enumerate(ema_models):
                 ema_val_loss, _, _, ema_val_loss_dict = eval_epoch(
                     ema_m.module, validationData, device, loss_weights, stage_epoch, total_stage_epochs,
-                    current_stage=current_stage, use_dense_trajectory=use_dense_trajectory, num_dense_points=num_dense_points
+                    current_stage=current_stage,
+                    num_dense_points=num_dense_points,
+                    validation_seed=torch_seed,
                 )
                 ema_val_losses.append(ema_val_loss)
                 ema_val_loss_dicts.append(ema_val_loss_dict)
@@ -1799,21 +1832,121 @@ if __name__ == "__main__":
         print(f"\n[Stage {current_stage}] Epoch {stage_epoch}:")
         print(f"  Train Loss: {train_loss:.9f}")
         print(f"    - Main: {train_loss_dict['main']:.6f}")
-        # print(f"    - Smoothness: {train_loss_dict['smoothness']:.6f}")
-        # print(f"    - Curvature: {train_loss_dict['curvature']:.6f}")
-        # print(f"    - Angle Smoothness: {train_loss_dict['angle_smoothness']:.6f}")
-        # print(f"    - Angle Consistency: {train_loss_dict['angle_consistency']:.6f}")
-        # print(f"    - Uniformity: {train_loss_dict['uniformity']:.6f}")
-        print(f"    - Tangent: {train_loss_dict['tangent']:.6f}")
+        print(
+            "    - Scaled residual/noise RMS and ratio: "
+            f"{train_loss_dict['residual_rms']:.6f} / "
+            f"{train_loss_dict['noise_rms']:.6f}"
+            f" / {train_loss_dict['noise_to_residual_ratio']:.3f}"
+        )
+        print(f"    - Unscaled residual RMS: {train_loss_dict['unscaled_residual_rms']:.6f}")
+        print(
+            "    - Radial x-norm mean/max, rho mean/min: "
+            f"{train_loss_dict['radial_x_norm_mean']:.4f} / "
+            f"{train_loss_dict['radial_x_norm_max']:.4f} / "
+            f"{train_loss_dict['radial_rho_mean']:.4f} / "
+            f"{train_loss_dict['radial_rho_min']:.4f}"
+        )
+        print(
+            "    - Hard margin mean/min, GT infeasible: "
+            f"{train_loss_dict['hard_boundary_margin_mean']:.6f} / "
+            f"{train_loss_dict['hard_boundary_margin_min']:.6f} / "
+            f"{train_loss_dict['gt_infeasible_fraction']:.3%}"
+        )
+        print(
+            "    - GT alpha mean/median/p95/p99, >.90/>.98: "
+            f"{train_loss_dict['gt_radial_x_norm_mean']:.4f} / "
+            f"{train_loss_dict['gt_radial_x_norm_median']:.4f} / "
+            f"{train_loss_dict['gt_radial_x_norm_p95']:.4f} / "
+            f"{train_loss_dict['gt_radial_x_norm_p99']:.4f} / "
+            f"{train_loss_dict['gt_radial_above_090_fraction']:.3%} / "
+            f"{train_loss_dict['gt_radial_above_098_fraction']:.3%}"
+        )
+        print(
+            "    - Active constraint CP / y / upper: "
+            f"{train_loss_dict['radial_active_cp_mean']:.2f} / "
+            f"{train_loss_dict['radial_active_y_fraction']:.3%} / "
+            f"{train_loss_dict['radial_active_upper_fraction']:.3%}"
+        )
+        print(
+            "    - First raw-v norm; head grad Wv/bv/Ws/bs: "
+            f"{train_loss_dict['raw_v_norm_first_batch']:.6f}; "
+            f"{train_loss_dict['raw_v_weight_grad_norm']:.6f} / "
+            f"{train_loss_dict['raw_v_bias_grad_norm']:.3e} / "
+            f"{train_loss_dict['raw_s_weight_grad_norm']:.6f} / "
+            f"{train_loss_dict['raw_s_bias_grad_norm']:.6f}"
+        )
+        print(
+            "    - Zero MSE, Model MSE, Explained: "
+            f"{train_loss_dict['zero_pred_mse']:.6f} / "
+            f"{train_loss_dict['model_x0_mse']:.6f} / "
+            f"{train_loss_dict['explained_ratio']:.3f}"
+        )
+        print(
+            "    - Boundary / OOB rate / max OOB: "
+            f"{train_loss_dict['boundary']:.6f} / "
+            f"{train_loss_dict['oob_rate']:.3%} / "
+            f"{train_loss_dict['max_oob']:.6f}"
+        )
+        print(
+            "    - Dense-curve OOB rate / max OOB: "
+            f"{train_loss_dict['dense_oob_rate']:.3%} / "
+            f"{train_loss_dict['dense_max_oob']:.6f}"
+        )
         print(f"    - Capsize: {train_loss_dict['capsize']:.9f}")
         print(f"  Val Loss:   {val_loss:.9f}")
         print(f"    - Main: {val_loss_dict['main']:.6f}")
-        # print(f"    - Smoothness: {val_loss_dict['smoothness']:.6f}")
-        # print(f"    - Curvature: {val_loss_dict['curvature']:.6f}")
-        # print(f"    - Angle Smoothness: {val_loss_dict['angle_smoothness']:.6f}")
-        # print(f"    - Angle Consistency: {val_loss_dict['angle_consistency']:.6f}")
-        # print(f"    - Uniformity: {val_loss_dict['uniformity']:.6f}")
-        print(f"    - Tangent: {val_loss_dict['tangent']:.6f}")
+        print(
+            "    - Scaled residual/noise RMS and ratio: "
+            f"{val_loss_dict['residual_rms']:.6f} / "
+            f"{val_loss_dict['noise_rms']:.6f}"
+            f" / {val_loss_dict['noise_to_residual_ratio']:.3f}"
+        )
+        print(f"    - Unscaled residual RMS: {val_loss_dict['unscaled_residual_rms']:.6f}")
+        print(
+            "    - Radial x-norm mean/max, rho mean/min: "
+            f"{val_loss_dict['radial_x_norm_mean']:.4f} / "
+            f"{val_loss_dict['radial_x_norm_max']:.4f} / "
+            f"{val_loss_dict['radial_rho_mean']:.4f} / "
+            f"{val_loss_dict['radial_rho_min']:.4f}"
+        )
+        print(
+            "    - Hard margin mean/min, GT infeasible: "
+            f"{val_loss_dict['hard_boundary_margin_mean']:.6f} / "
+            f"{val_loss_dict['hard_boundary_margin_min']:.6f} / "
+            f"{val_loss_dict['gt_infeasible_fraction']:.3%}"
+        )
+        print(
+            "    - GT alpha mean/median/p95/p99, >.90/>.98: "
+            f"{val_loss_dict['gt_radial_x_norm_mean']:.4f} / "
+            f"{val_loss_dict['gt_radial_x_norm_median']:.4f} / "
+            f"{val_loss_dict['gt_radial_x_norm_p95']:.4f} / "
+            f"{val_loss_dict['gt_radial_x_norm_p99']:.4f} / "
+            f"{val_loss_dict['gt_radial_above_090_fraction']:.3%} / "
+            f"{val_loss_dict['gt_radial_above_098_fraction']:.3%}"
+        )
+        print(
+            "    - Active constraint CP / y / upper: "
+            f"{val_loss_dict['radial_active_cp_mean']:.2f} / "
+            f"{val_loss_dict['radial_active_y_fraction']:.3%} / "
+            f"{val_loss_dict['radial_active_upper_fraction']:.3%}"
+        )
+        print(
+            "    - Zero MSE, Model MSE, Explained: "
+            f"{val_loss_dict['zero_pred_mse']:.6f} / "
+            f"{val_loss_dict['model_x0_mse']:.6f} / "
+            f"{val_loss_dict['explained_ratio']:.3f}"
+        )
+        print(
+            "    - Boundary / OOB rate / max OOB: "
+            f"{val_loss_dict['boundary']:.6f} / "
+            f"{val_loss_dict['oob_rate']:.3%} / "
+            f"{val_loss_dict['max_oob']:.6f}"
+        )
+        print(
+            "    - Dense-curve OOB rate / max OOB: "
+            f"{val_loss_dict['dense_oob_rate']:.3%} / "
+            f"{val_loss_dict['dense_max_oob']:.6f}"
+        )
         print(f"    - Capsize: {val_loss_dict['capsize']:.9f}")
         
         # 打印EMA验证损失
@@ -1827,34 +1960,70 @@ if __name__ == "__main__":
         
         # TensorBoard - 各项损失
         writer.add_scalar('Loss/train_main', train_loss_dict['main'], stage_epoch)
-        writer.add_scalar('Loss/train_smoothness', train_loss_dict['smoothness'], stage_epoch)
-        writer.add_scalar('Loss/train_curvature', train_loss_dict['curvature'], stage_epoch)
-        writer.add_scalar('Loss/train_angle_smoothness', train_loss_dict['angle_smoothness'], stage_epoch)
-        writer.add_scalar('Loss/train_angle_consistency', train_loss_dict['angle_consistency'], stage_epoch)
-        writer.add_scalar('Loss/train_uniformity', train_loss_dict['uniformity'], stage_epoch)
-        writer.add_scalar('Loss/train_tangent', train_loss_dict['tangent'], stage_epoch)
+        writer.add_scalar('Loss/train_main_raw_mse', train_loss_dict.get('main_raw_mse', 0.0), stage_epoch)
+        writer.add_scalar('Loss/train_main_adp_weight_mean', train_loss_dict.get('main_adp_weight_mean', 0.0), stage_epoch)
+        writer.add_scalar('Loss/train_boundary', train_loss_dict['boundary'], stage_epoch)
         writer.add_scalar('Loss/train_capsize', train_loss_dict['capsize'], stage_epoch)
-        
-        # ===== R² × S¹ 监控指标 =====
-        writer.add_scalar('Manifold/train_angle_norm_mean', train_loss_dict.get('angle_norm_mean', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/train_angle_norm_error', train_loss_dict.get('angle_norm_error', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/train_main_loss_pos', train_loss_dict.get('main_loss_pos', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/train_main_loss_ang', train_loss_dict.get('main_loss_ang', 0.0), stage_epoch)
+        for metric_name in (
+            'raw_v_norm_first_batch',
+            'raw_v_weight_grad_norm',
+            'raw_v_bias_grad_norm',
+            'raw_s_weight_grad_norm',
+            'raw_s_bias_grad_norm',
+        ):
+            writer.add_scalar(
+                f'Diagnostics/train_{metric_name}',
+                train_loss_dict[metric_name],
+                stage_epoch,
+            )
         
         writer.add_scalar('Loss/val_main', val_loss_dict['main'], stage_epoch)
-        writer.add_scalar('Loss/val_smoothness', val_loss_dict['smoothness'], stage_epoch)
-        writer.add_scalar('Loss/val_curvature', val_loss_dict['curvature'], stage_epoch)
-        writer.add_scalar('Loss/val_angle_smoothness', val_loss_dict['angle_smoothness'], stage_epoch)
-        writer.add_scalar('Loss/val_angle_consistency', val_loss_dict['angle_consistency'], stage_epoch)
-        writer.add_scalar('Loss/val_uniformity', val_loss_dict['uniformity'], stage_epoch)
-        writer.add_scalar('Loss/val_tangent', val_loss_dict['tangent'], stage_epoch)
+        writer.add_scalar('Loss/val_main_raw_mse', val_loss_dict.get('main_raw_mse', 0.0), stage_epoch)
+        writer.add_scalar('Loss/val_main_adp_weight_mean', val_loss_dict.get('main_adp_weight_mean', 0.0), stage_epoch)
+        writer.add_scalar('Loss/val_boundary', val_loss_dict['boundary'], stage_epoch)
         writer.add_scalar('Loss/val_capsize', val_loss_dict['capsize'], stage_epoch)
-        
-        # ===== R² × S¹ 监控指标（验证集）=====
-        writer.add_scalar('Manifold/val_angle_norm_mean', val_loss_dict.get('angle_norm_mean', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/val_angle_norm_error', val_loss_dict.get('angle_norm_error', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/val_main_loss_pos', val_loss_dict.get('main_loss_pos', 0.0), stage_epoch)
-        writer.add_scalar('Manifold/val_main_loss_ang', val_loss_dict.get('main_loss_ang', 0.0), stage_epoch)
+
+        for split_name, metrics in (
+            ('train', train_loss_dict),
+            ('val', val_loss_dict),
+        ):
+            for metric_name in (
+                'residual_rms',
+                'unscaled_residual_rms',
+                'noise_rms',
+                'noise_to_residual_ratio',
+                'radial_x_norm_mean',
+                'radial_x_norm_max',
+                'radial_rho_mean',
+                'radial_rho_min',
+                'radial_active_cp_mean',
+                'radial_active_y_fraction',
+                'radial_active_upper_fraction',
+                'hard_boundary_margin_mean',
+                'hard_boundary_margin_min',
+                'gt_radial_x_norm_mean',
+                'gt_radial_x_norm_median',
+                'gt_radial_x_norm_p95',
+                'gt_radial_x_norm_p99',
+                'gt_radial_x_norm_max',
+                'gt_radial_above_090_fraction',
+                'gt_radial_above_098_fraction',
+                'gt_infeasible_fraction',
+                'zero_pred_mse',
+                'model_x0_mse',
+                'explained_ratio',
+                'oob_sample_loss',
+                'oob_rate',
+                'max_oob',
+                'active_boundary_fraction',
+                'dense_oob_rate',
+                'dense_max_oob',
+            ):
+                writer.add_scalar(
+                    f'Diagnostics/{split_name}_{metric_name}',
+                    metrics[metric_name],
+                    stage_epoch,
+                )
         
         # TensorBoard - EMA验证损失
         if use_ema and len(ema_val_losses) > 0:
@@ -1891,7 +2060,10 @@ if __name__ == "__main__":
                 'train_loss': train_loss,
                 'val_loss': current_val_metric,
                 'stage1_best_loss': stage1_best_loss,
-                'torch_seed': torch_seed
+                'torch_seed': torch_seed,
+                'main_norm_p': args.main_norm_p,
+                'boundary_weight': args.boundary_weight,
+                'boundary_safe_bound': args.boundary_safe_bound,
             }
             
             torch.save(checkpoint, best_model_path)
@@ -1934,7 +2106,10 @@ if __name__ == "__main__":
                         'train_loss': train_loss,
                         'val_loss': ema_val_metric,
                         'stage1_best_loss': stage1_best_loss,
-                        'torch_seed': torch_seed
+                        'torch_seed': torch_seed,
+                        'main_norm_p': args.main_norm_p,
+                        'boundary_weight': args.boundary_weight,
+                        'boundary_safe_bound': args.boundary_safe_bound,
                     }
                     torch.save(ema_checkpoint, ema_model_path)
                     if current_stage == 2:
@@ -1945,8 +2120,8 @@ if __name__ == "__main__":
                     else:
                         print(f"  ✓ Saved best EMA model (decay={decay}) to {ema_model_filename} (val_loss={ema_val_metric:.6f})")
         
-        # 定期保存检查点（每5个epoch）- 作为备份
-        if (stage_epoch + 1) % 5 == 0:
+        # 可选周期备份；消融实验可设为0，仅保留best/final以控制磁盘占用。
+        if args.checkpoint_every > 0 and (stage_epoch + 1) % args.checkpoint_every == 0:
             if isinstance(model, nn.DataParallel):
                 state_dict = model.module.state_dict()
             else:
@@ -1963,7 +2138,10 @@ if __name__ == "__main__":
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'stage1_best_loss': stage1_best_loss,
-                'torch_seed': torch_seed
+                'torch_seed': torch_seed,
+                'main_norm_p': args.main_norm_p,
+                'boundary_weight': args.boundary_weight,
+                'boundary_safe_bound': args.boundary_safe_bound,
             }, checkpoint_path)
             print(f"  Saved checkpoint to {checkpoint_path}")
             
@@ -1982,7 +2160,10 @@ if __name__ == "__main__":
                         'train_loss': train_loss,
                         'val_loss': val_loss,
                         'stage1_best_loss': stage1_best_loss,
-                        'torch_seed': torch_seed
+                        'torch_seed': torch_seed,
+                        'main_norm_p': args.main_norm_p,
+                        'boundary_weight': args.boundary_weight,
+                        'boundary_safe_bound': args.boundary_safe_bound,
                     }, ema_checkpoint_path)
                     print(f"  Saved EMA checkpoint (decay={decay}) to {ema_checkpoint_filename}")
         
@@ -2026,7 +2207,10 @@ if __name__ == "__main__":
         'train_loss': train_losses[-1],
         'val_loss': val_losses[-1],
         'stage1_best_loss': stage1_best_loss,
-        'torch_seed': torch_seed
+        'torch_seed': torch_seed,
+        'main_norm_p': args.main_norm_p,
+        'boundary_weight': args.boundary_weight,
+        'boundary_safe_bound': args.boundary_safe_bound,
     }, final_model_path)
     
     print(f"Final model saved to: {final_model_path}")
@@ -2046,7 +2230,10 @@ if __name__ == "__main__":
                 'train_loss': train_losses[-1],
                 'val_loss': val_losses[-1],
                 'stage1_best_loss': stage1_best_loss,
-                'torch_seed': torch_seed
+                'torch_seed': torch_seed,
+                'main_norm_p': args.main_norm_p,
+                'boundary_weight': args.boundary_weight,
+                'boundary_safe_bound': args.boundary_safe_bound,
             }, final_ema_path)
             print(f"Final EMA model (decay={decay}) saved to: {final_ema_filename}")
     

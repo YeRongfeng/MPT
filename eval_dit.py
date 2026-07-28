@@ -18,6 +18,13 @@ import time
 from dit.Models import PathDiffusionTransformer
 from evaluator import TrajectoryEvaluator
 from dataLoader_dit import compute_map_yaw_bins, generate_sdf_from_yaw_stability
+from map_config import (
+    MAP_BOUNDS,
+    MAP_CONFIG,
+    MAP_HALF_EXTENT,
+    MAP_RESOLUTION,
+    MAP_YAW_BINS,
+)
 
 
 def generate_paths(model, map_input, start_point, goal_point, num_paths=1, device='cuda',
@@ -50,16 +57,24 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=1, devic
     """
     model.eval()
     
+    base_model = model.module if hasattr(model, 'module') else model
+    coordinate_scale = float(base_model.coordinate_scale)
+    if not np.isclose(coordinate_scale, MAP_HALF_EXTENT, rtol=0.0, atol=1e-6):
+        raise ValueError(
+            f"模型 coordinate_scale={coordinate_scale}，"
+            f"当前地图配置要求 {MAP_HALF_EXTENT}"
+        )
+
     # 归一化起点终点并转换为4维 (x, y, cos(θ), sin(θ))
     start_normalized = torch.zeros(4, device=device)
-    start_normalized[:2] = start_point[:2] / 20.0  # x,y归一化
+    start_normalized[:2] = start_point[:2] / coordinate_scale
     start_normalized[2] = torch.cos(start_point[2])  # cos(θ)
     start_normalized[3] = torch.sin(start_point[2])  # sin(θ)
     start_normalized[:2] = torch.clamp(start_normalized[:2], -1.0, 1.0)
     start_normalized = start_normalized.unsqueeze(0)  # (1, 4)
     
     goal_normalized = torch.zeros(4, device=device)
-    goal_normalized[:2] = goal_point[:2] / 20.0
+    goal_normalized[:2] = goal_point[:2] / coordinate_scale
     goal_normalized[2] = torch.cos(goal_point[2])  # cos(θ)
     goal_normalized[3] = torch.sin(goal_point[2])  # sin(θ)
     goal_normalized[:2] = torch.clamp(goal_normalized[:2], -1.0, 1.0)
@@ -135,6 +150,21 @@ def load_environment_data(env_folder: str) -> Tuple[np.ndarray, np.ndarray, np.n
     with open(env_path, 'rb') as f:
         env = pickle.load(f)
         tensor = env['tensor']
+        if tuple(tensor.shape[:2]) != MAP_CONFIG.map_shape:
+            raise ValueError(
+                f"{env_path} 地图尺寸为 {tuple(tensor.shape[:2])}，"
+                f"配置要求 {MAP_CONFIG.map_shape}"
+            )
+        resolution = float(env.get('resolution', MAP_RESOLUTION))
+        if not np.isclose(resolution, MAP_RESOLUTION, rtol=0.0, atol=1e-6):
+            raise ValueError(
+                f"{env_path} 分辨率为 {resolution}，配置要求 {MAP_RESOLUTION}"
+            )
+        bounds = tuple(env.get('bounds', MAP_BOUNDS))
+        if not np.allclose(bounds, MAP_BOUNDS, rtol=0.0, atol=1e-6):
+            raise ValueError(
+                f"{env_path} 地图边界为 {bounds}，配置要求 {MAP_BOUNDS}"
+            )
         elevation = tensor[:, :, 0]
         normal_x = tensor[:, :, 1]
         normal_y = tensor[:, :, 2]
@@ -372,10 +402,24 @@ def print_comparison_summary(gt_metrics_agg: Dict, stage1_metrics_agg: Dict, sta
         'path_length',
         'estimated_time',
         'smoothness_total',
+        'smoothness_xy',
+        'smoothness_yaw',
+        'periodic_smoothness_yaw',
         'jerk_x',
         'jerk_y',
         'jerk_yaw',
+        'periodic_jerk_yaw',
+        'raw_yaw_step_max',
+        'periodic_yaw_step_max',
+        'yaw_wrap_jump_ratio',
+        'periodic_large_turn_ratio_pi_2',
+        'tangent_norm_min',
+        'tangent_near_zero_ratio_1e-2',
+        'tangent_near_zero_ratio_5e-2',
         'curvature_mean',
+        'curvature_abs_max',
+        'curvature_abs_q99',
+        'curvature_abs_violation_ratio_1p4',
         'speed_mean',
         'out_of_bounds_ratio',
         'heading_error_mean'
@@ -424,8 +468,8 @@ def print_comparison_summary(gt_metrics_agg: Dict, stage1_metrics_agg: Dict, sta
 
 def main():
     # =================== 配置参数 ===================
-    dataset_path = 'data/sim_dataset/val'
-    # dataset_path = 'data/sim_dataset/train'
+    dataset_path = str(MAP_CONFIG.dataset_root / 'val')
+    # dataset_path = str(MAP_CONFIG.dataset_root / 'train')
     save_path = 'evaluation_results'
     os.makedirs(save_path, exist_ok=True)
     
@@ -462,13 +506,14 @@ def main():
     
     # 选择要评估的环境和路径
     # envNum = np.random.randint(0, 99)
-    # env_list = [f'env{envNum:06d}']
-    env_list = ['env000010']  # 可以添加多个环境
+    env_list = [f'env{envNum:06d}' for envNum in range(100)]  # 评估所有环境
+    # env_list = ['env000010']  # 可以添加多个环境
     
     # 选择要评估的路径编号
     # path_nums = list(range(50))  # 评估前50条路径
     # path_nums = list(range(40, 50))  # 评估指定范围的路径
-    path_nums = list(range(0, 100))  # 评估指定范围的路径
+    # path_nums = list(range(0, 100))  # 评估指定范围的路径
+    path_nums = list(range(0, 20))  # 评估指定范围的路径
     # path_nums = [40, 41, 42, 43, 44, 45]  # 或指定特定路径
     
     print(f"Device: {device}")
@@ -488,6 +533,35 @@ def main():
     # modelFolder = 'data'
     modelFile = osp.join(modelFolder, 'model_params.json')
     model_param = json.load(open(modelFile))
+    model_coordinate_scale = model_param.get('model_args', {}).get('coordinate_scale')
+    if model_coordinate_scale is None:
+        raise ValueError(
+            f"{modelFile} 缺少 model_args.coordinate_scale，无法确认模型地图尺度"
+        )
+    if not np.isclose(
+        float(model_coordinate_scale), MAP_HALF_EXTENT, rtol=0.0, atol=1e-6
+    ):
+        raise ValueError(
+            f"{modelFile} 的 coordinate_scale={model_coordinate_scale}，"
+            f"当前地图配置要求 {MAP_HALF_EXTENT}"
+        )
+    saved_map_config = model_param.get('map_config')
+    if saved_map_config is not None:
+        expected_map_fields = {
+            'size_meters': MAP_CONFIG.size_meters,
+            'grid_size': MAP_CONFIG.grid_size,
+            'resolution': MAP_RESOLUTION,
+            'half_extent': MAP_HALF_EXTENT,
+        }
+        for key, expected_value in expected_map_fields.items():
+            actual_value = saved_map_config.get(key)
+            if actual_value is None or not np.isclose(
+                float(actual_value), float(expected_value), rtol=0.0, atol=1e-6
+            ):
+                raise ValueError(
+                    f"{modelFile} 的 map_config.{key}={actual_value}，"
+                    f"当前配置要求 {expected_value}"
+                )
     
     # 加载阶段一模型
     model_stage1 = PathDiffusionTransformer(**model_param['model_args'])
@@ -500,7 +574,10 @@ def main():
     #     checkpoint_stage1 = torch.load(osp.join(modelFolder, f'checkpoint_stage1_epoch_{epoch}.pth'))
     #     print(f"Loaded stage 1 model from epoch {epoch}.")
     
-    checkpoint_stage1 = torch.load(osp.join(modelFolder, 'stage1_best_model.pth'))
+    checkpoint_stage1 = torch.load(
+        osp.join(modelFolder, 'stage1_best_model.pth'),
+        map_location=device,
+    )
     print(f"Loaded best stage 1 model.")
     
     model_stage1.load_state_dict(checkpoint_stage1['model_state_dict'])
@@ -512,13 +589,22 @@ def main():
     
     if best:
         if ema:
-            checkpoint_stage2 = torch.load(osp.join(modelFolder, f'stage2_best_ema_{ema_decay}.pth'))
+            checkpoint_stage2 = torch.load(
+                osp.join(modelFolder, f'stage2_best_ema_{ema_decay}.pth'),
+                map_location=device,
+            )
             print(f"Loaded best EMA stage {stage} model.")
         else:
-            checkpoint_stage2 = torch.load(osp.join(modelFolder, 'stage2_best_model.pth'))
+            checkpoint_stage2 = torch.load(
+                osp.join(modelFolder, 'stage2_best_model.pth'),
+                map_location=device,
+            )
             print(f"Loaded best stage 2 model.")
     else:
-        checkpoint_stage2 = torch.load(osp.join(modelFolder, f'checkpoint_stage2_epoch_{epoch}.pth'))
+        checkpoint_stage2 = torch.load(
+            osp.join(modelFolder, f'checkpoint_stage2_epoch_{epoch}.pth'),
+            map_location=device,
+        )
         print(f"Loaded stage 2 model from epoch {epoch}.")
     
     model_stage2.load_state_dict(checkpoint_stage2['model_state_dict'])
@@ -562,23 +648,24 @@ def main():
                 normal_x_torch, 
                 normal_y_torch, 
                 normal_z_torch, 
-                yaw_bins=36
+                yaw_bins=MAP_YAW_BINS
             )  # [H, W, 36]
             
             # 生成 ESDF cost map
             cost_map = generate_sdf_from_yaw_stability(
                 yaw_stability, 
-                voxel_size_xy=0.4,  # 匹配数据集的分辨率
+                voxel_size_xy=MAP_RESOLUTION,
                 yaw_weight=1.4
             )  # [H, W, 36] - signed distance field
             
             # 创建地图信息
             H, W, D = cost_map.shape
-            map_info = {
-                'resolution': 0.4,  # 0.4米/像素
-                'origin': (-20.0, -20.0, -np.pi),  # 地图原点 (x, y, yaw)
-                'size': (W, H, D)  # (width, height, yaw_bins)
-            }
+            expected_size = MAP_CONFIG.cost_map_size
+            if (W, H, D) != expected_size:
+                raise ValueError(
+                    f"代价地图尺寸为 {(W, H, D)}，配置要求 {expected_size}"
+                )
+            map_info = MAP_CONFIG.cost_map_info()
             
             # 转换地图格式为 (D, H, W)
             cost_map_transposed = cost_map.permute(2, 0, 1)  # [36, H, W]
@@ -596,7 +683,10 @@ def main():
             print(f"Created evaluator with ESDF occupancy map and binary yaw stability map for {env_name}")
         else:
             # 创建不带地图的评估器（只评估几何特性）
-            evaluator = TrajectoryEvaluator(device=device)
+            evaluator = TrajectoryEvaluator(
+                map_info=MAP_CONFIG.cost_map_info(),
+                device=device,
+            )
             print(f"Created evaluator without map for {env_name}")
         
         for path_num in path_nums:
@@ -774,7 +864,13 @@ def main():
     comparison_data = []
     key_metrics = [
         'collision_risk_mean', 'unstable_point_ratio', 'path_length', 'estimated_time',
-        'smoothness_total', 'jerk_x', 'jerk_y', 'jerk_yaw', 'curvature_mean', 'speed_mean',
+        'smoothness_total', 'smoothness_xy', 'smoothness_yaw', 'periodic_smoothness_yaw',
+        'jerk_x', 'jerk_y', 'jerk_yaw', 'periodic_jerk_yaw',
+        'raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
+        'periodic_large_turn_ratio_pi_2',
+        'tangent_norm_min', 'tangent_near_zero_ratio_1e-2', 'tangent_near_zero_ratio_5e-2',
+        'curvature_mean', 'curvature_abs_max', 'curvature_abs_q99',
+        'curvature_abs_violation_ratio_1p4', 'speed_mean',
         'out_of_bounds_ratio', 'heading_error_mean'
     ]
     
@@ -840,7 +936,12 @@ def main():
             # 对于某些指标，低更好
             if metric in ['collision_risk_mean', 'unstable_point_ratio', 'out_of_bounds_ratio', 
                          'heading_error_mean', 'curvature_violation_ratio', 'dangerous_point_ratio',
-                         'jerk_x', 'jerk_y', 'jerk_yaw', 'smoothness_total']:
+                         'jerk_x', 'jerk_y', 'jerk_yaw', 'periodic_jerk_yaw',
+                         'smoothness_total', 'smoothness_xy', 'smoothness_yaw', 'periodic_smoothness_yaw',
+                         'raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
+                         'periodic_large_turn_ratio_pi_2', 'tangent_near_zero_ratio_1e-2',
+                         'tangent_near_zero_ratio_5e-2', 'curvature_abs_max', 'curvature_abs_q99',
+                         'curvature_abs_violation_ratio_1p4']:
                 if diff_pct < 0:
                     stage1_improved.append((metric, abs(diff_pct)))
                 elif diff_pct > 0:
@@ -872,7 +973,12 @@ def main():
             
             if metric in ['collision_risk_mean', 'unstable_point_ratio', 'out_of_bounds_ratio', 
                          'heading_error_mean', 'curvature_violation_ratio', 'dangerous_point_ratio',
-                         'jerk_x', 'jerk_y', 'jerk_yaw', 'smoothness_total']:
+                         'jerk_x', 'jerk_y', 'jerk_yaw', 'periodic_jerk_yaw',
+                         'smoothness_total', 'smoothness_xy', 'smoothness_yaw', 'periodic_smoothness_yaw',
+                         'raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
+                         'periodic_large_turn_ratio_pi_2', 'tangent_near_zero_ratio_1e-2',
+                         'tangent_near_zero_ratio_5e-2', 'curvature_abs_max', 'curvature_abs_q99',
+                         'curvature_abs_violation_ratio_1p4']:
                 if diff_pct < 0:
                     stage2_improved.append((metric, abs(diff_pct)))
                 elif diff_pct > 0:
@@ -904,7 +1010,12 @@ def main():
             
             if metric in ['collision_risk_mean', 'unstable_point_ratio', 'out_of_bounds_ratio', 
                          'heading_error_mean', 'curvature_violation_ratio', 'dangerous_point_ratio',
-                         'jerk_x', 'jerk_y', 'jerk_yaw', 'smoothness_total']:
+                         'jerk_x', 'jerk_y', 'jerk_yaw', 'periodic_jerk_yaw',
+                         'smoothness_total', 'smoothness_xy', 'smoothness_yaw', 'periodic_smoothness_yaw',
+                         'raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
+                         'periodic_large_turn_ratio_pi_2', 'tangent_near_zero_ratio_1e-2',
+                         'tangent_near_zero_ratio_5e-2', 'curvature_abs_max', 'curvature_abs_q99',
+                         'curvature_abs_violation_ratio_1p4']:
                 if diff_pct < 0:
                     stage2_vs_stage1_improved.append((metric, abs(diff_pct)))
                 elif diff_pct > 0:

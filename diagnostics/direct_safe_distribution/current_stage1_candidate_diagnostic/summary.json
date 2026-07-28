@@ -1,0 +1,73 @@
+{
+  "variant": "legacy_global",
+  "split": "validation",
+  "strict_ood": false,
+  "strict_ood_note": "Legacy checkpoint trained on all dataset0 maps; this is a pipeline diagnostic, not unseen-map evidence.",
+  "condition_count": 15,
+  "candidate_count": 480,
+  "strict_safe_definition": "all dense yaw-ESDF samples >=0, dense trajectory inside original map bounds, and finite privileged safe cost",
+  "prefix_metrics": {
+    "1": {
+      "safe_at_k": 0.4,
+      "valid_rate": 0.4,
+      "best_cost_at_k_mean": 2.4045729666948317,
+      "best_cost_at_k_median": 1.9989891052246094,
+      "safe_candidate_count_mean": 0.4,
+      "safe_mode_coverage_mean": 0.4,
+      "deduplicated_valid_count_mean": 0.4
+    },
+    "4": {
+      "safe_at_k": 0.4666666666666667,
+      "valid_rate": 0.45,
+      "best_cost_at_k_mean": 1.8180702020724615,
+      "best_cost_at_k_median": 0.7439505457878113,
+      "safe_candidate_count_mean": 1.8,
+      "safe_mode_coverage_mean": 0.9333333333333333,
+      "deduplicated_valid_count_mean": 1.4666666666666666
+    },
+    "8": {
+      "safe_at_k": 0.4666666666666667,
+      "valid_rate": 0.45,
+      "best_cost_at_k_mean": 1.7080412228902182,
+      "best_cost_at_k_median": 0.7439505457878113,
+      "safe_candidate_count_mean": 3.6,
+      "safe_mode_coverage_mean": 1.2666666666666666,
+      "deduplicated_valid_count_mean": 2.8
+    },
+    "16": {
+      "safe_at_k": 0.5333333333333333,
+      "valid_rate": 0.45,
+      "best_cost_at_k_mean": 1.6172962178786596,
+      "best_cost_at_k_median": 0.4332018792629242,
+      "safe_candidate_count_mean": 7.2,
+      "safe_mode_coverage_mean": 1.3333333333333333,
+      "deduplicated_valid_count_mean": 5.0
+    },
+    "32": {
+      "safe_at_k": 0.5333333333333333,
+      "valid_rate": 0.44166666666666665,
+      "best_cost_at_k_mean": 1.4277332976460457,
+      "best_cost_at_k_median": 0.4332018792629242,
+      "safe_candidate_count_mean": 14.133333333333333,
+      "safe_mode_coverage_mean": 1.3333333333333333,
+      "deduplicated_valid_count_mean": 8.133333333333333
+    }
+  },
+  "single_candidate": {
+    "max_esdf_violation_median": 0.356003999710083,
+    "safe_cost_median": 1.8447821140289307,
+    "path_length_median": 15.267229080200195,
+    "curvature_exceedance_mean": 0.08426869660615921,
+    "jerk_median": 0.000478008936624974,
+    "endpoint_yaw_error_median_rad": 0.23875844478607178,
+    "self_intersection_rate": 0.0,
+    "abnormal_rate": 0.0
+  },
+  "batch_inference": {
+    "k": 32,
+    "latency_ms_mean": 66.9789393330575,
+    "latency_ms_median": 32.048236000264296,
+    "peak_memory_bytes": 1011985408
+  },
+  "oracle_note": "Best-Cost@K uses privileged yaw-aware ESDF offline only; it is not an online candidate selector."
+}

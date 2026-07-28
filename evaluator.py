@@ -3,6 +3,8 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 
+from map_config import MAP_BOUNDS
+
 
 class TrajectoryEvaluator:
     """
@@ -200,12 +202,15 @@ class TrajectoryEvaluator:
         
         # 10. 航向一致性
         metrics.update(self._evaluate_heading_consistency(trajectory, velocities))
+
+        # 11. 几何诊断：周期 yaw、切向速度、曲率爆点等，用于定位 B-spline 曲线问题
+        metrics.update(self._evaluate_geometry_diagnostics(trajectory, velocities, accelerations))
         
-        # 11. 控制点均匀性（如果提供）
+        # 12. 控制点均匀性（如果提供）
         if control_points is not None:
             metrics.update(self._evaluate_control_point_uniformity(control_points))
         
-        # 12. 边界检查
+        # 13. 边界检查
         metrics.update(self._check_bounds(trajectory))
         
         return metrics
@@ -507,6 +512,96 @@ class TrajectoryEvaluator:
         metrics['actual_backward_ratio'] = (actual_backward / len(speed_projection)).item()
         
         return metrics
+
+    def _angle_diff(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """周期角差 a-b，返回 [-pi, pi]。"""
+        diff = a - b
+        return torch.atan2(torch.sin(diff), torch.cos(diff))
+
+    def _evaluate_geometry_diagnostics(
+        self,
+        trajectory: torch.Tensor,
+        velocities: torch.Tensor,
+        accelerations: torch.Tensor
+    ) -> Dict[str, float]:
+        """额外几何诊断：不替代原指标，只帮助判断 yaw wrap、低切向速度和曲率尖峰。"""
+        metrics = {}
+        K = trajectory.shape[0]
+        if K < 2:
+            return {
+                'smoothness_xy': 0.0,
+                'periodic_smoothness_yaw': 0.0,
+                'periodic_jerk_yaw': 0.0,
+                'raw_yaw_step_max': 0.0,
+                'periodic_yaw_step_max': 0.0,
+                'yaw_wrap_jump_count': 0.0,
+                'yaw_wrap_jump_ratio': 0.0,
+                'tangent_norm_min': 0.0,
+                'tangent_norm_mean': 0.0,
+                'tangent_near_zero_ratio_1e-3': 0.0,
+                'tangent_near_zero_ratio_1e-2': 0.0,
+                'tangent_near_zero_ratio_5e-2': 0.0,
+            }
+
+        yaw = trajectory[:, 2]
+        raw_yaw_step = yaw[1:] - yaw[:-1]
+        periodic_yaw_step = self._angle_diff(yaw[1:], yaw[:-1])
+
+        metrics['raw_yaw_step_max'] = raw_yaw_step.abs().max().item()
+        metrics['raw_yaw_step_mean'] = raw_yaw_step.abs().mean().item()
+        metrics['periodic_yaw_step_max'] = periodic_yaw_step.abs().max().item()
+        metrics['periodic_yaw_step_mean'] = periodic_yaw_step.abs().mean().item()
+        metrics['yaw_wrap_jump_count'] = (raw_yaw_step.abs() > np.pi).sum().float().item()
+        metrics['yaw_wrap_jump_ratio'] = (raw_yaw_step.abs() > np.pi).float().mean().item()
+        metrics['periodic_large_turn_ratio_pi_2'] = (periodic_yaw_step.abs() > (np.pi / 2)).float().mean().item()
+        metrics['periodic_large_turn_ratio_pi_4'] = (periodic_yaw_step.abs() > (np.pi / 4)).float().mean().item()
+
+        ax, ay = accelerations[:, 0], accelerations[:, 1]
+        metrics['smoothness_xy'] = (ax**2 + ay**2).mean().item()
+        metrics['smoothness_yaw_fraction'] = (
+            metrics.get('smoothness_yaw', (accelerations[:, 2] ** 2).mean().item()) /
+            (metrics['smoothness_xy'] + metrics.get('smoothness_yaw', (accelerations[:, 2] ** 2).mean().item()) + 1e-12)
+        )
+
+        if periodic_yaw_step.numel() >= 2:
+            periodic_yaw_acc = self._angle_diff(periodic_yaw_step[1:], periodic_yaw_step[:-1])
+            metrics['periodic_smoothness_yaw'] = (periodic_yaw_acc**2).mean().item()
+            metrics['periodic_yaw_acc_max'] = periodic_yaw_acc.abs().max().item()
+            if periodic_yaw_acc.numel() >= 2:
+                periodic_yaw_jerk = self._angle_diff(periodic_yaw_acc[1:], periodic_yaw_acc[:-1])
+                metrics['periodic_jerk_yaw'] = torch.sqrt((periodic_yaw_jerk**2).mean() + 1e-12).item()
+                metrics['periodic_yaw_jerk_max'] = periodic_yaw_jerk.abs().max().item()
+            else:
+                metrics['periodic_jerk_yaw'] = 0.0
+                metrics['periodic_yaw_jerk_max'] = 0.0
+        else:
+            metrics['periodic_smoothness_yaw'] = 0.0
+            metrics['periodic_yaw_acc_max'] = 0.0
+            metrics['periodic_jerk_yaw'] = 0.0
+            metrics['periodic_yaw_jerk_max'] = 0.0
+
+        vx, vy = velocities[:, 0], velocities[:, 1]
+        tangent_norm = torch.sqrt(vx**2 + vy**2)
+        metrics['tangent_norm_min'] = tangent_norm.min().item()
+        metrics['tangent_norm_mean'] = tangent_norm.mean().item()
+        metrics['tangent_norm_std'] = tangent_norm.std().item()
+        metrics['tangent_near_zero_ratio_1e-3'] = (tangent_norm < 1e-3).float().mean().item()
+        metrics['tangent_near_zero_ratio_1e-2'] = (tangent_norm < 1e-2).float().mean().item()
+        metrics['tangent_near_zero_ratio_5e-2'] = (tangent_norm < 5e-2).float().mean().item()
+        metrics['tangent_near_zero_ratio_1e-1'] = (tangent_norm < 1e-1).float().mean().item()
+
+        curvature_eps = 1e-6
+        cross_product = vx * ay - vy * ax
+        curvature_abs = torch.abs(cross_product) / (tangent_norm.clamp_min(curvature_eps) ** 3 + curvature_eps)
+        metrics['curvature_abs_mean'] = curvature_abs.mean().item()
+        metrics['curvature_abs_max'] = curvature_abs.max().item()
+        metrics['curvature_abs_std'] = curvature_abs.std().item()
+        metrics['curvature_abs_q90'] = torch.quantile(curvature_abs, 0.9).item()
+        metrics['curvature_abs_q99'] = torch.quantile(curvature_abs, 0.99).item()
+        metrics['curvature_abs_violation_ratio_1p4'] = (curvature_abs > 1.4).float().mean().item()
+        metrics['curvature_abs_violation_ratio_5'] = (curvature_abs > 5.0).float().mean().item()
+
+        return metrics
     
     def _evaluate_control_point_uniformity(self, control_points: torch.Tensor) -> Dict[str, float]:
         """评估控制点的均匀性"""
@@ -555,15 +650,44 @@ class TrajectoryEvaluator:
         
         return metrics
     
-    def _check_bounds(self, trajectory: torch.Tensor, map_limit: float = 20.0) -> Dict[str, float]:
+    def _check_bounds(
+        self,
+        trajectory: torch.Tensor,
+        bounds: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Dict[str, float]:
         """检查轨迹是否超出边界"""
         metrics = {}
+
+        if bounds is None:
+            if self.map_info is not None and 'bounds' in self.map_info:
+                bounds = tuple(self.map_info['bounds'])
+            elif self.map_info is not None:
+                resolution = float(self.map_info['resolution'])
+                origin = self.map_info['origin']
+                W, H, _ = self.map_info['size']
+                bounds = (
+                    float(origin[0]),
+                    float(origin[0]) + W * resolution,
+                    float(origin[1]),
+                    float(origin[1]) + H * resolution,
+                )
+            else:
+                bounds = MAP_BOUNDS
+        if len(bounds) != 4:
+            raise ValueError(f"bounds must be (xmin,xmax,ymin,ymax), got {bounds}")
+        x_min, x_max, y_min, y_max = map(float, bounds)
         
         x, y = trajectory[:, 0], trajectory[:, 1]
         
         # 计算超出距离
-        exceed_x = torch.abs(x) - map_limit
-        exceed_y = torch.abs(y) - map_limit
+        exceed_x = torch.maximum(
+            torch.tensor(x_min, device=x.device, dtype=x.dtype) - x,
+            x - torch.tensor(x_max, device=x.device, dtype=x.dtype),
+        )
+        exceed_y = torch.maximum(
+            torch.tensor(y_min, device=y.device, dtype=y.dtype) - y,
+            y - torch.tensor(y_max, device=y.device, dtype=y.dtype),
+        )
         
         # 超出点的数量和比例
         out_of_bounds_x = (exceed_x > 0).sum().float()
@@ -579,8 +703,8 @@ class TrajectoryEvaluator:
         metrics['max_exceed_y'] = torch.relu(exceed_y).max().item()
         
         # 边界距离统计
-        distance_to_bound_x = map_limit - torch.abs(x)
-        distance_to_bound_y = map_limit - torch.abs(y)
+        distance_to_bound_x = torch.minimum(x - x_min, x_max - x)
+        distance_to_bound_y = torch.minimum(y - y_min, y_max - y)
         min_distance_to_bound = torch.minimum(distance_to_bound_x, distance_to_bound_y)
         
         metrics['min_distance_to_boundary'] = min_distance_to_bound.min().item()
@@ -602,8 +726,13 @@ class TrajectoryEvaluator:
                         'stability_min', 'stability_max', 'stability_std', 'stable_point_ratio'],
             "轨迹长度": ['path_length', 'estimated_time'],
             "平滑度": ['smoothness_total', 'smoothness_x', 'smoothness_y', 'smoothness_yaw',
-                     'jerk_x', 'jerk_y', 'jerk_yaw'],
-            "曲率": ['curvature_mean', 'curvature_max', 'curvature_std', 'curvature_violation_ratio'],
+                     'smoothness_xy', 'periodic_smoothness_yaw',
+                     'jerk_x', 'jerk_y', 'jerk_yaw', 'periodic_jerk_yaw'],
+            "曲率": ['curvature_mean', 'curvature_max', 'curvature_std', 'curvature_violation_ratio',
+                   'curvature_abs_max', 'curvature_abs_q99', 'curvature_abs_violation_ratio_1p4'],
+            "几何诊断": ['raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
+                     'periodic_large_turn_ratio_pi_2', 'tangent_norm_min', 'tangent_norm_mean',
+                     'tangent_near_zero_ratio_1e-2', 'tangent_near_zero_ratio_5e-2'],
             "角速度": ['angular_velocity_mean', 'angular_velocity_max', 'angular_velocity_std'],
             "速度": ['speed_mean', 'speed_max', 'speed_min', 'speed_std', 
                     'slow_point_ratio', 'speed_change_mean', 'speed_change_max'],

@@ -18,6 +18,14 @@ from torch.nn.utils.rnn import pad_sequence  # 序列填充：处理变长序列
 
 from utils import geom2pix  # 坐标转换工具：几何坐标到像素坐标的转换
 from relative_motion_utils import trajectory_to_relative_motion  # 相对运动工具：轨迹转换为相对运动表示
+from map_config import (
+    MAP_BOUNDS,
+    MAP_CONFIG,
+    MAP_GRID_SIZE,
+    MAP_HALF_EXTENT,
+    MAP_RESOLUTION,
+    MAP_YAW_BINS,
+)
 
 # 添加兼容性处理
 import sys
@@ -25,21 +33,20 @@ sys.modules['numpy._core'] = np
 sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
 sys.modules['numpy._core.multiarray'] = np.core.multiarray
 
-# 【全局参数配置】
-input_size = 100
+# 【全局参数配置】地图物理尺度统一来自 map_config.py
+input_size = MAP_GRID_SIZE
 output_grid = 12
 anchor_spacing = 8
 boundary_offset = 6
 
-map_size = (input_size, input_size)  # 地图尺寸：100x100像素的标准地图大小
+map_size = MAP_CONFIG.map_shape
 receptive_field = 38   # 感受野大小：每个锚点影响的像素范围 TODO
-res = 0.4              # 地图分辨率：每像素代表0.4米的实际距离
+res = MAP_RESOLUTION
 
 # 【理论最大正样本数自动计算】
-# 感受野区域大小：receptive_field * res = 38 * 0.1 = 3.8米
-# 锚点间距：anchor_spacing * res = 8 * 0.1 = 0.8米
-# x方向最大锚点数：ceil(3.8 / 0.8) = 5个
-# y方向最大锚点数：ceil(3.8 / 0.8) = 5个
+# 感受野和锚点间距都由像素数乘 MAP_RESOLUTION 得到。
+# 当前 dataset20 中分别为 38*0.2=7.6 米、8*0.2=1.6 米。
+# 每个轴向最大锚点数：ceil(7.6 / 1.6) = 5个
 # 理论最大正样本数：5 × 5 = 25个
 import math
 receptive_field_size = receptive_field * res  # 感受野的实际大小（米）
@@ -50,13 +57,27 @@ MAX_POSITIVE_ANCHORS = max_anchors_per_axis * max_anchors_per_axis  # 理论最�
 # 【锚点网格系统构建】
 # 将连续的地图空间离散化为12x12的锚点网格，用于Transformer的token化处理
 
-# X轴锚点坐标：从6像素开始，每8像素一个锚点，转换为几何坐标: 
-# [6, 14, 22, ..., 94] * res - 5 = [-4.4, -3.6, -2.8, ..., 4.4] 米
-X = np.arange(boundary_offset, output_grid*anchor_spacing+boundary_offset, anchor_spacing)*res - 20
+# X轴锚点坐标：从6像素开始，每8像素一个锚点，再转换为地图几何坐标。
+X = (
+    np.arange(
+        boundary_offset,
+        output_grid * anchor_spacing + boundary_offset,
+        anchor_spacing,
+    )
+    * res
+    - MAP_HALF_EXTENT
+)
 
-# Y轴锚点坐标：从6像素开始，每8像素一个锚点，转换为几何坐标: 
-# [6, 14, 22, ..., 94] * res - 5 = [-4.4, -3.6, -2.8, ..., 4.4] 米
-Y = np.arange(boundary_offset, output_grid*anchor_spacing+boundary_offset, anchor_spacing)*res - 20
+# Y轴使用相同的居中坐标约定。
+Y = (
+    np.arange(
+        boundary_offset,
+        output_grid * anchor_spacing + boundary_offset,
+        anchor_spacing,
+    )
+    * res
+    - MAP_HALF_EXTENT
+)
 
 # 创建2D网格：生成所有锚点的几何坐标
 grid_2d = np.meshgrid(X, Y)  # 创建X-Y坐标网格
@@ -80,12 +101,12 @@ hashTable = [(anchor_spacing*c+boundary_offset, anchor_spacing*r+boundary_offset
 
 # 【网格系统说明】
 # 1. 锚点分布：12x12=144个锚点均匀分布在地图上
-# 2. 像素间距：每个锚点间隔8像素，对应0.8米的实际距离
+# 2. 像素间距：每个锚点间隔8像素，物理间距由 MAP_RESOLUTION 派生
 # 3. 边界偏移：起始偏移6像素，确保锚点不在地图边缘
 # 4. 坐标对应：每个锚点代表一个8x8像素的区域
 # 5. 索引映射：通过hashTable实现1D索引到2D像素坐标的转换
 
-def geom2pixMatpos(pos, res=0.4, size=(100, 100)):
+def geom2pixMatpos(pos, res=MAP_RESOLUTION, size=MAP_CONFIG.map_shape):
     # 计算输入位置到所有锚点的距离
     distances = np.linalg.norm(grid_points - pos, axis=1)  # 形状：(100,)
     
@@ -101,7 +122,7 @@ def geom2pixMatpos(pos, res=0.4, size=(100, 100)):
 
     return indices  # 返回正样本锚点索引元组
 
-def geom2pix(pos, res=0.4, size=(100, 100)):
+def geom2pix(pos, res=MAP_RESOLUTION, size=MAP_CONFIG.map_shape):
     """
     几何坐标到像素坐标的转换函数
     
@@ -113,14 +134,11 @@ def geom2pix(pos, res=0.4, size=(100, 100)):
     Returns:
         tuple: 像素坐标 (row, col)
     """
-    # 根据地图边界 (-5, 5, -5, 5) 和分辨率 0.1 进行转换
     x, y = pos
-    
-    # 将几何坐标转换为像素坐标
-    # x: -5 到 5 映射到 0 到 100
-    # y: -5 到 5 映射到 0 到 100
-    col = int((x + 20.0) / res)
-    row = int((y + 20.0) / res)
+
+    # 居中地图坐标 [-half_extent, half_extent] -> 像素坐标。
+    col = int((x - MAP_CONFIG.origin_xy[0]) / res)
+    row = int((y - MAP_CONFIG.origin_xy[1]) / res)
     
     # 边界检查
     row = max(0, min(size[0] - 1, row))
@@ -1321,13 +1339,26 @@ class UnevenPathDataLoader(Dataset):
         self.env_index = {env_name: i for i, env_name in enumerate(env_list)}
         self.indexDict = []
         self.env_static_cache = {}  # 每个环境的静态缓存：地图通道/编码输入/stability等
-        
+
         for env_name in env_list:
             env_path = osp.join(dataFolder, env_name)
-            # 只计算path_*.p文件的数量
-            path_files = [f for f in os.listdir(env_path) if f.startswith('path_') and f.endswith('.p')]
-            for i in range(len(path_files)):
-                self.indexDict.append((self.env_index[env_name], i))
+            if not osp.isdir(env_path):
+                raise FileNotFoundError(f"环境目录不存在: {env_path}")
+            if not osp.isfile(osp.join(env_path, "map.p")):
+                raise FileNotFoundError(f"环境缺少 map.p: {env_path}")
+
+            # 保存真实路径编号，不再假定 path 文件必须从0开始连续编号。
+            path_indices = []
+            for filename in os.listdir(env_path):
+                if not (filename.startswith("path_") and filename.endswith(".p")):
+                    continue
+                index_text = filename[len("path_"):-len(".p")]
+                if index_text.isdigit():
+                    path_indices.append(int(index_text))
+            if not path_indices:
+                raise FileNotFoundError(f"环境中没有 path_*.p: {env_path}")
+            for path_index in sorted(path_indices):
+                self.indexDict.append((self.env_index[env_name], path_index))
         
         if self.compute_stability_map:
             if self.use_precomputed_stability:
@@ -1356,6 +1387,24 @@ class UnevenPathDataLoader(Dataset):
             map_data = pickle.load(f)
 
         map_tensor = map_data['tensor']
+        if tuple(map_tensor.shape[:2]) != MAP_CONFIG.map_shape:
+            raise ValueError(
+                f"{map_file} 的地图尺寸为 {tuple(map_tensor.shape[:2])}，"
+                f"配置要求 {MAP_CONFIG.map_shape}"
+            )
+        map_resolution = float(map_data.get("resolution", MAP_RESOLUTION))
+        if not np.isclose(map_resolution, MAP_RESOLUTION, rtol=0.0, atol=1e-6):
+            raise ValueError(
+                f"{map_file} 的分辨率为 {map_resolution}，"
+                f"配置要求 {MAP_RESOLUTION}"
+            )
+        map_bounds = tuple(map_data.get("bounds", MAP_BOUNDS))
+        if len(map_bounds) != 4 or not np.allclose(
+            map_bounds, MAP_BOUNDS, rtol=0.0, atol=1e-6
+        ):
+            raise ValueError(
+                f"{map_file} 的边界为 {map_bounds}，配置要求 {MAP_BOUNDS}"
+            )
         elevation = map_tensor[:, :, 0].astype(np.float32)
         normal_x = map_tensor[:, :, 1].astype(np.float32)
         normal_y = map_tensor[:, :, 2].astype(np.float32)
@@ -1559,10 +1608,12 @@ class UnevenPathDataLoader(Dataset):
 
             # 如果缓存没有，则在线计算一次并写回缓存
             if yaw_stability is None or cost_map is None:
-                yaw_stability = compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=36)  # [H, W, 36]
+                yaw_stability = compute_map_yaw_bins(
+                    normal_x, normal_y, normal_z, yaw_bins=MAP_YAW_BINS
+                )
                 cost_map = generate_sdf_from_yaw_stability(
                     yaw_stability,
-                    voxel_size_xy=0.1,
+                    voxel_size_xy=MAP_RESOLUTION,
                     yaw_weight=1.4
                 )
                 if isinstance(yaw_stability, torch.Tensor):

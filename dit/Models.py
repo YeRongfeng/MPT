@@ -56,8 +56,288 @@ from bspline_utils import (
     reconstruct_from_control_points,
     DifferentiableBSpline
 )
+from map_config import MAP_HALF_EXTENT
 
 import math
+
+
+class PhysicalScaledEdgeResidualRepresentation(nn.Module):
+    """25× physical edge residuals with an optional radial feasibility map."""
+
+    def __init__(
+        self,
+        num_control_points: int = 26,
+        lower_bound: float = -1.0,
+        upper_bound: float = 1.0,
+        feasibility_eps: float = 1e-6,
+    ):
+        super().__init__()
+        if num_control_points != 26:
+            raise ValueError("Current implementation expects 26 control points.")
+        if not lower_bound < upper_bound:
+            raise ValueError("lower_bound must be smaller than upper_bound.")
+        self.num_control_points = num_control_points
+        self.num_edges = num_control_points - 1
+        self.residual_scale = float(self.num_edges)
+        self.lower_bound = float(lower_bound)
+        self.upper_bound = float(upper_bound)
+        self.feasibility_eps = float(feasibility_eps)
+
+    def project_zero_sum(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or x.shape[1:] != (self.num_edges, 2):
+            raise ValueError(
+                f"Expected (B,{self.num_edges},2), got {tuple(x.shape)}"
+            )
+        projected = x - x.mean(dim=1, keepdim=True)
+        return projected - projected.mean(dim=1, keepdim=True)
+
+    def encode(
+        self,
+        control_points: torch.Tensor,
+        start_xy: torch.Tensor,
+        goal_xy: torch.Tensor,
+    ) -> torch.Tensor:
+        if control_points.ndim != 3 or control_points.shape[1:] != (
+            self.num_control_points,
+            2,
+        ):
+            raise ValueError(
+                f"Expected control_points (B,{self.num_control_points},2), "
+                f"got {tuple(control_points.shape)}"
+            )
+        if start_xy.shape != (control_points.shape[0], 2):
+            raise ValueError(f"Expected start_xy (B,2), got {tuple(start_xy.shape)}")
+        if goal_xy.shape != (control_points.shape[0], 2):
+            raise ValueError(f"Expected goal_xy (B,2), got {tuple(goal_xy.shape)}")
+
+        edges = control_points[:, 1:, :] - control_points[:, :-1, :]
+        base_edge = (goal_xy - start_xy).unsqueeze(1) / self.num_edges
+        return self.project_zero_sum(
+            self.residual_scale * (edges - base_edge)
+        )
+
+    def decode(
+        self,
+        scaled_residuals: torch.Tensor,
+        start_xy: torch.Tensor,
+        goal_xy: torch.Tensor,
+    ) -> torch.Tensor:
+        scaled_residuals = self.project_zero_sum(scaled_residuals)
+        if start_xy.shape != (scaled_residuals.shape[0], 2):
+            raise ValueError(f"Expected start_xy (B,2), got {tuple(start_xy.shape)}")
+        if goal_xy.shape != (scaled_residuals.shape[0], 2):
+            raise ValueError(f"Expected goal_xy (B,2), got {tuple(goal_xy.shape)}")
+
+        base_edge = (goal_xy - start_xy).unsqueeze(1) / self.num_edges
+        edges = base_edge + scaled_residuals / self.residual_scale
+        points_after_start = start_xy.unsqueeze(1) + torch.cumsum(edges, dim=1)
+        return torch.cat([start_xy.unsqueeze(1), points_after_start], dim=1)
+
+    def chord(self, start_xy: torch.Tensor, goal_xy: torch.Tensor) -> torch.Tensor:
+        if start_xy.ndim != 2 or start_xy.shape[-1] != 2:
+            raise ValueError(f"Expected start_xy (B,2), got {tuple(start_xy.shape)}")
+        if goal_xy.shape != start_xy.shape:
+            raise ValueError(
+                f"Expected goal_xy shaped {tuple(start_xy.shape)}, got "
+                f"{tuple(goal_xy.shape)}"
+            )
+        tau = torch.linspace(
+            0.0,
+            1.0,
+            self.num_control_points,
+            device=start_xy.device,
+            dtype=start_xy.dtype,
+        ).view(1, self.num_control_points, 1)
+        return (1.0 - tau) * start_xy.unsqueeze(1) + tau * goal_xy.unsqueeze(1)
+
+    def compute_max_feasible_radius(
+        self,
+        direction: torch.Tensor,
+        start_xy: torch.Tensor,
+        goal_xy: torch.Tensor,
+        return_diagnostics: bool = False,
+    ):
+        """Maximum positive radius along a unit zero-sum residual direction."""
+        if direction.ndim != 3 or direction.shape[1:] != (self.num_edges, 2):
+            raise ValueError(
+                f"Expected direction (B,{self.num_edges},2), got "
+                f"{tuple(direction.shape)}"
+            )
+        chord = self.chord(start_xy, goal_xy)
+        delta_after_start = torch.cumsum(direction, dim=1) / self.residual_scale
+        delta = torch.cat(
+            [torch.zeros_like(delta_after_start[:, :1]), delta_after_start],
+            dim=1,
+        )
+
+        eps = self.feasibility_eps
+        upper_slack = (self.upper_bound - chord).clamp_min(0.0)
+        lower_slack = (chord - self.lower_bound).clamp_min(0.0)
+        # Use a large finite sentinel instead of inf: the zero-direction branch
+        # is masked later, and finite values avoid inf*0/NaN in backward.
+        sentinel = torch.full_like(delta, 1.0 / eps)
+
+        positive = delta > eps
+        negative = delta < -eps
+        safe_positive_delta = torch.where(positive, delta, torch.ones_like(delta))
+        safe_negative_delta = torch.where(negative, -delta, torch.ones_like(delta))
+        upper_limit = torch.where(
+            positive,
+            upper_slack / safe_positive_delta,
+            sentinel,
+        )
+        lower_limit = torch.where(
+            negative,
+            lower_slack / safe_negative_delta,
+            sentinel,
+        )
+        coordinate_limit = torch.minimum(upper_limit, lower_limit)
+        flat_limit = coordinate_limit.flatten(start_dim=1)
+        rho, active_flat_index = flat_limit.min(dim=1)
+        rho = rho.clamp_min(0.0)
+
+        if not return_diagnostics:
+            return rho
+
+        active_is_upper = (
+            upper_limit.flatten(start_dim=1)
+            .gather(1, active_flat_index.unsqueeze(1))
+            .squeeze(1)
+            <= lower_limit.flatten(start_dim=1)
+            .gather(1, active_flat_index.unsqueeze(1))
+            .squeeze(1)
+        )
+        diagnostics = {
+            'active_flat_index': active_flat_index,
+            'active_control_point': torch.div(
+                active_flat_index, 2, rounding_mode='floor'
+            ),
+            'active_coordinate': active_flat_index.remainder(2),
+            'active_is_upper': active_is_upper,
+            'chord': chord,
+            'delta': delta,
+        }
+        return rho, diagnostics
+
+    def radial_feasible_residual(
+        self,
+        raw_v: torch.Tensor,
+        raw_s: torch.Tensor,
+        start_xy: torch.Tensor,
+        goal_xy: torch.Tensor,
+        return_diagnostics: bool = False,
+    ):
+        """Map unconstrained network outputs to a feasible physical residual."""
+        v = self.project_zero_sum(raw_v)
+        batch_size = v.shape[0]
+        if raw_s.ndim == 1:
+            raw_s = raw_s.unsqueeze(1)
+        if raw_s.shape != (batch_size, 1):
+            raise ValueError(f"Expected raw_s (B,1), got {tuple(raw_s.shape)}")
+
+        v_norm = torch.linalg.vector_norm(v.flatten(start_dim=1), dim=1)
+        slack = F.softplus(raw_s.squeeze(1)) + 1e-4
+        denominator = torch.sqrt(
+            v_norm.square() + slack.square() + self.feasibility_eps
+        )
+        x = v / denominator.view(batch_size, 1, 1)
+        x_norm = torch.linalg.vector_norm(x.flatten(start_dim=1), dim=1)
+        nonzero = x_norm > self.feasibility_eps
+        direction = x / x_norm.clamp_min(self.feasibility_eps).view(
+            batch_size, 1, 1
+        )
+        rho, radius_diagnostics = self.compute_max_feasible_radius(
+            direction,
+            start_xy,
+            goal_xy,
+            return_diagnostics=True,
+        )
+        rho = torch.where(nonzero, rho, torch.zeros_like(rho))
+        residual = rho.view(batch_size, 1, 1) * x
+        residual = torch.where(
+            nonzero.view(batch_size, 1, 1),
+            residual,
+            torch.zeros_like(residual),
+        )
+
+        if not return_diagnostics:
+            return residual
+
+        control_points = self.decode(residual, start_xy, goal_xy)
+        hard_margin = torch.minimum(
+            control_points - self.lower_bound,
+            self.upper_bound - control_points,
+        ).flatten(start_dim=1).amin(dim=1)
+        diagnostics = {
+            'x_norm': x_norm,
+            'rho': rho,
+            'slack': slack,
+            'hard_boundary_margin': hard_margin,
+            **radius_diagnostics,
+        }
+        return residual, diagnostics
+
+    def radial_diagnostics_from_residual(
+        self,
+        residual: torch.Tensor,
+        start_xy: torch.Tensor,
+        goal_xy: torch.Tensor,
+    ):
+        """Recover radial utilization and active constraints from a residual."""
+        residual = self.project_zero_sum(residual)
+        residual_norm = torch.linalg.vector_norm(
+            residual.flatten(start_dim=1), dim=1
+        )
+        nonzero = residual_norm > self.feasibility_eps
+        direction = residual / residual_norm.clamp_min(
+            self.feasibility_eps
+        ).view(-1, 1, 1)
+        rho, diagnostics = self.compute_max_feasible_radius(
+            direction,
+            start_xy,
+            goal_xy,
+            return_diagnostics=True,
+        )
+        rho = torch.where(nonzero, rho, torch.zeros_like(rho))
+        x_norm = torch.where(
+            nonzero,
+            residual_norm / rho.clamp_min(self.feasibility_eps),
+            torch.zeros_like(residual_norm),
+        )
+        control_points = self.decode(residual, start_xy, goal_xy)
+        hard_margin = torch.minimum(
+            control_points - self.lower_bound,
+            self.upper_bound - control_points,
+        ).flatten(start_dim=1).amin(dim=1)
+        return {
+            'x_norm': x_norm,
+            'rho': rho,
+            'hard_boundary_margin': hard_margin,
+            **diagnostics,
+        }
+
+    def radial_project_residual(
+        self,
+        residual: torch.Tensor,
+        start_xy: torch.Tensor,
+        goal_xy: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project only excessive radial magnitude; preserve residual direction."""
+        residual = self.project_zero_sum(residual)
+        residual_norm = torch.linalg.vector_norm(
+            residual.flatten(start_dim=1), dim=1
+        )
+        nonzero = residual_norm > self.feasibility_eps
+        direction = residual / residual_norm.clamp_min(
+            self.feasibility_eps
+        ).view(-1, 1, 1)
+        rho = self.compute_max_feasible_radius(direction, start_xy, goal_xy)
+        scale = torch.minimum(
+            torch.ones_like(residual_norm),
+            rho / residual_norm.clamp_min(self.feasibility_eps),
+        )
+        scale = torch.where(nonzero, scale, torch.ones_like(scale))
+        return residual * scale.view(-1, 1, 1)
 
 
 class TrajDiTBlock(nn.Module):
@@ -86,7 +366,7 @@ class TrajDiTBlock(nn.Module):
             self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
             self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
             self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
-            self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+            self.regime_cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
             self.norm3 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
             self.ffn = nn.Sequential(
                     nn.Linear(d_model, d_ff),
@@ -102,7 +382,7 @@ class TrajDiTBlock(nn.Module):
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, map_feat, c):
+    def forward(self, x, regime_feat, c):
             params = self.adaLN_modulation(c).chunk(9, dim=-1)
             (shift_msa, scale_msa, gate_msa, 
                 shift_mca, scale_mca, gate_mca, 
@@ -115,7 +395,7 @@ class TrajDiTBlock(nn.Module):
             # 2. Cross-Attention
             x_norm = self.norm2(x)
             x_norm = x_norm * (1 + scale_mca.unsqueeze(1)) + shift_mca.unsqueeze(1)
-            attn_out, _ = self.cross_attn(x_norm, map_feat, map_feat, need_weights=False)
+            attn_out, _ = self.regime_cross_attn(x_norm, regime_feat, regime_feat, need_weights=False)
             x = x + gate_mca.unsqueeze(1) * attn_out
             # 3. FFN
             x_norm = self.norm3(x)
@@ -320,6 +600,87 @@ class MultiScalePositionalEncoding(nn.Module):
         if x.shape[1] != h * w:
             raise ValueError(f"Token length mismatch: got {x.shape[1]}, expected {h*w} for conv_shape={conv_shape}.")
         return x + pos
+
+
+class ImplicitGuidanceEncoder(nn.Module):
+    """
+    生成与轨迹进度对齐的隐式 guidance tokens。
+
+    guidance queries 由 start/goal SE(2)、t/h 和可学习进度 token 构成，
+    再由这些非逐点噪声 query 去读取 normal map tokens。
+    """
+    def __init__(self, d_model, n_heads, d_ff, n_path_steps=25, dropout=0.1, n_self_layers=1):
+        super().__init__()
+        self.n_path_steps = n_path_steps
+
+        self.start_embedder = nn.Sequential(
+            nn.Linear(4, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
+        self.goal_embedder = nn.Sequential(
+            nn.Linear(4, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
+        self.task_fusion = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
+        self.time_fusion = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
+        self.progress_embed = nn.Parameter(
+            torch.randn(1, n_path_steps, d_model) * 0.02
+        )
+        self.query_film = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(2 * d_model, 2 * d_model)
+        )
+
+        self.map_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.query_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.map_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.guidance_self_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=d_ff,
+                dropout=dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True
+            )
+            for _ in range(n_self_layers)
+        ])
+        self.output_norm = nn.LayerNorm(d_model, eps=1e-6)
+
+    def forward(self, map_tokens, start_pose, goal_pose, t_emb, h_emb):
+        B = map_tokens.shape[0]
+
+        start_token = self.start_embedder(start_pose)
+        goal_token = self.goal_embedder(goal_pose)
+        task_context = self.task_fusion(torch.cat([start_token, goal_token], dim=-1))
+        time_context = self.time_fusion(torch.cat([t_emb, h_emb], dim=-1))
+
+        context = torch.cat([task_context, time_context], dim=-1)
+        shift, scale = self.query_film(context).chunk(2, dim=-1)
+
+        queries = self.progress_embed.expand(B, -1, -1)
+        queries = queries * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+        q = self.query_norm(queries)
+        kv = self.map_norm(map_tokens)
+        guidance, _ = self.map_attn(q, kv, kv, need_weights=False)
+        guidance = queries + guidance
+
+        for layer in self.guidance_self_layers:
+            guidance = layer(guidance)
+
+        return self.output_norm(guidance)
 
 
 class Encoder(nn.Module):
@@ -620,9 +981,8 @@ class PathDiffusionTransformer(nn.Module):
     """
     基于DiT架构的路径扩散模型（从UnevenTransformer改造）
     【控制点语义】
-    - 完整B样条：26个控制点 = 起点(1) + 中间点(24) + 终点(1)
-    - 起点/终点：固定的，由start_pose和goal_pose决定
-    - n_path_steps=24：网络预测的中间控制点数量（不包含起终点）
+    - pMF状态：25个物理控制多边形边的25×缩放零和残差
+    - 完整B样条：由起终点、均匀基准边和残差累加为26个控制点
     【架构设计】
     原始UnevenTransformer：地图 → CNN → Transformer blocks → 预测头
     改造为扩散模型：地图+噪声路径 → CNN特征提取 → token融合 → DiT blocks(时间步条件) → 噪声预测
@@ -639,18 +999,34 @@ class PathDiffusionTransformer(nn.Module):
     
     def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, 
                  pad_idx, dropout, n_position, train_shape, 
-                 n_path_steps=24, diffusion_steps=50, prediction_type='epsilon', loss_type=None):
+                 n_path_steps=25, diffusion_steps=50, prediction_type='epsilon', loss_type=None,
+                 coordinate_scale=MAP_HALF_EXTENT,
+                 privileged_local_dim=0,
+                 **deprecated_kwargs):
         """
         Args:
-            n_path_steps: 中间控制点数量（默认24，不包含起终点）
-                         完整B样条需要26=1(起点)+24(中间)+1(终点)个控制点
+            n_path_steps: 物理边残差token数量，当前固定为25
             prediction_type: 'epsilon' (预测噪声), 'x0' (预测原始数据), 或 'v' (预测velocity)
             loss_type: 'epsilon', 'x0', 或 'v' - 损失函数的目标类型，如果为None则与prediction_type相同
+            coordinate_scale: 归一化坐标1.0对应的物理米数
         """
         super().__init__()
+        unexpected_kwargs = set(deprecated_kwargs) - {'num_regime_tokens'}
+        if unexpected_kwargs:
+            raise TypeError(f"Unexpected PathDiffusionTransformer kwargs: {sorted(unexpected_kwargs)}")
+        if n_path_steps != 25:
+            raise ValueError(
+                "Physical edge residual representation requires n_path_steps=25."
+            )
         
         self.prediction_type = prediction_type
         self.loss_type = loss_type if loss_type is not None else prediction_type
+        self.coordinate_scale = float(coordinate_scale)
+        self.privileged_local_dim = int(privileged_local_dim)
+        if self.coordinate_scale <= 0.0:
+            raise ValueError("coordinate_scale must be positive")
+        if self.privileged_local_dim < 0:
+            raise ValueError("privileged_local_dim must be non-negative")
         # 显存优化：训练时对DiT主干启用梯度检查点
         self.use_gradient_checkpoint = True
         
@@ -696,10 +1072,22 @@ class PathDiffusionTransformer(nn.Module):
         self.map_position_enc = MultiScalePositionalEncoding(d_model)
         self.dropout = nn.Dropout(p=dropout)
         
+        # ========== Implicit Guidance Encoder ==========
+        # 用非逐点噪声的 progress/task/time/summary queries 读取 normal map，
+        # 得到与25条控制多边形边对齐的隐式 guidance tokens。
+        self.guidance_encoder = ImplicitGuidanceEncoder(
+            d_model=d_model,
+            n_heads=n_heads,
+            d_ff=d_inner,
+            n_path_steps=n_path_steps,
+            dropout=dropout,
+            n_self_layers=1
+        )
+
         # ========== 条件融合MLP ==========
-        # 将时间步、起点和终点融合为全局条件
+        # 将 t、h=t-r、起点和终点融合为全局条件
         self.cond_mlp = nn.Sequential(
-            nn.Linear(d_model * 4, d_model * 5),  # 4 = time + time_r + start + goal
+            nn.Linear(d_model * 4, d_model * 5),  # 4 = time + time_h + start + goal
             nn.GELU(),
             nn.Linear(d_model * 5, d_model)
         )
@@ -719,6 +1107,16 @@ class PathDiffusionTransformer(nn.Module):
             nn.GELU(),
             nn.Linear(d_model // 2, d_model)
         )
+        if self.privileged_local_dim:
+            self.privileged_local_embed = nn.Sequential(
+                nn.Linear(self.privileged_local_dim, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, d_model),
+            )
+            # Enabling the diagnostic branch must reproduce the frozen
+            # Stage-1 output before any Stage-2 update.
+            nn.init.zeros_(self.privileged_local_embed[-1].weight)
+            nn.init.zeros_(self.privileged_local_embed[-1].bias)
         
         # 路径位置编码（可学习）
         self.path_pos_embed = nn.Parameter(
@@ -760,6 +1158,19 @@ class PathDiffusionTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model // 2, 2)  # (x, y)
         )
+        self.radial_slack_pred = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
+        # softplus makes slack positive with a non-zero derivative even when
+        # raw_s is initialized at zero.
+        nn.init.zeros_(self.radial_slack_pred[-1].weight)
+        # A moderate initial slack keeps the untrained path near its chord
+        # instead of placing random directions close to the hard boundary.
+        initial_slack = 5.0
+        initial_raw_s = math.log(math.expm1(initial_slack - 1e-4))
+        nn.init.constant_(self.radial_slack_pred[-1].bias, initial_raw_s)
         
         # # 细节预测头（用于精细化调整主预测）
         # detail_in_dim = d_model + 2  # DiT特征 + 主预测的完整2维
@@ -776,6 +1187,11 @@ class PathDiffusionTransformer(nn.Module):
         
         # ========== Rectified Flow 连续时间参数化 ==========
         self.n_path_steps = n_path_steps
+        self.num_edges = n_path_steps
+        self.num_control_points = 26
+        self.trajectory_representation = PhysicalScaledEdgeResidualRepresentation(
+            num_control_points=self.num_control_points
+        )
         self.diffusion_steps = diffusion_steps  # 仅用于采样步数，不再作为离散索引
         
         # Rectified Flow 时间语义：
@@ -790,7 +1206,7 @@ class PathDiffusionTransformer(nn.Module):
         self.register_buffer('t_sample_mean', torch.tensor(-0.8))  # logit空间的均值
         self.register_buffer('t_sample_std', torch.tensor(0.8))   # logit空间的标准差
     
-    def sample_timesteps(self, n: int, device=None):
+    def sample_timesteps(self, n: int, device=None, generator=None):
         """
         连续时间步采样策略（Rectified Flow）
         
@@ -809,7 +1225,11 @@ class PathDiffusionTransformer(nn.Module):
             device = self.t_sample_mean.device
         
         # logit-normal分布采样
-        z = torch.randn(n, device=device) * self.t_sample_std + self.t_sample_mean
+        z = (
+            torch.randn(n, device=device, generator=generator)
+            * self.t_sample_std
+            + self.t_sample_mean
+        )
         # sigmoid映射到(0,1)，自然避免极端值
         t_continuous = torch.sigmoid(z)
         
@@ -818,7 +1238,50 @@ class PathDiffusionTransformer(nn.Module):
         
         return t_continuous
 
-    def forward(self, map_input, noisy_path, timestep, timestep_r, start_pose, goal_pose):
+    def project_zero_sum(self, residuals):
+        return self.trajectory_representation.project_zero_sum(residuals)
+
+    def decode_residual_edges(self, residuals, start_pose, goal_pose):
+        return self.trajectory_representation.decode(
+            residuals, start_pose[:, :2], goal_pose[:, :2]
+        )
+
+    def decode_feasible_residual_edges(self, residuals, start_pose, goal_pose):
+        feasible_residuals = self.trajectory_representation.radial_project_residual(
+            residuals,
+            start_pose[:, :2],
+            goal_pose[:, :2],
+        )
+        return self.decode_residual_edges(
+            feasible_residuals, start_pose, goal_pose
+        )
+
+    def radial_feasible_x0(
+        self,
+        raw_v,
+        raw_s,
+        start_pose,
+        goal_pose,
+        return_diagnostics=False,
+    ):
+        return self.trajectory_representation.radial_feasible_residual(
+            raw_v,
+            raw_s,
+            start_pose[:, :2],
+            goal_pose[:, :2],
+            return_diagnostics=return_diagnostics,
+        )
+
+    def forward(
+        self,
+        map_input,
+        noisy_path,
+        timestep,
+        timestep_r,
+        start_pose,
+        goal_pose,
+        privileged_local_features=None,
+    ):
         """
         扩散模型前向传播（解耦数据流版本）- Rectified Flow
         
@@ -829,15 +1292,14 @@ class PathDiffusionTransformer(nn.Module):
         
         Args:
             map_input: (B, 3, H, W) 输入地图
-            noisy_path: (B, n_path_steps, 2) 加噪后的中间控制点 x_t (x,y)
-                       n_path_steps=24，不包含起终点
+            noisy_path: (B,25,2) 加噪后的缩放零和边残差
             timestep: (B,) 连续时间步 t ∈ [0, 1]
                      t=0: 纯数据, t=1: 纯噪声
             start_pose: (B, 4) 起点坐标 (x,y,cos(θ),sin(θ)) - 已归一化
             goal_pose: (B, 4) 终点坐标 (x,y,cos(θ),sin(θ)) - 已归一化
             
         Returns:
-            model_output: (B, n_path_steps, 2) 预测的速度场 v = x_1 - x_0
+            model_output: (B,25,2) 缩放零和边残差预测
         """
         B = map_input.shape[0]
         
@@ -853,21 +1315,39 @@ class PathDiffusionTransformer(nn.Module):
         map_tokens = self.reorder_dims(feat_12)           # (B, 144, D)
         map_tokens = self.map_position_enc(map_tokens, conv_shape=feat_12.shape[-2:])
         
-        # ========== 2. 编码路径 + 起终点 (Query Sequence) ==========
-        # 2.1 编码中间路径点 (B, N, D)
-        path_tokens = self.path_patchify(noisy_path)
-        # 添加 Learnable Position Embedding (仅针对中间路径点)
-        path_tokens = path_tokens + self.path_pos_embed  # (B, N, D)
-        
-        # 2.2 编码起终点 (B, 1, D)
-        # 使用 pose_embedder 提取 x,y,cos,sin 特征
-        start_token = self.pose_embedder(start_pose).unsqueeze(1)
-        goal_token = self.pose_embedder(goal_pose).unsqueeze(1)
-        
-        # 【关键修改】拼接顺序: [Start, Path, Goal] -> (B, N+2, D)
-        # 注意：这里不再对 combined 整体加 pos_embed，因为 path_pos_embed 已经加在中间了
-        # Start/Goal 本身就是绝对位置信息，不需要额外的序列位置编码
-        combined_tokens = torch.cat([start_token, path_tokens, goal_token], dim=1)
+        # ========== 2. 编码25条物理边残差 (Query Sequence) ==========
+        if noisy_path.ndim != 3 or noisy_path.shape[1:] != (self.num_edges, 2):
+            raise ValueError(
+                f"Expected noisy_path (B,{self.num_edges},2), "
+                f"got {tuple(noisy_path.shape)}"
+            )
+
+        path_tokens = self.path_patchify(noisy_path)  # (B, 25, D)
+        combined_tokens = path_tokens + self.path_pos_embed
+        if privileged_local_features is not None:
+            if not self.privileged_local_dim:
+                raise ValueError(
+                    "privileged_local_features were provided, but "
+                    "privileged_local_dim=0"
+                )
+            if (
+                privileged_local_features.ndim != 3
+                or privileged_local_features.shape[0] != B
+                or privileged_local_features.shape[2] != self.privileged_local_dim
+            ):
+                raise ValueError(
+                    "Expected privileged_local_features "
+                    f"(B,N,{self.privileged_local_dim}), got "
+                    f"{tuple(privileged_local_features.shape)}"
+                )
+            local_features = F.adaptive_avg_pool1d(
+                privileged_local_features.transpose(1, 2),
+                self.num_edges,
+            ).transpose(1, 2)
+            combined_tokens = (
+                combined_tokens
+                + self.privileged_local_embed(local_features)
+            )
         
         # 2.3 预处理
         # 建议先 Norm 再进入 Block，保证分布一致性
@@ -876,35 +1356,48 @@ class PathDiffusionTransformer(nn.Module):
         
         # ========== 3. 编码条件 (Condition) ==========
         t_emb = self.time_embedder(timestep)      # (B, D) - 时间步
-        r_emb = self.time_embedder(timestep_r)      # (B, D) - 时间步
+        h_emb = self.time_embedder(torch.clamp(timestep - timestep_r, min=0.0, max=1.0))  # (B, D) - pMF步长
         s_emb = self.pose_embedder(start_pose)    # (B, D) - 起点
         g_emb = self.pose_embedder(goal_pose)     # (B, D) - 终点
         
         # 融合所有全局条件 -> (B, D)
         # cond = self.cond_mlp(torch.cat([t_emb, s_emb, g_emb], dim=-1))
-        cond = self.cond_mlp(torch.cat([t_emb, r_emb, s_emb, g_emb], dim=-1))
+        cond = self.cond_mlp(torch.cat([t_emb, h_emb, s_emb, g_emb], dim=-1))
         # cond = t_emb  # 仅使用时间步作为条件
         
-        # ========== 4. DiT Blocks（解耦数据流） ==========
+        # ========== 4. Implicit Guidance Tokens ==========
+        guidance_tokens = self.guidance_encoder(
+            map_tokens=map_tokens,
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            t_emb=t_emb,
+            h_emb=h_emb
+        )
+
+        # ========== 5. DiT Blocks（解耦数据流） ==========
         # x (Query): combined tokens，在主干中不断更新
-        # map_tokens (Key/Value): 地图tokens，保持不变，提供环境信息
+        # guidance_tokens (Key/Value): 轨迹进度对齐的隐式地图引导
         # cond: 全局条件，通过AdaLN调制每一层
         x = combined_tokens
         for block in self.dit_blocks:
             if self.training and self.use_gradient_checkpoint:
                 x = torch.utils.checkpoint.checkpoint(
-                    block, x, map_tokens, cond, use_reentrant=False
+                    block, x, guidance_tokens, cond, use_reentrant=False
                 )
             else:
-                x = block(x, map_tokens, cond)
+                x = block(x, guidance_tokens, cond)
             
         x = self.layer_norm(x)  # 最后LayerNorm
         
-        # ========== 5. 输出预测（单头连续回归） ==========
-        middle_feats = x[:, 1:-1, :]  # 提取中间控制点特征，去掉起终点 (B, n_path_steps, D)
-        model_output = self.main_pred(middle_feats)  # (B, n_path_steps, 2)
-        model_output = torch.clamp(model_output, -1.0, 1.0)
-        return model_output  # 返回24个中间控制点
+        # ========== 6. 条件径向可行域 x0 输出 ==========
+        raw_v = self.main_pred(x)
+        raw_s = self.radial_slack_pred(x.mean(dim=1))
+        return self.radial_feasible_x0(
+            raw_v,
+            raw_s,
+            start_pose,
+            goal_pose,
+        )
     
     def q_sample(self, x_start, t, noise=None):
         """
@@ -932,12 +1425,14 @@ class PathDiffusionTransformer(nn.Module):
         """
         if noise is None:
             noise = torch.randn_like(x_start)
+        x_start = self.project_zero_sum(x_start)
+        noise = self.project_zero_sum(noise)
         
         # 扩展时间维度以匹配数据形状
         t = t.view(-1, 1, 1)  # (B, 1, 1)
         
         # Rectified Flow: z_t = (1-t) * x_0 + t * x_1
-        z_t = (1 - t) * x_start + t * noise
+        z_t = self.project_zero_sum((1 - t) * x_start + t * noise)
         
         return z_t, noise
     
@@ -965,8 +1460,7 @@ class PathDiffusionTransformer(nn.Module):
         if t_scalar < 1e-5:
             return torch.zeros_like(z_in)
             
-        v_field = (z_in - pred_x0) / t_scalar
-        return v_field
+        return self.project_zero_sum((z_in - pred_x0) / t_scalar)
 
     def get_velocity_tensor(self, z_in, t_scalar, r_scalar, map_input, start_pose, goal_pose):
         """可微分的速度获取函数（t/r 使用 0-d tensor）"""
@@ -991,32 +1485,34 @@ class PathDiffusionTransformer(nn.Module):
             pred_x0 = (z_in - t_scalar * model_out)
 
         eps = 1e-5
-        v_field = (z_in - pred_x0) / (t_scalar + eps)
-        return v_field
+        return self.project_zero_sum((z_in - pred_x0) / (t_scalar + eps))
 
     def sample_differentiable(self, map_input, start_pose, goal_pose, num_steps=3,
                               solver='pmf_refined', reconstruct_trajectory=True, num_traj_points=100):
         """
-        可微分采样（用于训练期的梯度回传）。
+        可微分采样（用于训练期的梯度回传）。零和物理边残差在解码时
+        结构性保证真实起终点，不需要事后覆盖。
 
         Args:
             map_input: (B, 3, H, W)
             start_pose: (B, 4) 归一化起点 (x,y,cos,sin)
             goal_pose: (B, 4) 归一化终点 (x,y,cos,sin)
         Returns:
-            reconstructed_traj: (B, num_traj_points, 2) 或控制点 (B, n_path_steps+2, 2)
+            reconstructed_traj: (B, num_traj_points, 2) 或控制点 (B, 26, 2)
         """
         device = map_input.device
         B = map_input.shape[0]
 
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
 
         if solver == 'pmf_refined':
             t_start = torch.tensor(1.0, device=device)
             t_mid = torch.tensor(0.1, device=device)
 
             v_coarse = self.get_velocity_tensor(z, t_start, t_mid, map_input, start_pose, goal_pose)
-            z = z + (t_mid - t_start) * v_coarse
+            z = self.project_zero_sum(z + (t_mid - t_start) * v_coarse)
 
             timesteps = torch.linspace(t_mid, torch.tensor(0.0, device=device), num_steps + 1, device=device)
             for i in range(num_steps):
@@ -1024,7 +1520,7 @@ class PathDiffusionTransformer(nn.Module):
                 t_next = timesteps[i + 1]
                 dt = t_next - t_curr
                 v_fine = self.get_velocity_tensor(z, t_curr, t_next, map_input, start_pose, goal_pose)
-                z = z + dt * v_fine
+                z = self.project_zero_sum(z + dt * v_fine)
         elif solver == 'euler':
             timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
             for i in range(num_steps):
@@ -1032,7 +1528,7 @@ class PathDiffusionTransformer(nn.Module):
                 t_next = timesteps[i + 1]
                 dt = t_next - t_curr
                 v_pred = self.get_velocity_tensor(z, t_curr, t_next, map_input, start_pose, goal_pose)
-                z = z + dt * v_pred
+                z = self.project_zero_sum(z + dt * v_pred)
         elif solver == 'heun':
             timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
             for i in range(num_steps):
@@ -1042,22 +1538,20 @@ class PathDiffusionTransformer(nn.Module):
                 v1 = self.get_velocity_tensor(z, t_curr, t_next, map_input, start_pose, goal_pose)
                 z_pred = z + dt * v1
                 v2 = self.get_velocity_tensor(z_pred, t_next, t_next, map_input, start_pose, goal_pose)
-                z = z + dt * (v1 + v2) / 2
+                z = self.project_zero_sum(z + dt * (v1 + v2) / 2)
         else:
             raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_refined', 'euler' or 'heun'.")
 
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        control_points = torch.cat([start_xy, z, goal_xy], dim=1)
-
-        control_points_normalized = torch.clamp(control_points, -1.0, 1.0)
-        control_points_denorm = control_points_normalized * 20.0
+        control_points_normalized = self.decode_feasible_residual_edges(
+            z, start_pose, goal_pose
+        )
+        control_points_denorm = control_points_normalized * self.coordinate_scale
 
         if not reconstruct_trajectory:
             return control_points_denorm
 
         bspline_layer = DifferentiableBSpline(
-            num_control_points=self.n_path_steps + 2,
+            num_control_points=self.num_control_points,
             num_output_points=num_traj_points,
             degree=3
         ).to(device)
@@ -1071,7 +1565,9 @@ class PathDiffusionTransformer(nn.Module):
         B = map_input.shape[0]
         
         # 从纯噪声开始 t=1
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         
         t_batch = torch.ones(B, device=device)
         r_batch = torch.zeros(B, device=device) # 目标是 0 
@@ -1079,12 +1575,7 @@ class PathDiffusionTransformer(nn.Module):
         # 模型在 pMF 训练下，t=1, r=0 的输出即为修正后的高质量 x0
         pred_x0 = self.forward(map_input, z, t_batch, r_batch, start_pose, goal_pose)
         
-        # 组装控制点
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        control_points = torch.cat([start_xy, pred_x0, goal_xy], dim=1)
-        
-        return control_points
+        return self.decode_feasible_residual_edges(pred_x0, start_pose, goal_pose)
     
     @torch.no_grad()
     def sample_pmf_refined(self, map_input, start_pose, goal_pose, 
@@ -1098,7 +1589,9 @@ class PathDiffusionTransformer(nn.Module):
         B = map_input.shape[0]
 
         # --- 初始化 ---
-        z = torch.randn(B, self.n_path_steps, 2, device=device) # t=1
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )  # t=1
         
         # --- 阶段一：Coarse Jump (利用 pMF 的跨步能力) ---
         t_start = 1.0
@@ -1107,7 +1600,9 @@ class PathDiffusionTransformer(nn.Module):
         # 调用模型预测从 1.0 到 0.1 的平均速度
         # 根据 pMF 定义：z_mid = z_1 + (t_mid - t_start) * V(z_1, t=1, r=t_mid)
         v_coarse = self.get_velocity(z, t_start, t_mid, map_input, start_pose, goal_pose)
-        z = z + (t_mid - t_start) * v_coarse # 注意此时 dt = -0.9
+        z = self.project_zero_sum(
+            z + (t_mid - t_start) * v_coarse
+        )  # 注意此时 dt = -0.9
         
         # --- 阶段二：Fine-grained Integration (局部细化) ---
         # 此时 z 已经严格处于 Probability Flow 上的 t=0.1 位置
@@ -1120,12 +1615,9 @@ class PathDiffusionTransformer(nn.Module):
             
             # 保持 r = t_next，每一小步都利用 pMF 修正局部截断误差
             v_fine = self.get_velocity(z, t_curr, t_next, map_input, start_pose, goal_pose)
-            z = z + dt * v_fine
+            z = self.project_zero_sum(z + dt * v_fine)
             
-        # --- 组装 ---
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        return torch.cat([start_xy, z, goal_xy], dim=1)
+        return self.decode_feasible_residual_edges(z, start_pose, goal_pose)
     
     @torch.no_grad()
     def sample_euler(self, map_input, start_pose, goal_pose, num_steps=None):
@@ -1149,7 +1641,7 @@ class PathDiffusionTransformer(nn.Module):
             num_steps: ODE求解步数（默认使用self.diffusion_steps）
         
         Returns:
-            control_points: (B, n_path_steps+2, 2) 控制点（含起终点）
+            control_points: (B, 26, 2) 控制点（含起终点）
         """
         if num_steps is None:
             num_steps = self.diffusion_steps
@@ -1158,7 +1650,9 @@ class PathDiffusionTransformer(nn.Module):
         B = map_input.shape[0]
         
         # 初始化：t=1时为纯噪声
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         
         # 时间步划分：从t=1到t=0
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
@@ -1171,14 +1665,9 @@ class PathDiffusionTransformer(nn.Module):
             
             # pMF 迭代建议：r 等于下一步的时间
             v_pred = self.get_velocity(z, t_curr, t_next, map_input, start_pose, goal_pose)
-            z = z + dt * v_pred
+            z = self.project_zero_sum(z + dt * v_pred)
         
-        # 组装完整控制点（起点 + 中间点 + 终点）
-        start_xy = start_pose[:, :2].unsqueeze(1)  # (B, 1, 2)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)    # (B, 1, 2)
-        control_points = torch.cat([start_xy, z, goal_xy], dim=1)  # (B, n_path_steps+2, 2)
-        
-        return control_points
+        return self.decode_feasible_residual_edges(z, start_pose, goal_pose)
     
     @torch.no_grad()
     def sample_heun(self, map_input, start_pose, goal_pose, num_steps=None):
@@ -1189,7 +1678,9 @@ class PathDiffusionTransformer(nn.Module):
         B = map_input.shape[0]
         
         # 初始化：t=1时为纯噪声
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         
         # 时间步划分：从t=1到t=0
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
@@ -1210,14 +1701,9 @@ class PathDiffusionTransformer(nn.Module):
             v2 = self.get_velocity(z_pred, t_next, t_next, map_input, start_pose, goal_pose)
             
             # 4. 校正步
-            z = z + dt * (v1 + v2) / 2
+            z = self.project_zero_sum(z + dt * (v1 + v2) / 2)
         
-        # 组装完整控制点
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        control_points = torch.cat([start_xy, z, goal_xy], dim=1)
-        
-        return control_points
+        return self.decode_feasible_residual_edges(z, start_pose, goal_pose)
     
     
     @torch.no_grad()
@@ -1226,10 +1712,7 @@ class PathDiffusionTransformer(nn.Module):
         """
         Rectified Flow采样（使用ODE求解器）
         
-        【完整B样条】26个控制点 = 起点(1) + 中间点(24) + 终点(1)
-        - 网络预测：24个中间控制点
-        - 固定条件：起点和终点
-        - B样条重建：拼接成26个控制点后重建轨迹
+        【完整B样条】25个缩放零和物理边残差解码为26个控制点
         
         Args:
             map_input: (1, 3, H, W) 输入地图（3通道：normal_x, normal_y, normal_z）
@@ -1245,7 +1728,7 @@ class PathDiffusionTransformer(nn.Module):
             如果reconstruct_trajectory=True: 
                 (num_samples, num_traj_points, 2) - 重建的轨迹(x,y)
             如果reconstruct_trajectory=False: 
-                (num_samples, n_path_steps+2, 2) - 完整控制点(包含起终点)
+                (num_samples, 26, 2) - 完整控制点(包含起终点)
         """
         device = map_input.device
         
@@ -1290,18 +1773,15 @@ class PathDiffusionTransformer(nn.Module):
         else:
             raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_onestep', 'euler' or 'heun'.")
         
-        # result: (batch_size, n_path_steps+2, 2) 或 (batch_size*num_samples, n_path_steps+2, 2)
-        control_points_normalized = torch.clamp(result, -1.0, 1.0)
-        
-        # 反归一化控制点: [-1,1] -> [-20,20]
-        control_points_denorm = control_points_normalized * 20.0
+        # result: (batch_size, 26, 2) 或 (batch_size*num_samples, 26, 2)
+        control_points_denorm = result * self.coordinate_scale
         
         if not reconstruct_trajectory:
             return control_points_denorm
         
         # 使用B样条重建轨迹
         bspline_layer = DifferentiableBSpline(
-            num_control_points=self.n_path_steps + 2,  # 26个控制点
+            num_control_points=self.num_control_points,
             num_output_points=num_traj_points,
             degree=3
         ).to(device)
@@ -1371,7 +1851,8 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
     
     def __init__(self, n_layers, n_heads, d_k, d_v, d_model, d_inner, 
                  pad_idx, dropout, n_position, train_shape, 
-                 n_path_steps=24, diffusion_steps=50, prediction_type='epsilon', loss_type=None):
+                 n_path_steps=25, diffusion_steps=50, prediction_type='epsilon', loss_type=None,
+                 coordinate_scale=MAP_HALF_EXTENT):
         """
         初始化成本条件化路径扩散变换器
         
@@ -1386,7 +1867,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
             dropout: Dropout比率
             n_position: 最大位置数
             train_shape: 训练输入形状
-            n_path_steps: 中间控制点数量（默认24）
+            n_path_steps: 缩放物理边残差token数量，当前固定为25
             diffusion_steps: 扩散步数
             prediction_type: 预测类型 ('epsilon', 'x0', 'v')
             loss_type: 损失类型
@@ -1405,7 +1886,8 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
             n_path_steps=n_path_steps,
             diffusion_steps=diffusion_steps,
             prediction_type=prediction_type,
-            loss_type=loss_type
+            loss_type=loss_type,
+            coordinate_scale=coordinate_scale,
         )
         
         # ========== 成本嵌入模块 ==========
@@ -1442,8 +1924,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         
         Args:
             map_input: (B, 3, H, W) 输入地图
-            noisy_path: (B, n_path_steps, 2) 加噪后的中间控制点 x_t (x,y)
-                       n_path_steps=24，不包含起终点
+            noisy_path: (B,25,2) 加噪后的缩放零和边残差
             timestep: (B,) 连续时间步 t ∈ [0, 1]
                      t=0: 纯数据, t=1: 纯噪声
             timestep_r: (B,) 反向时间步
@@ -1453,7 +1934,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
                   范围可以是任意，建议归一化到 [0, 1]
             
         Returns:
-            model_output: (B, n_path_steps, 2) 预测的速度场 v = x_1 - x_0
+            model_output: (B,25,2) 缩放零和边残差预测
         """
         B = map_input.shape[0]
         
@@ -1466,18 +1947,15 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         map_tokens = self.reorder_dims(feat_12)           # (B, 144, D)
         map_tokens = self.map_position_enc(map_tokens, conv_shape=feat_12.shape[-2:])
         
-        # ========== 2. 编码路径 + 起终点 (Query Sequence) ==========
-        # 2.1 编码中间路径点 (B, N, D)
+        # ========== 2. 编码25条局部边残差 (Query Sequence) ==========
+        if noisy_path.ndim != 3 or noisy_path.shape[1:] != (self.num_edges, 2):
+            raise ValueError(
+                f"Expected noisy_path (B,{self.num_edges},2), "
+                f"got {tuple(noisy_path.shape)}"
+            )
         path_tokens = self.path_patchify(noisy_path)
-        # 添加 Learnable Position Embedding (仅针对中间路径点)
         path_tokens = path_tokens + self.path_pos_embed  # (B, N, D)
-        
-        # 2.2 编码起终点 (B, 1, D)
-        start_token = self.pose_embedder(start_pose).unsqueeze(1)
-        goal_token = self.pose_embedder(goal_pose).unsqueeze(1)
-        
-        # 拼接顺序: [Start, Path, Goal] -> (B, N+2, D)
-        combined_tokens = torch.cat([start_token, path_tokens, goal_token], dim=1)
+        combined_tokens = path_tokens
         
         # 2.3 预处理
         combined_tokens = self.layer_norm(combined_tokens)
@@ -1532,12 +2010,15 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         
         x = self.layer_norm(x)  # 最后LayerNorm
         
-        # ========== 5. 输出预测（单头连续回归） ==========
-        middle_feats = x[:, 1:-1, :]  # 提取中间控制点特征，去掉起终点 (B, n_path_steps, D)
-        model_output = self.main_pred(middle_feats)  # (B, n_path_steps, 2)
-        model_output = torch.clamp(model_output, -1.0, 1.0)
-        
-        return model_output  # 返回24个中间控制点
+        # ========== 5. 条件径向可行域 x0 输出 ==========
+        raw_v = self.main_pred(x)
+        raw_s = self.radial_slack_pred(x.mean(dim=1))
+        return self.radial_feasible_x0(
+            raw_v,
+            raw_s,
+            start_pose,
+            goal_pose,
+        )
     
     def get_velocity(self, z_in, t_scalar, r_scalar, cost_scalar, map_input, start_pose, goal_pose, w=1.0):
         """
@@ -1593,8 +2074,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         if t_val < 1e-5:
             return torch.zeros_like(z_in)
         
-        v_field = (z_in - pred_x0) / t_val
-        return v_field
+        return self.project_zero_sum((z_in - pred_x0) / t_val)
     
     def get_velocity_tensor(self, z_in, t_scalar, r_scalar, cost_scalar, map_input, start_pose, goal_pose, w=1.0):
         """
@@ -1643,8 +2123,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
 
         # 计算速度场（可微分）
         eps = 1e-5
-        v_field = (z_in - pred_x0) / (t_scalar + eps)
-        return v_field
+        return self.project_zero_sum((z_in - pred_x0) / (t_scalar + eps))
 
     def _expand_cost_to_batch(self, cost_scalar, batch_size, device, dtype):
         """将 cost 标量或张量统一扩展为 batch 形式。"""
@@ -1681,7 +2160,9 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         device = map_input.device
         B = map_input.shape[0]
 
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
 
         if solver == 'pmf_refined':
@@ -1689,7 +2170,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
             t_mid = torch.tensor(0.1, device=device, dtype=z.dtype)
 
             v_coarse = self.get_velocity_tensor(z, t_start, t_mid, cost_batch, map_input, start_pose, goal_pose, w=w)
-            z = z + (t_mid - t_start) * v_coarse
+            z = self.project_zero_sum(z + (t_mid - t_start) * v_coarse)
 
             timesteps = torch.linspace(t_mid, torch.tensor(0.0, device=device, dtype=z.dtype), num_steps + 1, device=device)
             for i in range(num_steps):
@@ -1697,7 +2178,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
                 t_next = timesteps[i + 1]
                 dt = t_next - t_curr
                 v_fine = self.get_velocity_tensor(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
-                z = z + dt * v_fine
+                z = self.project_zero_sum(z + dt * v_fine)
         elif solver == 'euler':
             timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
             for i in range(num_steps):
@@ -1705,7 +2186,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
                 t_next = timesteps[i + 1]
                 dt = t_next - t_curr
                 v_pred = self.get_velocity_tensor(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
-                z = z + dt * v_pred
+                z = self.project_zero_sum(z + dt * v_pred)
         elif solver == 'heun':
             timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
             for i in range(num_steps):
@@ -1715,22 +2196,20 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
                 v1 = self.get_velocity_tensor(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
                 z_pred = z + dt * v1
                 v2 = self.get_velocity_tensor(z_pred, t_next, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
-                z = z + dt * (v1 + v2) / 2
+                z = self.project_zero_sum(z + dt * (v1 + v2) / 2)
         else:
             raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_refined', 'euler' or 'heun'.")
 
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        control_points = torch.cat([start_xy, z, goal_xy], dim=1)
-
-        control_points_normalized = torch.clamp(control_points, -1.0, 1.0)
-        control_points_denorm = control_points_normalized * 20.0
+        control_points_normalized = self.decode_feasible_residual_edges(
+            z, start_pose, goal_pose
+        )
+        control_points_denorm = control_points_normalized * self.coordinate_scale
 
         if not reconstruct_trajectory:
             return control_points_denorm
 
         bspline_layer = DifferentiableBSpline(
-            num_control_points=self.n_path_steps + 2,
+            num_control_points=self.num_control_points,
             num_output_points=num_traj_points,
             degree=3
         ).to(device)
@@ -1742,7 +2221,9 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         """pMF 核心：单步生成，支持 cost 条件。"""
         device = map_input.device
         B = map_input.shape[0]
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
 
         t_batch = torch.ones(B, device=device, dtype=z.dtype)
@@ -1751,10 +2232,7 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
             map_input, z, t_batch, r_batch, start_pose, goal_pose, cost_batch, w=w
         )
 
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        control_points = torch.cat([start_xy, pred_x0, goal_xy], dim=1)
-        return control_points
+        return self.decode_feasible_residual_edges(pred_x0, start_pose, goal_pose)
 
     @torch.no_grad()
     def sample_pmf_refined(self, map_input, start_pose, goal_pose, cost_scalar=0.0,
@@ -1762,13 +2240,15 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         """pMF 两阶段采样，支持 cost 条件。"""
         device = map_input.device
         B = map_input.shape[0]
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
 
         t_start = 1.0
         t_mid = t_refine_start
         v_coarse = self.get_velocity(z, t_start, t_mid, cost_batch, map_input, start_pose, goal_pose, w=w)
-        z = z + (t_mid - t_start) * v_coarse
+        z = self.project_zero_sum(z + (t_mid - t_start) * v_coarse)
 
         timesteps = torch.linspace(t_mid, 0.0, refine_steps + 1, device=device, dtype=z.dtype)
         for i in range(refine_steps):
@@ -1776,11 +2256,9 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
             t_next = timesteps[i + 1].item()
             dt = t_next - t_curr
             v_fine = self.get_velocity(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
-            z = z + dt * v_fine
+            z = self.project_zero_sum(z + dt * v_fine)
 
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        return torch.cat([start_xy, z, goal_xy], dim=1)
+        return self.decode_feasible_residual_edges(z, start_pose, goal_pose)
 
     @torch.no_grad()
     def sample_euler(self, map_input, start_pose, goal_pose, cost_scalar=0.0, num_steps=None, w=1.0):
@@ -1790,7 +2268,9 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
 
         device = map_input.device
         B = map_input.shape[0]
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
 
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
@@ -1799,11 +2279,9 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
             t_next = timesteps[i + 1].item()
             dt = t_next - t_curr
             v_pred = self.get_velocity(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
-            z = z + dt * v_pred
+            z = self.project_zero_sum(z + dt * v_pred)
 
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        return torch.cat([start_xy, z, goal_xy], dim=1)
+        return self.decode_feasible_residual_edges(z, start_pose, goal_pose)
 
     @torch.no_grad()
     def sample_heun(self, map_input, start_pose, goal_pose, cost_scalar=0.0, num_steps=None, w=1.0):
@@ -1813,7 +2291,9 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
 
         device = map_input.device
         B = map_input.shape[0]
-        z = torch.randn(B, self.n_path_steps, 2, device=device)
+        z = self.project_zero_sum(
+            torch.randn(B, self.num_edges, 2, device=device)
+        )
         cost_batch = self._expand_cost_to_batch(cost_scalar, B, device, z.dtype)
 
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=z.dtype)
@@ -1825,11 +2305,9 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
             v1 = self.get_velocity(z, t_curr, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
             z_pred = z + dt * v1
             v2 = self.get_velocity(z_pred, t_next, t_next, cost_batch, map_input, start_pose, goal_pose, w=w)
-            z = z + dt * (v1 + v2) / 2
+            z = self.project_zero_sum(z + dt * (v1 + v2) / 2)
 
-        start_xy = start_pose[:, :2].unsqueeze(1)
-        goal_xy = goal_pose[:, :2].unsqueeze(1)
-        return torch.cat([start_xy, z, goal_xy], dim=1)
+        return self.decode_feasible_residual_edges(z, start_pose, goal_pose)
 
     @torch.no_grad()
     def sample(self, map_input, start_pose, goal_pose, cost_scalar=0.0, num_samples=5, num_steps=50,
@@ -1872,14 +2350,13 @@ class CostConditionedPathDiffusionTransformer(PathDiffusionTransformer):
         else:
             raise ValueError(f"Unknown solver: {solver}. Choose 'pmf_onestep', 'euler' or 'heun'.")
 
-        control_points_normalized = torch.clamp(result, -1.0, 1.0)
-        control_points_denorm = control_points_normalized * 20.0
+        control_points_denorm = result * self.coordinate_scale
 
         if not reconstruct_trajectory:
             return control_points_denorm
 
         bspline_layer = DifferentiableBSpline(
-            num_control_points=self.n_path_steps + 2,
+            num_control_points=self.num_control_points,
             num_output_points=num_traj_points,
             degree=3
         ).to(device)
