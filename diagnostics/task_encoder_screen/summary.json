@@ -1,0 +1,51 @@
+{
+  "status": "completed_screen_not_final",
+  "implementation": "task_encoder_feature_fuse_v2",
+  "invalidates": "diagnostics/task_encoder_raster_wrong_impl",
+  "protocol": "diagnostics/task_encoder_protocol.json",
+  "independent_eval": {
+    "spatial_map_2500": {
+      "architecture": "spatial_map",
+      "update": 2500,
+      "val_loss": 0.16783958464860915,
+      "safe1": 0.0625,
+      "safe8": 0.155,
+      "curvature1": 0.08500000089406967,
+      "forbidden1": 0.9225000143051147,
+      "stability1": 0.8025000095367432
+    },
+    "task_encoder_best_1750": {
+      "architecture": "task_encoder",
+      "update": 1750,
+      "val_loss": 0.1713146835565567,
+      "safe1": 0.0475,
+      "safe8": 0.2,
+      "curvature1": 0.07000000029802322,
+      "forbidden1": 0.9100000262260437,
+      "stability1": 0.800000011920929
+    },
+    "task_encoder_last_2500": {
+      "architecture": "task_encoder",
+      "update": 2500,
+      "val_loss": 0.15889493256807327,
+      "safe1": 0.0625,
+      "safe8": 0.21,
+      "curvature1": 0.0925000011920929,
+      "forbidden1": 0.9175000190734863,
+      "stability1": 0.7524999976158142
+    }
+  },
+  "ca_off_note": "CA-off now removes both map and S/G because S/G live only in H_task",
+  "ca_off_rms_m": {
+    "spatial_map": {
+      "map_swap": 0.013182499824324623,
+      "ca_off": 0.026945847166643944
+    },
+    "task_encoder": {
+      "map_swap": 0.02247779340541456,
+      "ca_off": 0.6836024548392743
+    }
+  },
+  "decision": "keep_mixed_not_a_fail",
+  "decision_reason": "At matched 2500 updates, Safe@1 is tied (6.25%), Safe@8 +5.5pp, Curvature slightly better, Stability -5pp. Not a collapse. CA-off is large because S/G were removed from AdaLN."
+}

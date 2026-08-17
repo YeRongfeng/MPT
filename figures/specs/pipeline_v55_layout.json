@@ -1,0 +1,54 @@
+{
+  "title": "Method overview v55 - two-band causal pipeline",
+  "canvas": {
+    "width": 1600,
+    "height": 760
+  },
+  "composition": {
+    "top": "model provenance: demonstrations -> route learning -> physical adaptation -> trained generator",
+    "bottom": "deployment spine: observation -> generator -> task-aligned free coordinates -> analytic decoder -> path",
+    "shared_anchor": "the adapted generator is the deployed generator; the shared boundary-aligned path space is indicated by the spline icon in Stage 1 and the orange deployment decoder",
+    "training_nodes": [
+      "expert demonstrations",
+      "route learning",
+      "physical adaptation",
+      "adapted generator"
+    ]
+  },
+  "visual_rules": [
+    "no explicit backpropagation loop in the overview",
+    "no isolated contribution towers or large feedback loop",
+    "training-only full terrain is a local annotation for rollover stability",
+    "deployment path is the strongest visual line",
+    "input and output thumbnails use a muted repository terrain map rather than generic scenery",
+    "no long connector crosses the training and deployment bands",
+    "full terrain is visibly excluded from deployment",
+    "ASCII-only rendered labels for conversion compatibility",
+    "minimum body text remains readable in a full-width IEEE figure",
+    "training-only full terrain is integrated locally under the rollover objective",
+    "major rows use rules and whitespace rather than card-like outer containers",
+    "explicit arrowhead polygons replace SVG markers for renderer robustness",
+    "terrain normals are visually muted so the generated path remains dominant",
+    "method-name-independent labels avoid premature naming lock-in",
+    "deployment condition is stated once below the masked observation",
+    "redundant microcopy is removed after 800-pixel readability review",
+    "labels use concrete planning semantics instead of shorthand or implementation jargon",
+    "long training labels wrap inside their nodes",
+    "full terrain is a distinct training-only input to rollover supervision",
+    "both training stages retain the same deployment-visible condition",
+    "start and goal are visibly inside the masked admissible region",
+    "top training band contains only the causal training stages",
+    "input and output thumbnails depict the same start-goal task",
+    "the output path is overlaid on the same masked observation rather than complete terrain",
+    "raster terrain thumbnails are embedded as data URIs in the delivery SVG",
+    "standard subfigure headings replace non-causal contribution numbering",
+    "training header and shared-model note occupy separate aligned positions",
+    "physical objective labels match the Method nomenclature",
+    "explicit arrowheads visualize fixed start and goal headings",
+    "representation label states fixed endpoint poses rather than generic boundary",
+    "heading arrows are concentrated in the representation module to avoid stray input symbols",
+    "full terrain is labeled training-only beside the rollover objective"
+  ],
+  "iteration": 55,
+  "notes": "Two-band overview with a minimal local full-terrain annotation and a shared boundary-aligned path-space icon."
+}

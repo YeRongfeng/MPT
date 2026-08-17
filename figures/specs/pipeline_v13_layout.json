@@ -1,0 +1,29 @@
+{
+  "title": "Method overview v13 - reviewer-readable terminology candidate",
+  "canvas": {"width": 1600, "height": 760},
+  "composition": {
+    "top": "model provenance: demonstrations -> route learning -> physical adaptation -> trained generator",
+    "bottom": "deployment spine: observation -> generator -> task-aligned free coordinates -> analytic decoder -> path",
+    "shared_anchor": "the adapted generator and deployed generator share the same teal visual identity; no cross-figure weight wire",
+    "training_nodes": ["expert demonstrations", "route learning", "physical adaptation", "adapted generator"]
+  },
+  "visual_rules": [
+    "no explicit backpropagation loop in the overview",
+    "only two contribution badges",
+    "training-only complete terrain terminates inside physical adaptation",
+    "deployment path is the strongest visual line",
+    "input and output thumbnails use a muted repository terrain map rather than generic scenery",
+    "no long connector crosses the training and deployment bands",
+    "complete terrain connects only to the rollover objective",
+    "ASCII-only rendered labels for conversion compatibility",
+    "minimum body text remains readable in a full-width IEEE figure",
+    "training-only full terrain is integrated locally under the rollover objective",
+    "major rows use rules and whitespace rather than card-like outer containers",
+    "explicit arrowhead polygons replace SVG markers for renderer robustness",
+    "terrain normals are visually muted so the generated path remains dominant",
+    "method-name-independent labels avoid premature naming lock-in",
+    "deployment condition label is attached to the input rather than crowded into the header",
+    "redundant microcopy is removed after 800-pixel readability review",
+    "labels use concrete planning semantics instead of shorthand or implementation jargon"
+  ]
+}

@@ -1,0 +1,639 @@
+{
+  "status": "inference_only_path_xy_screen_diagnosis",
+  "contexts": 32,
+  "sources": 4,
+  "arms": [
+    {
+      "name": "spatial_map",
+      "run_dir": "diagnostics/path_xy_screen/baseline",
+      "checkpoint": "diagnostics/path_xy_screen/baseline/stage1_best.pth",
+      "update": 2500
+    },
+    {
+      "name": "task_encoder",
+      "run_dir": "diagnostics/task_encoder_screen/task_encoder",
+      "checkpoint": "diagnostics/task_encoder_screen/task_encoder/stage1_best.pth",
+      "update": 1500
+    }
+  ],
+  "component_norm_rows": [
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.4308528900146484,
+      "median": 2.928973913192749,
+      "p90": 5.108671188354492,
+      "max": 9.338773727416992
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.5251026153564453,
+      "median": 3.043548822402954,
+      "p90": 5.131687164306641,
+      "max": 9.349960327148438
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_mlp",
+      "mean": 4.005173206329346,
+      "median": 3.4484903812408447,
+      "p90": 6.02298641204834,
+      "max": 10.63720703125
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_index_pe",
+      "mean": 0.6335085034370422,
+      "median": 0.5975966453552246,
+      "p90": 0.7152780294418335,
+      "max": 0.9046241641044617
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_tokens",
+      "mean": 4.078075885772705,
+      "median": 3.49092173576355,
+      "p90": 6.043354034423828,
+      "max": 10.628469467163086
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.4511096477508545,
+      "median": 2.9909002780914307,
+      "p90": 5.14420223236084,
+      "max": 8.239728927612305
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.5439181327819824,
+      "median": 3.0681984424591064,
+      "p90": 5.170628547668457,
+      "max": 8.266074180603027
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_mlp",
+      "mean": 4.029331207275391,
+      "median": 3.503769874572754,
+      "p90": 6.0038743019104,
+      "max": 9.936200141906738
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_index_pe",
+      "mean": 0.6335085034370422,
+      "median": 0.5975966453552246,
+      "p90": 0.7152780294418335,
+      "max": 0.9046241641044617
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_tokens",
+      "mean": 4.104335784912109,
+      "median": 3.608020067214966,
+      "p90": 6.028265953063965,
+      "max": 9.972661972045898
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.324615001678467,
+      "median": 3.006606340408325,
+      "p90": 4.9709320068359375,
+      "max": 7.590794086456299
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.413552761077881,
+      "median": 3.1057045459747314,
+      "p90": 5.04424524307251,
+      "max": 7.596170425415039
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_mlp",
+      "mean": 3.8766517639160156,
+      "median": 3.480703353881836,
+      "p90": 5.7322211265563965,
+      "max": 8.331071853637695
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_index_pe",
+      "mean": 0.6335085034370422,
+      "median": 0.5975966453552246,
+      "p90": 0.7152780294418335,
+      "max": 0.9046241641044617
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_tokens",
+      "mean": 3.945107936859131,
+      "median": 3.555058479309082,
+      "p90": 5.7817277908325195,
+      "max": 8.332125663757324
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.3176610469818115,
+      "median": 3.109790802001953,
+      "p90": 4.700839996337891,
+      "max": 7.459039688110352
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.409221649169922,
+      "median": 3.1972875595092773,
+      "p90": 4.73956298828125,
+      "max": 7.541661262512207
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_mlp",
+      "mean": 3.868408679962158,
+      "median": 3.5937321186065674,
+      "p90": 5.538437843322754,
+      "max": 8.417621612548828
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_index_pe",
+      "mean": 0.6335085034370422,
+      "median": 0.5975966453552246,
+      "p90": 0.7152780294418335,
+      "max": 0.9046241641044617
+    },
+    {
+      "arm": "task_encoder",
+      "component": "path_tokens",
+      "mean": 3.939582586288452,
+      "median": 3.6887128353118896,
+      "p90": 5.591447830200195,
+      "max": 8.483846664428711
+    }
+  ],
+  "map_sensitivity_rows": [
+    {
+      "arm": "spatial_map",
+      "context": 0,
+      "map_swap_trajectory_rms_m": 0.005782076623290777,
+      "ca_off_trajectory_rms_m": 0.04185660183429718
+    },
+    {
+      "arm": "spatial_map",
+      "context": 12,
+      "map_swap_trajectory_rms_m": 0.005162987858057022,
+      "ca_off_trajectory_rms_m": 0.021558638662099838
+    },
+    {
+      "arm": "spatial_map",
+      "context": 25,
+      "map_swap_trajectory_rms_m": 0.0,
+      "ca_off_trajectory_rms_m": 0.02672768197953701
+    },
+    {
+      "arm": "spatial_map",
+      "context": 38,
+      "map_swap_trajectory_rms_m": 0.04909919947385788,
+      "ca_off_trajectory_rms_m": 0.018246078863739967
+    },
+    {
+      "arm": "spatial_map",
+      "context": 51,
+      "map_swap_trajectory_rms_m": 0.04922674223780632,
+      "ca_off_trajectory_rms_m": 0.07001592963933945
+    },
+    {
+      "arm": "spatial_map",
+      "context": 64,
+      "map_swap_trajectory_rms_m": 0.0009165675146505237,
+      "ca_off_trajectory_rms_m": 0.021735578775405884
+    },
+    {
+      "arm": "spatial_map",
+      "context": 77,
+      "map_swap_trajectory_rms_m": 0.001859568990767002,
+      "ca_off_trajectory_rms_m": 0.013198262080550194
+    },
+    {
+      "arm": "spatial_map",
+      "context": 90,
+      "map_swap_trajectory_rms_m": 0.0073100063018500805,
+      "ca_off_trajectory_rms_m": 0.017107199877500534
+    },
+    {
+      "arm": "task_encoder",
+      "context": 0,
+      "map_swap_trajectory_rms_m": 0.0020696711726486683,
+      "ca_off_trajectory_rms_m": 0.0705636739730835
+    },
+    {
+      "arm": "task_encoder",
+      "context": 12,
+      "map_swap_trajectory_rms_m": 0.006084423046559095,
+      "ca_off_trajectory_rms_m": 0.07312029600143433
+    },
+    {
+      "arm": "task_encoder",
+      "context": 25,
+      "map_swap_trajectory_rms_m": 0.0,
+      "ca_off_trajectory_rms_m": 0.060395196080207825
+    },
+    {
+      "arm": "task_encoder",
+      "context": 38,
+      "map_swap_trajectory_rms_m": 0.004738359712064266,
+      "ca_off_trajectory_rms_m": 0.03778829798102379
+    },
+    {
+      "arm": "task_encoder",
+      "context": 51,
+      "map_swap_trajectory_rms_m": 0.012325937859714031,
+      "ca_off_trajectory_rms_m": 0.10641636699438095
+    },
+    {
+      "arm": "task_encoder",
+      "context": 64,
+      "map_swap_trajectory_rms_m": 0.0019638289231806993,
+      "ca_off_trajectory_rms_m": 0.084922194480896
+    },
+    {
+      "arm": "task_encoder",
+      "context": 77,
+      "map_swap_trajectory_rms_m": 0.006947321817278862,
+      "ca_off_trajectory_rms_m": 0.08300957828760147
+    },
+    {
+      "arm": "task_encoder",
+      "context": 90,
+      "map_swap_trajectory_rms_m": 0.013081074692308903,
+      "ca_off_trajectory_rms_m": 0.054665613919496536
+    },
+    {
+      "arm": "spatial_map",
+      "context": 102,
+      "map_swap_trajectory_rms_m": 0.030764281749725342,
+      "ca_off_trajectory_rms_m": 0.03283613175153732
+    },
+    {
+      "arm": "spatial_map",
+      "context": 115,
+      "map_swap_trajectory_rms_m": 0.007187541574239731,
+      "ca_off_trajectory_rms_m": 0.06809066236019135
+    },
+    {
+      "arm": "spatial_map",
+      "context": 128,
+      "map_swap_trajectory_rms_m": 0.011244766414165497,
+      "ca_off_trajectory_rms_m": 0.04678826406598091
+    },
+    {
+      "arm": "spatial_map",
+      "context": 141,
+      "map_swap_trajectory_rms_m": 0.02205478772521019,
+      "ca_off_trajectory_rms_m": 0.0135004548355937
+    },
+    {
+      "arm": "spatial_map",
+      "context": 154,
+      "map_swap_trajectory_rms_m": 0.005445671733468771,
+      "ca_off_trajectory_rms_m": 0.021036691963672638
+    },
+    {
+      "arm": "spatial_map",
+      "context": 167,
+      "map_swap_trajectory_rms_m": 0.006410802714526653,
+      "ca_off_trajectory_rms_m": 0.03113817423582077
+    },
+    {
+      "arm": "spatial_map",
+      "context": 180,
+      "map_swap_trajectory_rms_m": 0.021427521482110023,
+      "ca_off_trajectory_rms_m": 0.06438892334699631
+    },
+    {
+      "arm": "spatial_map",
+      "context": 193,
+      "map_swap_trajectory_rms_m": 0.011915408074855804,
+      "ca_off_trajectory_rms_m": 0.008487194776535034
+    },
+    {
+      "arm": "task_encoder",
+      "context": 102,
+      "map_swap_trajectory_rms_m": 0.03727379068732262,
+      "ca_off_trajectory_rms_m": 0.05669109895825386
+    },
+    {
+      "arm": "task_encoder",
+      "context": 115,
+      "map_swap_trajectory_rms_m": 0.01528090424835682,
+      "ca_off_trajectory_rms_m": 0.07725705206394196
+    },
+    {
+      "arm": "task_encoder",
+      "context": 128,
+      "map_swap_trajectory_rms_m": 0.011779523454606533,
+      "ca_off_trajectory_rms_m": 0.03855138272047043
+    },
+    {
+      "arm": "task_encoder",
+      "context": 141,
+      "map_swap_trajectory_rms_m": 0.005045709200203419,
+      "ca_off_trajectory_rms_m": 0.014477751217782497
+    },
+    {
+      "arm": "task_encoder",
+      "context": 154,
+      "map_swap_trajectory_rms_m": 0.007069207727909088,
+      "ca_off_trajectory_rms_m": 0.06421222537755966
+    },
+    {
+      "arm": "task_encoder",
+      "context": 167,
+      "map_swap_trajectory_rms_m": 0.0103990463539958,
+      "ca_off_trajectory_rms_m": 0.058228667825460434
+    },
+    {
+      "arm": "task_encoder",
+      "context": 180,
+      "map_swap_trajectory_rms_m": 0.055611878633499146,
+      "ca_off_trajectory_rms_m": 0.06700630486011505
+    },
+    {
+      "arm": "task_encoder",
+      "context": 193,
+      "map_swap_trajectory_rms_m": 0.013596028089523315,
+      "ca_off_trajectory_rms_m": 0.030171003192663193
+    },
+    {
+      "arm": "spatial_map",
+      "context": 205,
+      "map_swap_trajectory_rms_m": 0.0017026962013915181,
+      "ca_off_trajectory_rms_m": 0.02241646498441696
+    },
+    {
+      "arm": "spatial_map",
+      "context": 218,
+      "map_swap_trajectory_rms_m": 0.009362788870930672,
+      "ca_off_trajectory_rms_m": 0.009458348155021667
+    },
+    {
+      "arm": "spatial_map",
+      "context": 231,
+      "map_swap_trajectory_rms_m": 0.010732539929449558,
+      "ca_off_trajectory_rms_m": 0.013562524691224098
+    },
+    {
+      "arm": "spatial_map",
+      "context": 244,
+      "map_swap_trajectory_rms_m": 0.010913252830505371,
+      "ca_off_trajectory_rms_m": 0.019346391782164574
+    },
+    {
+      "arm": "spatial_map",
+      "context": 257,
+      "map_swap_trajectory_rms_m": 0.013080541975796223,
+      "ca_off_trajectory_rms_m": 0.020954402163624763
+    },
+    {
+      "arm": "spatial_map",
+      "context": 270,
+      "map_swap_trajectory_rms_m": 0.02215508185327053,
+      "ca_off_trajectory_rms_m": 0.03975247964262962
+    },
+    {
+      "arm": "spatial_map",
+      "context": 283,
+      "map_swap_trajectory_rms_m": 0.0055308714509010315,
+      "ca_off_trajectory_rms_m": 0.01701780967414379
+    },
+    {
+      "arm": "spatial_map",
+      "context": 296,
+      "map_swap_trajectory_rms_m": 0.06066884472966194,
+      "ca_off_trajectory_rms_m": 0.005838599056005478
+    },
+    {
+      "arm": "task_encoder",
+      "context": 205,
+      "map_swap_trajectory_rms_m": 0.010480962693691254,
+      "ca_off_trajectory_rms_m": 0.10719990730285645
+    },
+    {
+      "arm": "task_encoder",
+      "context": 218,
+      "map_swap_trajectory_rms_m": 0.005570829845964909,
+      "ca_off_trajectory_rms_m": 0.04090427979826927
+    },
+    {
+      "arm": "task_encoder",
+      "context": 231,
+      "map_swap_trajectory_rms_m": 0.01850765384733677,
+      "ca_off_trajectory_rms_m": 0.02978251688182354
+    },
+    {
+      "arm": "task_encoder",
+      "context": 244,
+      "map_swap_trajectory_rms_m": 0.002903851680457592,
+      "ca_off_trajectory_rms_m": 0.0747004970908165
+    },
+    {
+      "arm": "task_encoder",
+      "context": 257,
+      "map_swap_trajectory_rms_m": 0.014299554750323296,
+      "ca_off_trajectory_rms_m": 0.05833879113197327
+    },
+    {
+      "arm": "task_encoder",
+      "context": 270,
+      "map_swap_trajectory_rms_m": 0.04440489411354065,
+      "ca_off_trajectory_rms_m": 0.06521550565958023
+    },
+    {
+      "arm": "task_encoder",
+      "context": 283,
+      "map_swap_trajectory_rms_m": 0.007598166819661856,
+      "ca_off_trajectory_rms_m": 0.04805832356214523
+    },
+    {
+      "arm": "task_encoder",
+      "context": 296,
+      "map_swap_trajectory_rms_m": 0.02765507809817791,
+      "ca_off_trajectory_rms_m": 0.04667574539780617
+    },
+    {
+      "arm": "spatial_map",
+      "context": 308,
+      "map_swap_trajectory_rms_m": 0.006781978532671928,
+      "ca_off_trajectory_rms_m": 0.02850101888179779
+    },
+    {
+      "arm": "spatial_map",
+      "context": 321,
+      "map_swap_trajectory_rms_m": 0.009407540783286095,
+      "ca_off_trajectory_rms_m": 0.03760338947176933
+    },
+    {
+      "arm": "spatial_map",
+      "context": 334,
+      "map_swap_trajectory_rms_m": 0.005525468848645687,
+      "ca_off_trajectory_rms_m": 0.03182006999850273
+    },
+    {
+      "arm": "spatial_map",
+      "context": 347,
+      "map_swap_trajectory_rms_m": 0.008873051032423973,
+      "ca_off_trajectory_rms_m": 0.0028506179805845022
+    },
+    {
+      "arm": "spatial_map",
+      "context": 360,
+      "map_swap_trajectory_rms_m": 0.0011379665229469538,
+      "ca_off_trajectory_rms_m": 0.020382601767778397
+    },
+    {
+      "arm": "spatial_map",
+      "context": 373,
+      "map_swap_trajectory_rms_m": 0.004197370260953903,
+      "ca_off_trajectory_rms_m": 0.045387912541627884
+    },
+    {
+      "arm": "spatial_map",
+      "context": 386,
+      "map_swap_trajectory_rms_m": 0.0023953181225806475,
+      "ca_off_trajectory_rms_m": 0.010430125519633293
+    },
+    {
+      "arm": "spatial_map",
+      "context": 399,
+      "map_swap_trajectory_rms_m": 0.013566751964390278,
+      "ca_off_trajectory_rms_m": 0.020231883972883224
+    },
+    {
+      "arm": "task_encoder",
+      "context": 308,
+      "map_swap_trajectory_rms_m": 0.003806546563282609,
+      "ca_off_trajectory_rms_m": 0.10087499767541885
+    },
+    {
+      "arm": "task_encoder",
+      "context": 321,
+      "map_swap_trajectory_rms_m": 0.005892307497560978,
+      "ca_off_trajectory_rms_m": 0.05764590948820114
+    },
+    {
+      "arm": "task_encoder",
+      "context": 334,
+      "map_swap_trajectory_rms_m": 0.012374834157526493,
+      "ca_off_trajectory_rms_m": 0.09967537969350815
+    },
+    {
+      "arm": "task_encoder",
+      "context": 347,
+      "map_swap_trajectory_rms_m": 0.0033142114989459515,
+      "ca_off_trajectory_rms_m": 0.034355662763118744
+    },
+    {
+      "arm": "task_encoder",
+      "context": 360,
+      "map_swap_trajectory_rms_m": 0.0032879915088415146,
+      "ca_off_trajectory_rms_m": 0.04600387066602707
+    },
+    {
+      "arm": "task_encoder",
+      "context": 373,
+      "map_swap_trajectory_rms_m": 0.029001588001847267,
+      "ca_off_trajectory_rms_m": 0.08198101073503494
+    },
+    {
+      "arm": "task_encoder",
+      "context": 386,
+      "map_swap_trajectory_rms_m": 0.004873353522270918,
+      "ca_off_trajectory_rms_m": 0.04004451632499695
+    },
+    {
+      "arm": "task_encoder",
+      "context": 399,
+      "map_swap_trajectory_rms_m": 0.02785048447549343,
+      "ca_off_trajectory_rms_m": 0.05488879606127739
+    }
+  ],
+  "component_aggregate": {
+    "spatial_map": {
+      "path_mlp": {
+        "mean": 3.3810596466064453,
+        "median": 3.0090678334236145
+      },
+      "path_index_pe": {
+        "mean": 0.6890934109687805,
+        "median": 0.6386917233467102
+      },
+      "path_tokens": {
+        "mean": 3.4729487895965576,
+        "median": 3.1036848425865173
+      }
+    },
+    "task_encoder": {
+      "path_mlp": {
+        "mean": 3.9448912143707275,
+        "median": 3.5066739320755005
+      },
+      "path_index_pe": {
+        "mean": 0.6335085034370422,
+        "median": 0.5975966453552246
+      },
+      "path_tokens": {
+        "mean": 4.016775548458099,
+        "median": 3.585678279399872
+      }
+    }
+  },
+  "sensitivity_means": {
+    "spatial_map": {
+      "map_swap": 0.013182499824324623,
+      "ca_off": 0.026945847166643944
+    },
+    "task_encoder": {
+      "map_swap": 0.013284031709190458,
+      "ca_off": 0.06136945044272579
+    }
+  }
+}

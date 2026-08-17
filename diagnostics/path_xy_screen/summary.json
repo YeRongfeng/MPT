@@ -1,0 +1,77 @@
+{
+  "status": "completed_screen_not_final",
+  "protocol": "diagnostics/path_xy_protocol.json",
+  "split_matches_q1": true,
+  "train_val_loss": {
+    "spatial_map": 0.16966947853565217,
+    "path_xy": 0.1781837099790573
+  },
+  "independent_eval_best": {
+    "spatial_map": {
+      "architecture": "spatial_map",
+      "update": 2500,
+      "val_loss_eval": 0.16783958464860915,
+      "safe1": 0.0625,
+      "safe8": 0.155,
+      "curvature1": 0.08500000089406967,
+      "forbidden1": 0.9225000143051147,
+      "stability1": 0.8025000095367432
+    },
+    "path_xy": {
+      "architecture": "path_xy",
+      "update": 2500,
+      "val_loss_eval": 0.17599159300327302,
+      "safe1": 0.0625,
+      "safe8": 0.18,
+      "curvature1": 0.09000000357627869,
+      "forbidden1": 0.9100000262260437,
+      "stability1": 0.800000011920929
+    }
+  },
+  "ca_off_rms_m": {
+    "spatial_map": {
+      "map_swap": 0.013182499824324623,
+      "ca_off": 0.026945847166643944
+    },
+    "path_xy": {
+      "map_swap": 0.04480163329571951,
+      "ca_off": 0.0628923677286366
+    }
+  },
+  "path_component_norms": {
+    "spatial_map": {
+      "path_mlp": {
+        "mean": 3.3810596466064453,
+        "median": 3.0090678334236145
+      },
+      "path_index_pe": {
+        "mean": 0.6890934109687805,
+        "median": 0.6386917233467102
+      },
+      "path_tokens": {
+        "mean": 3.4729487895965576,
+        "median": 3.1036848425865173
+      }
+    },
+    "path_xy": {
+      "path_mlp": {
+        "mean": 3.3617420196533203,
+        "median": 2.973090410232544
+      },
+      "path_index_pe": {
+        "mean": 0.6701858639717102,
+        "median": 0.6233764290809631
+      },
+      "path_xy_hint": {
+        "mean": 1.1082289814949036,
+        "median": 1.088316261768341
+      },
+      "path_tokens": {
+        "mean": 3.514935076236725,
+        "median": 3.1359097957611084
+      }
+    }
+  },
+  "decision": "keep_for_shared_xy_consideration",
+  "decision_reason": "Safe@1 tied; Safe@8 and curvature slightly better; val loss slightly worse; CA-off RMS rose moderately without alignment-style collapse. Not a clear fail."
+}

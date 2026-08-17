@@ -1,0 +1,544 @@
+{
+  "audit": {
+    "development_only": true,
+    "validation_root": "/home/yrf/MPT/data/dataset1_val",
+    "validation_split": "train",
+    "validation_environment_count": 50,
+    "validation_context_count": 50,
+    "sources_per_context": 16,
+    "external_30_read": false,
+    "final_test_read": false
+  },
+  "selection": {
+    "status": "blocked_protocol_endpoint_mismatch_and_missing_best",
+    "rule": "minimum validation task_cost; Safe@1 then strict only break exact ties",
+    "intended_endpoint_updates": 50000,
+    "updates_per_epoch": 5000,
+    "configured_epochs": 20,
+    "configured_endpoint_updates": 100000,
+    "event_file": "/home/yrf/MPT/data/path_meanflow_stage2_mgda_sgd/tensorboard/stage2_direct_cost/events.out.tfevents.1786168797.Lyrith.317395.0",
+    "last_train_step": 54059,
+    "last_validation_step": 54000,
+    "pre_endpoint_best_step": 49600,
+    "pre_endpoint_best_task_cost": 2.4173660278320312,
+    "post_endpoint_best_step": 53400,
+    "post_endpoint_best_task_cost": 2.416091203689575,
+    "current_best_step": 53400,
+    "current_best_eligible": false,
+    "last_step": 50000,
+    "last_eligible_endpoint": true,
+    "selected_checkpoint": null,
+    "geometry_acceptance_run": false,
+    "external_gate_open": false
+  },
+  "checkpoint_manifest": {
+    "stage1": {
+      "path": "/home/yrf/MPT/data/path_meanflow/stage1_best.pth",
+      "sha256": "07d2a984ad0294de863f11b9171c86d1a1a9e67d3bd9e496d25ce8153c227723",
+      "size_bytes": 610229620,
+      "stage": "stage1",
+      "stage2_global_update": null,
+      "stage2_epoch": null,
+      "eligible": true
+    },
+    "stage2_last_10epoch": {
+      "path": "/home/yrf/MPT/data/path_meanflow_stage2_mgda_sgd/stage2_last.pth",
+      "sha256": "0d2cee63e93e1f9788f5dfb29819a35c9827d7c5e68014251116c382708fe0ec",
+      "size_bytes": 203552528,
+      "stage": "stage2_direct_privileged_cost",
+      "stage2_global_update": 50000,
+      "stage2_epoch": 9,
+      "eligible": true
+    },
+    "stage2_best_post_endpoint": {
+      "path": "/home/yrf/MPT/data/path_meanflow_stage2_mgda_sgd/stage2_best.pth",
+      "sha256": "5a202ebad5d39fce9129d7cf35355ee3de325cac18baab49058b8d0304b2d80e",
+      "size_bytes": 203534672,
+      "stage": "stage2_direct_privileged_cost",
+      "stage2_global_update": 53400,
+      "stage2_epoch": 10,
+      "eligible": false
+    }
+  },
+  "validation_manifest": {
+    "environments": [
+      "env000000",
+      "env000001",
+      "env000002",
+      "env000003",
+      "env000004",
+      "env000005",
+      "env000006",
+      "env000007",
+      "env000008",
+      "env000009",
+      "env000010",
+      "env000011",
+      "env000012",
+      "env000013",
+      "env000014",
+      "env000015",
+      "env000016",
+      "env000017",
+      "env000018",
+      "env000019",
+      "env000020",
+      "env000021",
+      "env000022",
+      "env000023",
+      "env000024",
+      "env000025",
+      "env000026",
+      "env000027",
+      "env000028",
+      "env000029",
+      "env000030",
+      "env000031",
+      "env000032",
+      "env000033",
+      "env000034",
+      "env000035",
+      "env000036",
+      "env000037",
+      "env000038",
+      "env000039",
+      "env000040",
+      "env000041",
+      "env000042",
+      "env000043",
+      "env000044",
+      "env000045",
+      "env000046",
+      "env000047",
+      "env000048",
+      "env000049"
+    ],
+    "indices": [
+      11,
+      310,
+      597,
+      605,
+      874,
+      1192,
+      1286,
+      1472,
+      1705,
+      1995,
+      2095,
+      2388,
+      2511,
+      2625,
+      2887,
+      3190,
+      3314,
+      3485,
+      3729,
+      3849,
+      4142,
+      4211,
+      4560,
+      4735,
+      4906,
+      5172,
+      5378,
+      5437,
+      5623,
+      5875,
+      6074,
+      6257,
+      6537,
+      6604,
+      6953,
+      7149,
+      7388,
+      7492,
+      7673,
+      7890,
+      8017,
+      8233,
+      8542,
+      8640,
+      8818,
+      9031,
+      9266,
+      9540,
+      9653,
+      9832
+    ],
+    "source_seed": 92026
+  },
+  "metrics": {
+    "stage1": {
+      "conditions": 50,
+      "sources_per_context": 16,
+      "trajectories": 800,
+      "J_F": 0.36061668395996094,
+      "J_S": 0.6433773040771484,
+      "J_K": 0.05914812907576561,
+      "task_cost": 2.4760348796844482,
+      "strict_valid_rate": 0.15625,
+      "safe_at_1": 0.18,
+      "safe_at_k": 0.44,
+      "forbidden_ok_rate": 0.7275000214576721,
+      "stability_ok_rate": 0.7225000262260437,
+      "curvature_ok_rate": 0.33000001311302185,
+      "yaw_ok_rate": 1.0,
+      "pairwise_path_distance_m": 0.33570528149604795,
+      "covariance_effective_rank": 2.2306807613372803,
+      "quality": {
+        "path_length_m": {
+          "count": 800,
+          "mean": 15.529751777648926,
+          "std": 3.961995840072632,
+          "median": 17.108333587646484,
+          "p10": 9.070674896240234,
+          "p90": 19.80615234375,
+          "min": 7.1520676612854,
+          "max": 22.17180633544922
+        },
+        "normalized_length": {
+          "count": 800,
+          "mean": 0.5490596890449524,
+          "std": 0.14007771015167236,
+          "median": 0.6048709154129028,
+          "p10": 0.32069680094718933,
+          "p90": 0.7002533078193665,
+          "min": 0.2528637945652008,
+          "max": 0.7838917374610901
+        },
+        "third_difference_regularization": {
+          "count": 800,
+          "mean": 2.233526174677536e-05,
+          "std": 0.00031609670259058475,
+          "median": 4.725982762465719e-06,
+          "p10": 9.129687441600254e-07,
+          "p90": 1.190830153063871e-05,
+          "min": 1.945592913443761e-07,
+          "max": 0.008704782463610172
+        },
+        "curvature_max": {
+          "count": 800,
+          "mean": 2.7337114810943604,
+          "std": 4.493401050567627,
+          "median": 2.3133163452148438,
+          "p10": 1.7089850902557373,
+          "p90": 3.262721061706543,
+          "min": 0.1932048201560974,
+          "max": 114.05379486083984
+        },
+        "min_stability_margin": {
+          "count": 800,
+          "mean": 0.6274314522743225,
+          "std": 0.850976824760437,
+          "median": 0.5857925415039062,
+          "p10": -0.4681534469127655,
+          "p90": 1.8390337228775024,
+          "min": -1.257373332977295,
+          "max": 2.7380831241607666
+        },
+        "composite_clearance_min": {
+          "count": 800,
+          "mean": 1.0742355585098267,
+          "std": 1.1273056268692017,
+          "median": 1.058259129524231,
+          "p10": -0.45497098565101624,
+          "p90": 2.6594021320343018,
+          "min": -0.7059739232063293,
+          "max": 3.3719592094421387
+        }
+      },
+      "weighted_costs": {
+        "forbidden": 1.8030831813812256,
+        "stability": 0.6433773040771484,
+        "curvature": 0.029574064537882805
+      },
+      "eligible": true,
+      "checkpoint": "/home/yrf/MPT/data/path_meanflow/stage1_best.pth",
+      "global_update": 0
+    },
+    "stage2_last_10epoch": {
+      "conditions": 50,
+      "sources_per_context": 16,
+      "trajectories": 800,
+      "J_F": 0.35337281227111816,
+      "J_S": 0.6349025368690491,
+      "J_K": 0.0318051278591156,
+      "task_cost": 2.4176690578460693,
+      "strict_valid_rate": 0.2874999940395355,
+      "safe_at_1": 0.28,
+      "safe_at_k": 0.74,
+      "forbidden_ok_rate": 0.7337499856948853,
+      "stability_ok_rate": 0.7149999737739563,
+      "curvature_ok_rate": 0.5799999833106995,
+      "yaw_ok_rate": 1.0,
+      "pairwise_path_distance_m": 0.3531346893310547,
+      "covariance_effective_rank": 2.1978285694122315,
+      "quality": {
+        "path_length_m": {
+          "count": 800,
+          "mean": 15.739492416381836,
+          "std": 4.0084357261657715,
+          "median": 17.20838165283203,
+          "p10": 9.177192687988281,
+          "p90": 20.09549903869629,
+          "min": 7.169226169586182,
+          "max": 22.543304443359375
+        },
+        "normalized_length": {
+          "count": 800,
+          "mean": 0.5564751029014587,
+          "std": 0.14171960949897766,
+          "median": 0.6084081530570984,
+          "p10": 0.32446274161338806,
+          "p90": 0.7104832530021667,
+          "min": 0.25347042083740234,
+          "max": 0.7970262169837952
+        },
+        "third_difference_regularization": {
+          "count": 800,
+          "mean": 7.390080281766132e-05,
+          "std": 0.0017535689985379577,
+          "median": 5.813148163724691e-06,
+          "p10": 1.215886186400894e-06,
+          "p90": 1.4443068721448071e-05,
+          "min": 2.473546203418664e-07,
+          "max": 0.04960741475224495
+        },
+        "curvature_max": {
+          "count": 800,
+          "mean": 2.6695384979248047,
+          "std": 11.207618713378906,
+          "median": 2.025622844696045,
+          "p10": 1.6350233554840088,
+          "p90": 2.797086715698242,
+          "min": 0.18807420134544373,
+          "max": 315.130126953125
+        },
+        "min_stability_margin": {
+          "count": 800,
+          "mean": 0.6139184236526489,
+          "std": 0.8420618772506714,
+          "median": 0.5794301629066467,
+          "p10": -0.46690136194229126,
+          "p90": 1.8113590478897095,
+          "min": -1.2708637714385986,
+          "max": 2.769083023071289
+        },
+        "composite_clearance_min": {
+          "count": 800,
+          "mean": 1.051624059677124,
+          "std": 1.1116236448287964,
+          "median": 1.0915886163711548,
+          "p10": -0.4519858956336975,
+          "p90": 2.6594021320343018,
+          "min": -0.716016411781311,
+          "max": 3.3099899291992188
+        }
+      },
+      "weighted_costs": {
+        "forbidden": 1.76686429977417,
+        "stability": 0.6349025368690491,
+        "curvature": 0.0159025639295578
+      },
+      "eligible": true,
+      "checkpoint": "/home/yrf/MPT/data/path_meanflow_stage2_mgda_sgd/stage2_last.pth",
+      "global_update": 50000
+    },
+    "stage2_best_post_endpoint": {
+      "conditions": 50,
+      "sources_per_context": 16,
+      "trajectories": 800,
+      "J_F": 0.3531057834625244,
+      "J_S": 0.6349300146102905,
+      "J_K": 0.03126487880945206,
+      "task_cost": 2.416091203689575,
+      "strict_valid_rate": 0.2887499928474426,
+      "safe_at_1": 0.28,
+      "safe_at_k": 0.74,
+      "forbidden_ok_rate": 0.7337499856948853,
+      "stability_ok_rate": 0.7112500071525574,
+      "curvature_ok_rate": 0.5837500095367432,
+      "yaw_ok_rate": 1.0,
+      "pairwise_path_distance_m": 0.35342456817626955,
+      "covariance_effective_rank": 2.1957593250274656,
+      "quality": {
+        "path_length_m": {
+          "count": 800,
+          "mean": 15.746115684509277,
+          "std": 4.009331703186035,
+          "median": 17.20813751220703,
+          "p10": 9.185614585876465,
+          "p90": 20.09743881225586,
+          "min": 7.169584274291992,
+          "max": 22.552204132080078
+        },
+        "normalized_length": {
+          "count": 800,
+          "mean": 0.5567092299461365,
+          "std": 0.14175128936767578,
+          "median": 0.608399510383606,
+          "p10": 0.3247605264186859,
+          "p90": 0.7105517387390137,
+          "min": 0.2534830868244171,
+          "max": 0.7973408699035645
+        },
+        "third_difference_regularization": {
+          "count": 800,
+          "mean": 8.383902604691684e-05,
+          "std": 0.0020321656484156847,
+          "median": 5.8304958656663075e-06,
+          "p10": 1.2084720992788789e-06,
+          "p90": 1.4415791156352498e-05,
+          "min": 2.543771415730589e-07,
+          "max": 0.05749605596065521
+        },
+        "curvature_max": {
+          "count": 800,
+          "mean": 2.6785824298858643,
+          "std": 11.647720336914062,
+          "median": 2.0196657180786133,
+          "p10": 1.6323963403701782,
+          "p90": 2.7849552631378174,
+          "min": 0.18732787668704987,
+          "max": 327.6733703613281
+        },
+        "min_stability_margin": {
+          "count": 800,
+          "mean": 0.6133546829223633,
+          "std": 0.8418926000595093,
+          "median": 0.577944278717041,
+          "p10": -0.4677690863609314,
+          "p90": 1.8113590478897095,
+          "min": -1.271065354347229,
+          "max": 2.769083023071289
+        },
+        "composite_clearance_min": {
+          "count": 800,
+          "mean": 1.0510119199752808,
+          "std": 1.1112143993377686,
+          "median": 1.0912073850631714,
+          "p10": -0.44897958636283875,
+          "p90": 2.6594021320343018,
+          "min": -0.7174839377403259,
+          "max": 3.309235095977783
+        }
+      },
+      "weighted_costs": {
+        "forbidden": 1.765528678894043,
+        "stability": 0.6349300146102905,
+        "curvature": 0.01563243940472603
+      },
+      "eligible": false,
+      "checkpoint": "/home/yrf/MPT/data/path_meanflow_stage2_mgda_sgd/stage2_best.pth",
+      "global_update": 53400
+    }
+  },
+  "paired_transitions_vs_stage1": {
+    "stage2_last_10epoch": {
+      "strict_valid": {
+        "improvement_count": 127,
+        "regression_count": 22,
+        "unchanged_count": 651
+      },
+      "forbidden_region_ok": {
+        "improvement_count": 6,
+        "regression_count": 1,
+        "unchanged_count": 793
+      },
+      "stability_ok": {
+        "improvement_count": 5,
+        "regression_count": 11,
+        "unchanged_count": 784
+      },
+      "curvature_ok": {
+        "improvement_count": 230,
+        "regression_count": 30,
+        "unchanged_count": 540
+      }
+    },
+    "stage2_best_post_endpoint": {
+      "strict_valid": {
+        "improvement_count": 128,
+        "regression_count": 22,
+        "unchanged_count": 650
+      },
+      "forbidden_region_ok": {
+        "improvement_count": 6,
+        "regression_count": 1,
+        "unchanged_count": 793
+      },
+      "stability_ok": {
+        "improvement_count": 5,
+        "regression_count": 14,
+        "unchanged_count": 781
+      },
+      "curvature_ok": {
+        "improvement_count": 234,
+        "regression_count": 31,
+        "unchanged_count": 535
+      }
+    }
+  },
+  "comparison_rows": [
+    {
+      "model": "stage1",
+      "eligible": true,
+      "J_F": 0.36061668395996094,
+      "J_S": 0.6433773040771484,
+      "J_K": 0.05914812907576561,
+      "task_cost": 2.4760348796844482,
+      "strict_valid_rate": 0.15625,
+      "safe_at_1": 0.18,
+      "safe_at_k": 0.44,
+      "forbidden_ok_rate": 0.7275000214576721,
+      "stability_ok_rate": 0.7225000262260437,
+      "curvature_ok_rate": 0.33000001311302185,
+      "pairwise_path_distance_m": 0.33570528149604795,
+      "covariance_effective_rank": 2.2306807613372803,
+      "path_length_m_mean": 15.529751777648926,
+      "third_difference_regularization_mean": 2.233526174677536e-05
+    },
+    {
+      "model": "stage2_last_10epoch",
+      "eligible": true,
+      "J_F": 0.35337281227111816,
+      "J_S": 0.6349025368690491,
+      "J_K": 0.0318051278591156,
+      "task_cost": 2.4176690578460693,
+      "strict_valid_rate": 0.2874999940395355,
+      "safe_at_1": 0.28,
+      "safe_at_k": 0.74,
+      "forbidden_ok_rate": 0.7337499856948853,
+      "stability_ok_rate": 0.7149999737739563,
+      "curvature_ok_rate": 0.5799999833106995,
+      "pairwise_path_distance_m": 0.3531346893310547,
+      "covariance_effective_rank": 2.1978285694122315,
+      "path_length_m_mean": 15.739492416381836,
+      "third_difference_regularization_mean": 7.390080281766132e-05
+    },
+    {
+      "model": "stage2_best_post_endpoint",
+      "eligible": false,
+      "J_F": 0.3531057834625244,
+      "J_S": 0.6349300146102905,
+      "J_K": 0.03126487880945206,
+      "task_cost": 2.416091203689575,
+      "strict_valid_rate": 0.2887499928474426,
+      "safe_at_1": 0.28,
+      "safe_at_k": 0.74,
+      "forbidden_ok_rate": 0.7337499856948853,
+      "stability_ok_rate": 0.7112500071525574,
+      "curvature_ok_rate": 0.5837500095367432,
+      "pairwise_path_distance_m": 0.35342456817626955,
+      "covariance_effective_rank": 2.1957593250274656,
+      "path_length_m_mean": 15.746115684509277,
+      "third_difference_regularization_mean": 8.383902604691684e-05
+    }
+  ],
+  "artifacts": {
+    "report": "diagnostics/stage2_mgda_sgd_dev_selection_20260808/REPORT.md",
+    "summary": "diagnostics/stage2_mgda_sgd_dev_selection_20260808/summary.json",
+    "metrics": "diagnostics/stage2_mgda_sgd_dev_selection_20260808/metrics.csv",
+    "frozen_manifest": "diagnostics/stage2_mgda_sgd_dev_selection_20260808/frozen_manifest.json"
+  }
+}

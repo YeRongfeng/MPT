@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 
-from map_config import MAP_BOUNDS
+from map_config import MAP_BOUNDS, SAFETY_COST_CONFIG
 
 
 class TrajectoryEvaluator:
@@ -143,7 +143,10 @@ class TrajectoryEvaluator:
                           trajectory: torch.Tensor,
                           velocities: Optional[torch.Tensor] = None,
                           accelerations: Optional[torch.Tensor] = None,
-                          control_points: Optional[torch.Tensor] = None) -> Dict[str, float]:
+                          control_points: Optional[torch.Tensor] = None,
+                          analytic_first_derivative: Optional[torch.Tensor] = None,
+                          analytic_second_derivative: Optional[torch.Tensor] = None,
+                          analytic_curvature: Optional[torch.Tensor] = None) -> Dict[str, float]:
         """
         评估轨迹的所有指标
         
@@ -177,19 +180,55 @@ class TrajectoryEvaluator:
         # 3. 轨迹长度
         metrics['path_length'] = self._compute_path_length(trajectory).item()
         
-        # 4. 如果没有提供速度和加速度，则从轨迹数值微分计算
-        if velocities is None or accelerations is None:
-            velocities_computed, accelerations_computed = self._compute_derivatives(trajectory)
-            if velocities is None:
-                velocities = velocities_computed
-            if accelerations is None:
-                accelerations = accelerations_computed
+        if (
+            analytic_first_derivative is None
+            or analytic_second_derivative is None
+            or analytic_curvature is None
+        ):
+            raise ValueError(
+                "Production evaluation requires analytic B-spline p'(t), "
+                "p''(t), and curvature; finite-difference geometry is disabled."
+            )
+        first = torch.as_tensor(
+            analytic_first_derivative,
+            dtype=trajectory.dtype,
+            device=self.device,
+        )
+        second = torch.as_tensor(
+            analytic_second_derivative,
+            dtype=trajectory.dtype,
+            device=self.device,
+        )
+        analytic_curvature = torch.as_tensor(
+            analytic_curvature,
+            dtype=trajectory.dtype,
+            device=self.device,
+        )
+        if first.shape != (K, 2) or second.shape != (K, 2):
+            raise ValueError("Analytic derivatives must have shape (K,2)")
+        if analytic_curvature.shape != (K,):
+            raise ValueError("analytic_curvature must have shape (K,)")
+        yaw_rate = (
+            first[:, 0] * second[:, 1]
+            - first[:, 1] * second[:, 0]
+        ) / first.square().sum(dim=1).clamp_min(1e-12)
+        yaw_acceleration = torch.gradient(yaw_rate)[0]
+        velocities = torch.cat([first, yaw_rate[:, None]], dim=1)
+        accelerations = torch.cat(
+            [second, yaw_acceleration[:, None]], dim=1
+        )
         
         # 5. 平滑度指标
         metrics.update(self._evaluate_smoothness(accelerations))
         
         # 6. 几何曲率
-        metrics.update(self._evaluate_curvature(velocities, accelerations))
+        metrics.update(
+            self._evaluate_curvature(
+                velocities,
+                accelerations,
+                analytic_curvature=analytic_curvature,
+            )
+        )
         
         # 7. 角速度指标
         metrics.update(self._evaluate_angular_velocity(velocities[:, 2]))
@@ -204,7 +243,14 @@ class TrajectoryEvaluator:
         metrics.update(self._evaluate_heading_consistency(trajectory, velocities))
 
         # 11. 几何诊断：周期 yaw、切向速度、曲率爆点等，用于定位 B-spline 曲线问题
-        metrics.update(self._evaluate_geometry_diagnostics(trajectory, velocities, accelerations))
+        metrics.update(
+            self._evaluate_geometry_diagnostics(
+                trajectory,
+                velocities,
+                accelerations,
+                analytic_curvature=analytic_curvature,
+            )
+        )
         
         # 12. 控制点均匀性（如果提供）
         if control_points is not None:
@@ -395,26 +441,24 @@ class TrajectoryEvaluator:
         
         return metrics
     
-    def _evaluate_curvature(self, velocities: torch.Tensor, accelerations: torch.Tensor) -> Dict[str, float]:
+    def _evaluate_curvature(
+        self,
+        velocities: torch.Tensor,
+        accelerations: torch.Tensor,
+        *,
+        analytic_curvature: torch.Tensor,
+    ) -> Dict[str, float]:
         """评估几何曲率"""
         metrics = {}
         
-        vx, vy = velocities[:, 0], velocities[:, 1]
-        ax, ay = accelerations[:, 0], accelerations[:, 1]
-        
-        eps = 1e-6
-        speed = torch.sqrt(vx**2 + vy**2 + eps)
-        
-        # 几何曲率 κ = |v × a| / |v|³
-        cross_product = torch.abs(vx * ay - vy * ax)
-        curvature = cross_product / (speed**3 + 1e-6)
+        curvature = analytic_curvature.abs()
         
         metrics['curvature_mean'] = curvature.mean().item()
         metrics['curvature_max'] = curvature.max().item()
         metrics['curvature_std'] = curvature.std().item()
         
-        # 曲率超限比例（假设限制为1.4 rad/m）
-        curvature_limit = 1.4
+        # 与 Stage 2 hard validity 共用车辆最大几何曲率。
+        curvature_limit = SAFETY_COST_CONFIG.curvature_limit
         curvature_violations = (curvature > curvature_limit).sum().float()
         metrics['curvature_violation_ratio'] = (curvature_violations / len(curvature)).item()
         
@@ -522,7 +566,9 @@ class TrajectoryEvaluator:
         self,
         trajectory: torch.Tensor,
         velocities: torch.Tensor,
-        accelerations: torch.Tensor
+        accelerations: torch.Tensor,
+        *,
+        analytic_curvature: torch.Tensor,
     ) -> Dict[str, float]:
         """额外几何诊断：不替代原指标，只帮助判断 yaw wrap、低切向速度和曲率尖峰。"""
         metrics = {}
@@ -590,15 +636,15 @@ class TrajectoryEvaluator:
         metrics['tangent_near_zero_ratio_5e-2'] = (tangent_norm < 5e-2).float().mean().item()
         metrics['tangent_near_zero_ratio_1e-1'] = (tangent_norm < 1e-1).float().mean().item()
 
-        curvature_eps = 1e-6
-        cross_product = vx * ay - vy * ax
-        curvature_abs = torch.abs(cross_product) / (tangent_norm.clamp_min(curvature_eps) ** 3 + curvature_eps)
+        curvature_abs = analytic_curvature.abs()
         metrics['curvature_abs_mean'] = curvature_abs.mean().item()
         metrics['curvature_abs_max'] = curvature_abs.max().item()
         metrics['curvature_abs_std'] = curvature_abs.std().item()
         metrics['curvature_abs_q90'] = torch.quantile(curvature_abs, 0.9).item()
         metrics['curvature_abs_q99'] = torch.quantile(curvature_abs, 0.99).item()
-        metrics['curvature_abs_violation_ratio_1p4'] = (curvature_abs > 1.4).float().mean().item()
+        metrics['curvature_abs_violation_ratio_2p1'] = (
+            curvature_abs > SAFETY_COST_CONFIG.curvature_limit
+        ).float().mean().item()
         metrics['curvature_abs_violation_ratio_5'] = (curvature_abs > 5.0).float().mean().item()
 
         return metrics
@@ -729,7 +775,7 @@ class TrajectoryEvaluator:
                      'smoothness_xy', 'periodic_smoothness_yaw',
                      'jerk_x', 'jerk_y', 'jerk_yaw', 'periodic_jerk_yaw'],
             "曲率": ['curvature_mean', 'curvature_max', 'curvature_std', 'curvature_violation_ratio',
-                   'curvature_abs_max', 'curvature_abs_q99', 'curvature_abs_violation_ratio_1p4'],
+                   'curvature_abs_max', 'curvature_abs_q99', 'curvature_abs_violation_ratio_2p1'],
             "几何诊断": ['raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
                      'periodic_large_turn_ratio_pi_2', 'tangent_norm_min', 'tangent_norm_mean',
                      'tangent_near_zero_ratio_1e-2', 'tangent_near_zero_ratio_5e-2'],

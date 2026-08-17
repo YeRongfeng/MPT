@@ -12,6 +12,7 @@ from dataLoader_dit import UnevenPathDataLoader
 from grad_optimizer import TrajectoryOptimizerSE2
 from dataLoader_uneven import compute_map_yaw_bins
 from tqdm import tqdm
+from tools._paths import evaluation_results_dir
 
 def evaluate_trajectory(trajectory, cost_map, map_info, yaw_stability, device):
     """评估轨迹的cost和unsafe ratio"""
@@ -199,8 +200,12 @@ def main():
     axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('guided_sampling_eval.png', dpi=300, bbox_inches='tight')
-    print("\n✓ Saved visualization to guided_sampling_eval.png")
+    output_path = (
+        evaluation_results_dir("guided_sampling")
+        / "guided_sampling_eval.png"
+    )
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\n✓ Saved visualization to {output_path}")
     
     print("\n" + "="*70)
 

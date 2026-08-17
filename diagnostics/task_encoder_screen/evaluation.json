@@ -1,0 +1,138 @@
+{
+  "diagnostics/path_xy_screen/baseline": {
+    "run_dir": "diagnostics/path_xy_screen/baseline",
+    "architecture": "spatial_map",
+    "map_layout": "single_12",
+    "validation_contexts": 400,
+    "checkpoints": [
+      {
+        "checkpoint": "diagnostics/path_xy_screen/baseline/stage1_best.pth",
+        "update": 2500,
+        "validation_meanflow": {
+          "loss": 0.16783958464860915,
+          "flow": 0.1462275868654251,
+          "endpoint": 0.08644799694418907,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.0625,
+            "strict_valid_rate": 0.0625,
+            "forbidden_ok_rate": 0.9225000143051147,
+            "stability_ok_rate": 0.8025000095367432,
+            "curvature_ok_rate": 0.08500000089406967,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.007261037826538
+          },
+          "8": {
+            "safe_at_k": 0.155,
+            "strict_valid_rate": 0.05249999836087227,
+            "forbidden_ok_rate": 0.9184374809265137,
+            "stability_ok_rate": 0.7759374976158142,
+            "curvature_ok_rate": 0.06750000268220901,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.011959433555603
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/path_xy_screen/baseline/stage1_last.pth",
+        "update": 2500,
+        "validation_meanflow": {
+          "loss": 0.16783958464860915,
+          "flow": 0.1462275868654251,
+          "endpoint": 0.08644799694418907,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.0625,
+            "strict_valid_rate": 0.0625,
+            "forbidden_ok_rate": 0.9225000143051147,
+            "stability_ok_rate": 0.8025000095367432,
+            "curvature_ok_rate": 0.08500000089406967,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.007261037826538
+          },
+          "8": {
+            "safe_at_k": 0.155,
+            "strict_valid_rate": 0.05249999836087227,
+            "forbidden_ok_rate": 0.9184374809265137,
+            "stability_ok_rate": 0.7759374976158142,
+            "curvature_ok_rate": 0.06750000268220901,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.011959433555603
+          }
+        }
+      }
+    ]
+  },
+  "diagnostics/task_encoder_screen/task_encoder": {
+    "run_dir": "diagnostics/task_encoder_screen/task_encoder",
+    "architecture": "task_encoder",
+    "map_layout": "single_12",
+    "validation_contexts": 400,
+    "checkpoints": [
+      {
+        "checkpoint": "diagnostics/task_encoder_screen/task_encoder/stage1_best.pth",
+        "update": 1750,
+        "validation_meanflow": {
+          "loss": 0.1713146835565567,
+          "flow": 0.15220820099115373,
+          "endpoint": 0.07642593532800675,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.0475,
+            "strict_valid_rate": 0.04749999940395355,
+            "forbidden_ok_rate": 0.9100000262260437,
+            "stability_ok_rate": 0.800000011920929,
+            "curvature_ok_rate": 0.07000000029802322,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.0876381397247314
+          },
+          "8": {
+            "safe_at_k": 0.2,
+            "strict_valid_rate": 0.059062499552965164,
+            "forbidden_ok_rate": 0.9153125286102295,
+            "stability_ok_rate": 0.7837499976158142,
+            "curvature_ok_rate": 0.0846875011920929,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9867066740989685
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_encoder_screen/task_encoder/stage1_last.pth",
+        "update": 2500,
+        "validation_meanflow": {
+          "loss": 0.15889493256807327,
+          "flow": 0.13856853425502777,
+          "endpoint": 0.08130559042096137,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.0625,
+            "strict_valid_rate": 0.0625,
+            "forbidden_ok_rate": 0.9175000190734863,
+            "stability_ok_rate": 0.7524999976158142,
+            "curvature_ok_rate": 0.0925000011920929,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.1071923971176147
+          },
+          "8": {
+            "safe_at_k": 0.21,
+            "strict_valid_rate": 0.06968750059604645,
+            "forbidden_ok_rate": 0.9087499976158142,
+            "stability_ok_rate": 0.7615625262260437,
+            "curvature_ok_rate": 0.10000000149011612,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.1002883911132812
+          }
+        }
+      }
+    ]
+  }
+}

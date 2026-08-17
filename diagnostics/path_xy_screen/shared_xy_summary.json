@@ -1,0 +1,49 @@
+{
+  "status": "completed_screen_not_final",
+  "protocol": "diagnostics/shared_xy_protocol.json",
+  "independent_eval_best": {
+    "spatial_map": {
+      "architecture": "spatial_map",
+      "val_loss": 0.16783958464860915,
+      "safe1": 0.0625,
+      "safe8": 0.155,
+      "curvature1": 0.08500000089406967,
+      "forbidden1": 0.9225000143051147,
+      "stability1": 0.8025000095367432
+    },
+    "path_xy": {
+      "architecture": "path_xy",
+      "val_loss": 0.17599159300327302,
+      "safe1": 0.0625,
+      "safe8": 0.18,
+      "curvature1": 0.09000000357627869,
+      "forbidden1": 0.9100000262260437,
+      "stability1": 0.800000011920929
+    },
+    "shared_xy": {
+      "architecture": "shared_xy",
+      "val_loss": 0.16710006266832353,
+      "safe1": 0.0375,
+      "safe8": 0.17,
+      "curvature1": 0.05249999836087227,
+      "forbidden1": 0.9075000286102295,
+      "stability1": 0.7850000262260437
+    }
+  },
+  "ca_off_rms_m": {
+    "spatial_map": {
+      "map_swap": 0.013182499824324623,
+      "ca_off": 0.026945847166643944
+    },
+    "path_xy": {
+      "map_swap": 0.04480163329571951,
+      "ca_off": 0.0628923677286366
+    },
+    "shared_xy": {
+      "map_swap": 0.042576274820021354,
+      "ca_off": 0.06936400872655213
+    }
+  },
+  "decision": "eliminate_shared_xy",
+  "decision_reason": "shared_xy matches or slightly beats val loss, but Safe@1 drops 6.25% -> 3.75% and Curvature@1 drops 9.0% -> 5.25% versus path_xy. Map CA-off stays in the same 6-7 cm band as path_xy, so shared language did not add a useful extra map signal. Keep path_xy; do not long-train shared_xy."
+}

@@ -1,0 +1,8 @@
+{
+  "ok": false,
+  "workspace": "/home/yrf/MPT",
+  "outputDir": "/home/yrf/MPT/figures/ai_generated",
+  "codexBin": "/home/yrf/.nvm/versions/node/v22.22.2/bin/codex",
+  "checkedAt": "2026-08-13T09:22:00Z",
+  "error": "codex app-server ping timed out"
+}

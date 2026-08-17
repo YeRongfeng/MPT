@@ -1,0 +1,23 @@
+{
+  "title": "Method overview v2 - shared-generator state evolution",
+  "canvas": {"width": 1600, "height": 760},
+  "reading_order": [
+    "top: expert routes -> route generator -> physical adaptation -> adapted weights",
+    "bottom: current observation -> one-step generator -> boundary decoder -> global path"
+  ],
+  "hierarchy": {
+    "primary": "online generation flow",
+    "secondary": "offline evolution of the same generator",
+    "focal_module": "boundary-constrained spline decoder"
+  },
+  "contribution_badges": {
+    "1": "Boundary-constrained path representation",
+    "2": "Sequential expert-route learning and physical adaptation"
+  },
+  "removed_from_v1": [
+    "stage-number badges",
+    "full-width feedback loop",
+    "long deployment disclaimer",
+    "duplicated representation panel"
+  ]
+}

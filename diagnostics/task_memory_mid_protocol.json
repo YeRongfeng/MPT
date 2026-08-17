@@ -1,0 +1,25 @@
+{
+  "status": "midcourse_confirmation_not_final",
+  "experiment": "Continue baseline and task_memory from 2500 to 5000",
+  "science_question": "Does the task_memory 2250 advantage persist with more training, or was it a lucky checkpoint?",
+  "arms": [
+    {
+      "name": "baseline",
+      "architecture": "spatial_map",
+      "resume": "diagnostics/path_xy_screen/baseline/stage1_last.pth",
+      "output_dir": "diagnostics/task_memory_mid/baseline"
+    },
+    {
+      "name": "task_memory",
+      "architecture": "task_memory",
+      "resume": "diagnostics/task_memory_screen/task_memory/stage1_last.pth",
+      "output_dir": "diagnostics/task_memory_mid/task_memory"
+    }
+  ],
+  "protocol_source": "diagnostics/q1_protocol.json",
+  "start_update": 2500,
+  "updates": 5000,
+  "eval_every": 250,
+  "save_every": 250,
+  "not_changed": ["architecture", "path_xy", "patch_size"]
+}

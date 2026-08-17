@@ -1,0 +1,4 @@
+interface:
+  display_name: "MPT Paper Writing"
+  short_description: "Evidence-gated MPT paper writing with ARIS"
+  default_prompt: "Use $mpt-paper-writing to revise the MPT paper from repository evidence."

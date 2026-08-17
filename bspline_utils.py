@@ -49,6 +49,34 @@ def create_bspline_basis_matrix(num_traj_points, num_control_points, degree=3):
     return basis_matrix, kv
 
 
+def create_bspline_geometry_matrices(
+    num_traj_points,
+    num_control_points,
+    degree=3,
+):
+    """创建 B-spline 的位置、一阶导数和二阶导数基矩阵。"""
+    if degree < 2:
+        raise ValueError("analytic curvature requires a B-spline degree >= 2")
+
+    basis_matrix, knot_vector = create_bspline_basis_matrix(
+        num_traj_points,
+        num_control_points,
+        degree,
+    )
+    parameters = np.linspace(0.0, 1.0, num_traj_points)
+    first_matrix = np.empty_like(basis_matrix)
+    second_matrix = np.empty_like(basis_matrix)
+
+    for index in range(num_control_points):
+        coefficients = np.zeros(num_control_points)
+        coefficients[index] = 1.0
+        spline = BSpline(knot_vector, coefficients, degree)
+        first_matrix[:, index] = spline.derivative(1)(parameters)
+        second_matrix[:, index] = spline.derivative(2)(parameters)
+
+    return basis_matrix, first_matrix, second_matrix, knot_vector
+
+
 def fit_bspline_least_squares(trajectory, num_control_points=20, degree=3):
     """
     使用最小二乘法拟合B样条控制点
@@ -137,8 +165,30 @@ class DifferentiableBSpline(nn.Module):
         self.degree = degree
         
         # 预计算基函数矩阵
-        basis_matrix, _ = create_bspline_basis_matrix(num_output_points, num_control_points, degree)
+        (
+            basis_matrix,
+            first_basis_matrix,
+            second_basis_matrix,
+            _,
+        ) = create_bspline_geometry_matrices(
+            num_output_points,
+            num_control_points,
+            degree,
+        )
         self.register_buffer('basis_matrix', torch.tensor(basis_matrix, dtype=torch.float32))
+        # Derivative matrices are deterministic helpers, not learned state.
+        # persistent=False keeps existing checkpoints that contain this layer
+        # backward-compatible.
+        self.register_buffer(
+            'first_basis_matrix',
+            torch.tensor(first_basis_matrix, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            'second_basis_matrix',
+            torch.tensor(second_basis_matrix, dtype=torch.float32),
+            persistent=False,
+        )
 
     def forward(self, control_points):
         """
@@ -153,6 +203,35 @@ class DifferentiableBSpline(nn.Module):
         # P = M @ C
         traj = torch.einsum('ij,bjk->bik', self.basis_matrix, control_points)
         return traj
+
+    def evaluate_geometry(self, control_points):
+        """返回位置及解析 B-spline 导数、切向 yaw 和绝对曲率。"""
+        position = self(control_points)
+        first = torch.einsum(
+            'ij,bjk->bik',
+            self.first_basis_matrix,
+            control_points,
+        )
+        second = torch.einsum(
+            'ij,bjk->bik',
+            self.second_basis_matrix,
+            control_points,
+        )
+        speed = torch.linalg.vector_norm(first, dim=-1)
+        yaw = torch.atan2(first[..., 1], first[..., 0])
+        cross = (
+            first[..., 0] * second[..., 1]
+            - first[..., 1] * second[..., 0]
+        )
+        curvature = torch.abs(cross) / speed.clamp_min(1e-10).pow(3)
+        return {
+            'position': position,
+            'first_derivative': first,
+            'second_derivative': second,
+            'speed': speed,
+            'yaw': yaw,
+            'curvature': curvature,
+        }
 
 
 class ArcLengthResampler(nn.Module):

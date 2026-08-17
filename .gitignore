@@ -1,28 +1,76 @@
-# Cache files
-.vscode
-.codebuddy
-.history
-
-# 3rd party files
-vision_transformer/**
-vit-pytorch/**
-pytorch-receptive-field/**
-torch_receptive_field/**
-ompl
-
-# data files
-data/**
-predictions
+# Editors and local environments
+.vscode/
+.codebuddy/
+.history/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Jupyter notebooks
-.ipynb_checkpoints/**
+.ipynb_checkpoints/
 *.ipynb
+!/legacy/mpt_baselines/notebooks/*.ipynb
 
+# Python caches
+**/__pycache__/
+*.py[cod]
 
-**/__pycache__/**
-__pycache__
+# Native and Python build products
+**/build/
+**/dist/
+*.egg-info/
+*.o
+*.so
+*.a
 
-*.png
+# Model and checkpoint artifacts
 *.pt
+*.pth
+*.pth.tar
+*.ckpt
+*.safetensors
+*.onnx
+*.pkl
+*.pickle
+
+# Bulk numerical artifacts
+*.npy
+*.npz
+
+# Training and runtime outputs
+/checkpoints/
+/runs/
+/wandb/
+/lightning_logs/
+/tensorboard/
+
+# Project data and experiment outputs
+/data/
+/predictions/
+/evaluation_results/
+/tests/audits/
+/tests/legacy/
+/.Trash-*/
+.aris/
+.paper-review/
+refine-logs/
+log.log
+*.log
+
+# Machine-local Codex/ARIS skill symlinks
+.agents/skills/*
+!.agents/skills/mpt-paper-writing/
+!.agents/skills/mpt-paper-writing/**
+
+# Generated plots and documents
+*.png
 *.svg
 *.pdf
+
+# Third-party local copies
+/vision_transformer/
+/vit-pytorch/
+/pytorch-receptive-field/
+/torch_receptive_field/
+/legacy/mpt_baselines/ompl/

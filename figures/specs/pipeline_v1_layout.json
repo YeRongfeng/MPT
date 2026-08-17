@@ -1,0 +1,36 @@
+{
+  "title": "Method overview v1 - deployment spine with staged offline learning",
+  "canvas": {"width": 1600, "height": 760},
+  "visual_thesis": "Offline learning shapes one generator; online planning is one left-to-right pass.",
+  "layers": [
+    {
+      "id": "offline",
+      "label": "OFFLINE LEARNING",
+      "bounds": [28, 28, 1544, 292],
+      "stages": ["Learn route structure", "Adapt physical feasibility"]
+    },
+    {
+      "id": "deployment",
+      "label": "ONLINE PATH GENERATION",
+      "bounds": [28, 346, 1544, 378],
+      "flow": ["masked observation", "one-step generator", "free coordinates", "boundary-constrained decoder", "global path"]
+    }
+  ],
+  "contributions": {
+    "1": "Boundary-constrained path representation",
+    "2": "Expert-route learning followed by physical adaptation"
+  },
+  "information_boundary": {
+    "deployment": ["current observation", "mask", "start and goal poses", "one Gaussian source"],
+    "training_only": ["complete terrain for rollover-stability supervision"]
+  },
+  "palette": {
+    "ink": "#183047",
+    "blue": "#3B6FB6",
+    "teal": "#167C78",
+    "orange": "#D97732",
+    "red": "#C94E45",
+    "green": "#6E9D78",
+    "paper": "#FFFFFF"
+  }
+}

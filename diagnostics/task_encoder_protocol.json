@@ -1,0 +1,29 @@
+{
+  "status": "screening_not_a_final_result",
+  "experiment": "Stage-1 2500-update feature-level task_encoder screen",
+  "science_question": "If AdaLN is time-only and H_task = Linear([CNN(M)_j ; MLP(S,G)]), is that better than baseline joint (S,G,t) AdaLN plus map-only CA?",
+  "invalidates": "diagnostics/task_encoder_raster_wrong_impl — Gaussian raster of S/G into CNN, not the intended design",
+  "arms": [
+    {
+      "name": "baseline",
+      "architecture": "spatial_map",
+      "reuse": "diagnostics/path_xy_screen/baseline"
+    },
+    {
+      "name": "task_encoder",
+      "architecture": "task_encoder",
+      "map_layout": "single_12",
+      "output_dir": "diagnostics/task_encoder_screen/task_encoder"
+    }
+  ],
+  "protocol_source": "diagnostics/q1_protocol.json",
+  "updates": 2500,
+  "single_variable": "time-only AdaLN + feature-level Linear fuse of CNN(M) and MLP(S,G)",
+  "not_included": [
+    "S/G heatmap",
+    "canonical raster",
+    "path_xy",
+    "shared_xy",
+    "condition_decoupling_q2"
+  ]
+}

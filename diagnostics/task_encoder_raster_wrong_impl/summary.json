@@ -1,0 +1,48 @@
+{
+  "status": "completed_screen_not_final",
+  "protocol": "diagnostics/task_encoder_protocol.json",
+  "independent_eval": {
+    "spatial_map_2500": {
+      "architecture": "spatial_map",
+      "update": 2500,
+      "val_loss": 0.16783958464860915,
+      "safe1": 0.0625,
+      "safe8": 0.155,
+      "curvature1": 0.08500000089406967,
+      "forbidden1": 0.9225000143051147,
+      "stability1": 0.8025000095367432
+    },
+    "task_encoder_best_1500": {
+      "architecture": "task_encoder",
+      "update": 1500,
+      "val_loss": 0.3634780430793762,
+      "safe1": 0.0,
+      "safe8": 0.005,
+      "curvature1": 0.0,
+      "forbidden1": 0.8799999952316284,
+      "stability1": 0.6899999976158142
+    },
+    "task_encoder_last_2500": {
+      "architecture": "task_encoder",
+      "update": 2500,
+      "val_loss": 0.3958469462394714,
+      "safe1": 0.0,
+      "safe8": 0.0025,
+      "curvature1": 0.0024999999441206455,
+      "forbidden1": 0.8799999952316284,
+      "stability1": 0.7024999856948853
+    }
+  },
+  "ca_off_rms_m": {
+    "spatial_map": {
+      "map_swap": 0.013182499824324623,
+      "ca_off": 0.026945847166643944
+    },
+    "task_encoder": {
+      "map_swap": 0.013284031709190458,
+      "ca_off": 0.06136945044272579
+    }
+  },
+  "decision": "eliminate_task_encoder_v1",
+  "decision_reason": "Clear fail vs baseline at 2500 updates. Best task_encoder val loss 0.36 vs baseline 0.17; Safe@1 0% vs 6.25%; Curvature@1 0% vs 8.5%. Do not combine with path_xy."
+}

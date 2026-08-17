@@ -1,0 +1,35 @@
+{
+  "status": "completed_7500_not_final",
+  "experiment": "Continue baseline and task_memory from 5000 to 7500",
+  "science_question": "Is task_memory faster to learn, or does it also reach a better final Stage-1 distribution?",
+  "focus": [
+    "Do Safe@8 / Curvature still favor task_memory on most 5000-7500 checkpoints?",
+    "Does baseline keep catching or overtaking on Safe@1?",
+    "Can task_memory Safe@1 peaks move past ~13%, or do they stall?"
+  ],
+  "arms": [
+    {
+      "name": "baseline",
+      "architecture": "spatial_map",
+      "resume": "diagnostics/task_memory_mid/baseline/stage1_last.pth",
+      "output_dir": "diagnostics/task_memory_7500/baseline"
+    },
+    {
+      "name": "task_memory",
+      "architecture": "task_memory",
+      "resume": "diagnostics/task_memory_mid/task_memory/stage1_last.pth",
+      "output_dir": "diagnostics/task_memory_7500/task_memory"
+    }
+  ],
+  "protocol_source": "diagnostics/q1_protocol.json",
+  "previous_interval": "diagnostics/task_memory_mid",
+  "start_update": 5000,
+  "updates": 7500,
+  "eval_every": 250,
+  "save_every": 250,
+  "seed": 20260813,
+  "split_seed": 20260814,
+  "eval_seed": 20260815,
+  "not_changed": ["architecture", "path_xy", "patch_size"],
+  "not_started": ["path_xy", "patch_size_sweep", "full_13750"]
+}

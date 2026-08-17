@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "workspace": "/home/yrf/MPT",
+  "outputDir": "/home/yrf/MPT/figures/ai_generated",
+  "codexBin": "/home/yrf/.nvm/versions/node/v22.22.2/bin/codex",
+  "checkedAt": "2026-08-13T09:17:06Z",
+  "returncode": 1,
+  "error": "WARNING: proceeding, even though we could not create PATH aliases: Read-only file system (os error 30)\nWARNING: proceeding, even though we could not create PATH aliases: Read-only file system (os error 30)\nError: failed to initialize sqlite state runtime under /home/yrf/.codex: failed to initialize state runtime at /home/yrf/.codex\nError: codex app-server closed stdout"
+}

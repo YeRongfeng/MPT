@@ -18,6 +18,7 @@ import time
 from dit.Models import CostConditionedPathDiffusionTransformer
 from evaluator import TrajectoryEvaluator
 from dataLoader_dit import compute_map_yaw_bins, generate_sdf_from_yaw_stability
+from tools._paths import evaluation_results_dir
 
 
 def generate_paths(model, map_input, start_point, goal_point, cost_scalar=0.65, num_paths=1, device='cuda',
@@ -297,7 +298,7 @@ def main():
     # =================== 配置参数 ===================
     dataset_path = 'data/sim_dataset/val'
     # dataset_path = 'data/sim_dataset/train'
-    save_path = 'evaluation_results'
+    save_path = str(evaluation_results_dir("cdit"))
     os.makedirs(save_path, exist_ok=True)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

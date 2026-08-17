@@ -101,18 +101,50 @@ class SafetyCostConfig:
     # tail here made Stage 2 round off too much of the trajectory.
     curvature_tail_ratio: float = 0.05
     out_of_bound_tail_ratio: float = 0.05
+    mask_tail_ratio: float = 0.05
+    # Stage 2 主线将内部 mask 与矩形安全边界合并成唯一禁区距离。
+    forbidden_tail_ratio: float = 0.05
+    # 在 signed-distance medial axis 上提供极小确定性斜率，避免完全零梯度。
+    mask_medial_axis_tiebreak_per_pixel: float = 1e-3
     d_safe_meters: float = 0.15
     softplus_alpha: float = 10.0
-    curvature_limit: float = 1.4
+    # 车辆已确认的最大几何曲率，等价于约 0.476 m 的最小转弯半径。
+    curvature_limit: float = 2.1
+    curvature_min_segment_meters: float = 1e-3
     boundary_safe_pixels: int = 1
+    # 旧碰撞检查器统一使用 0.2 m 圆形车辆近似；mask 会按该半径转为配置空间。
+    vehicle_radius_meters: float = 0.2
+    # Stage 2 的随机 mask 除了保护端点中心，还要为给定 yaw 保留短距离
+    # 起步/到达通道，否则端点像素合法但车辆第一步就可能进入配置空间禁区。
+    endpoint_mask_corridor_meters: float = 0.5
     obstacle_weight: float = 1.0
-    reference_curvature_weight: float = 1.0
+    # 32 个真实训练 context 的 residual-space 审计表明旧值 0.25 偏弱；
+    # reference=2 在当前 20 m 地图上得到实际 curvature_weight=0.5。
+    reference_curvature_weight: float = 2.0
+    # reference_curvature_weight: float = 0
     out_of_bound_weight: float = 1.0
     endpoint_weight: float = 1.0
+    # S/G 输入中的 yaw 属于任务约束；默认允许约 20 度切向误差。
+    endpoint_yaw_is_hard_constraint: bool = True
+    start_yaw_tolerance_rad: float = 0.35
+    goal_yaw_tolerance_rad: float = 0.35
+    mask_weight: float = 5.0
+    forbidden_weight: float = 5.0
+    # forbidden_weight: float = 0
+    # 仅保留 path length 诊断和宽松异常门槛，不进入主优化目标。
+    length_weight: float = 0.0
     # Low-priority tie-breaker: once safety and curvature are acceptable,
     # prefer trajectories with smoother vehicle-control changes.
-    quality_weight: float = 1e-4
-    quality_term: str = "jerk"
+    # B 样条与曲率已提供基础平滑性；主实验默认不启用额外三阶差分。
+    quality_weight: float = 0.0
+    quality_term: str = "third_difference"
+    # 三阶差分没有时间参数化，不是物理 jerk，只用于低权重质量排序。
+    third_difference_is_hard_constraint: bool = False
+    short_segment_weight: float = 1.0
+    # 防止专家用极端绕路换取局部安全；这是单独的质量门槛，不计入
+    # strict physical validity。
+    max_path_length_ratio: float = 2.0
+    hard_constraint_epsilon: float = 1e-6
     yaw_esdf_weight: float = 1.4
 
     @property
@@ -170,14 +202,14 @@ def discover_environments(split_folder, expected_count=None):
 # Dataset20: 100 centered 20m x 20m maps sampled on a 100 x 100 grid.
 # This is the single edit point for future map/dataset scale changes.
 MAP_CONFIG = MapConfig(
-    dataset_root=Path("/home/yrf/MPT/data/dataset0"),
+    dataset_root=Path("/home/yrf/MPT/data/dataset1"),
     expected_environments=100,
     size_meters=20.0,
     grid_size=100,
 )
 
 # Stage-2 safety-cost tuning is centralized here.  For the current 20 m map,
-# the scale compensation gives curvature_weight=(20/40)^2=0.25.
+# the scale compensation gives curvature_weight=2*(20/40)^2=0.5.
 SAFETY_COST_CONFIG = SafetyCostConfig(map_size_meters=MAP_CONFIG.size_meters)
 
 # Uppercase aliases are convenient for code that prefers macro-like constants.
@@ -186,5 +218,7 @@ MAP_GRID_SIZE = MAP_CONFIG.grid_size
 MAP_HALF_EXTENT = MAP_CONFIG.half_extent
 MAP_RESOLUTION = MAP_CONFIG.resolution
 MAP_BOUNDS = MAP_CONFIG.bounds
+# 训练 cost、hard validity 和可视化统一使用同一稠密采样点数。
+DENSE_TRAJECTORY_POINTS = 200
 MAP_ORIGIN_XY = MAP_CONFIG.origin_xy
 MAP_YAW_BINS = MAP_CONFIG.yaw_bins

@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 import open3d as o3d
 import noise
 import random
@@ -360,7 +361,8 @@ plt.title('10m x 10m Terrain with Ridge (Centered)' if generate_ridge else '10m 
 plt.xlabel('X (m)')
 plt.ylabel('Y (m)')
 plt.tight_layout()
-plt.savefig("terrain_10m_10m.png", dpi=300)
+asset_dir = Path(__file__).resolve().parent
+plt.savefig(asset_dir / "terrain_10m_10m.png", dpi=300)
 plt.show()
 
 # 创建点云并着色
@@ -381,7 +383,7 @@ colors = cm.terrain(norm_heights)[:, :3]
 pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float32))
 
 # 保存点云
-o3d.io.write_point_cloud("terrain_10m_10m.pcd", pcd)
+o3d.io.write_point_cloud(str(asset_dir / "terrain_10m_10m.pcd"), pcd)
 
 # 可视化（点云）
 o3d.visualization.draw_geometries([pcd], window_name="10m Terrain", width=900, height=700, point_show_normal=False)

@@ -22,6 +22,10 @@ from eval_model_uneven import getHashTable, get_patch
 import torch
 
 from relative_motion_utils import relative_motion_to_trajectory
+from tools._paths import PREDICTIONS_ROOT
+
+
+DEFAULT_PREDICTIONS_DIR = str(PREDICTIONS_ROOT)
 
 dataset_path = 'data/sim_dataset/val'
 # dataset_path = 'data/sim_dataset/train'
@@ -310,7 +314,7 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTrajs=None, out
     ax.set_title(title, fontsize=12, pad=8)
     ax.axis('off')
 
-def plot_elevation_map(pathNums, envType, save_path='predictions', num_pred_paths=1, use_bezier_interpolate=False):
+def plot_elevation_map(pathNums, envType, save_path=DEFAULT_PREDICTIONS_DIR, num_pred_paths=1, use_bezier_interpolate=False):
     """绘制多组轨迹对比图
     
     Args:

@@ -9,6 +9,8 @@ from torch.utils.data import Dataset  # 数据集基类：提供数据加载的�
 import skimage.io  # 图像IO操作：读取地图图像文件
 import pickle  # 序列化库：加载路径数据文件
 import numpy as np  # 数值计算库：数组操作和数学计算
+from functools import lru_cache
+import hashlib
 
 import os  # 操作系统接口：文件和目录操作
 from os import path as osp  # 路径操作：文件路径处理
@@ -18,13 +20,22 @@ from torch.nn.utils.rnn import pad_sequence  # 序列填充：处理变长序列
 
 from utils import geom2pix  # 坐标转换工具：几何坐标到像素坐标的转换
 from relative_motion_utils import trajectory_to_relative_motion  # 相对运动工具：轨迹转换为相对运动表示
+from bspline_utils import (
+    create_bspline_basis_matrix,
+    reconstruct_from_control_points,
+)
+from boundary_constrained_path import (
+    BoundaryConstrainedPathRepresentation,
+)
 from map_config import (
+    DENSE_TRAJECTORY_POINTS,
     MAP_BOUNDS,
     MAP_CONFIG,
     MAP_GRID_SIZE,
     MAP_HALF_EXTENT,
     MAP_RESOLUTION,
     MAP_YAW_BINS,
+    SAFETY_COST_CONFIG,
 )
 
 # 添加兼容性处理
@@ -53,6 +64,1037 @@ receptive_field_size = receptive_field * res  # 感受野的实际大小（米�
 anchor_spacing_size = anchor_spacing * res    # 锚点间距的实际大小（米）
 max_anchors_per_axis = math.ceil(receptive_field_size / anchor_spacing_size)  # 每个轴向最大锚点数
 MAX_POSITIVE_ANCHORS = max_anchors_per_axis * max_anchors_per_axis  # 理论最大正样本数
+
+# Stability caches are part of the physical-label contract, not merely a
+# performance optimization.  Bump this token whenever normal orientation,
+# array axes, ESDF construction, or continuous sampling semantics change.
+STABILITY_MAP_FORMAT_VERSION = 3
+STABILITY_MAP_SEMANTIC_VERSION = (
+    "yaw_esdf_hwy_upward_nz_no_transpose_cell_center_xy_uniform_v3"
+)
+
+
+def stability_source_map_sha256(map_file, chunk_bytes=1024 * 1024):
+    """Return the content hash binding a stability cache to ``map.p``."""
+    digest = hashlib.sha256()
+    with open(map_file, "rb") as handle:
+        while True:
+            chunk = handle.read(int(chunk_bytes))
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stability_cache_is_compatible(
+    cached,
+    *,
+    map_shape,
+    resolution,
+    yaw_bins,
+    yaw_weight,
+    source_map_sha256,
+):
+    """Validate both geometry and semantic provenance of a loaded NPZ."""
+    try:
+        return (
+            cached["yaw_stability"].shape == (*tuple(map_shape), int(yaw_bins))
+            and cached["cost_map"].shape == (*tuple(map_shape), int(yaw_bins))
+            and int(cached["format_version"].item())
+            == STABILITY_MAP_FORMAT_VERSION
+            and str(cached["semantic_version"].item())
+            == STABILITY_MAP_SEMANTIC_VERSION
+            and str(cached["source_map_sha256"].item())
+            == str(source_map_sha256)
+            and int(cached["yaw_bins"].item()) == int(yaw_bins)
+            and np.isclose(
+                float(cached["voxel_size_xy"].item()),
+                float(resolution),
+                atol=1e-6,
+                rtol=0.0,
+            )
+            and np.isclose(
+                float(cached["yaw_weight"].item()),
+                float(yaw_weight),
+                atol=1e-6,
+                rtol=0.0,
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+# 被 mask 挡住的法向量使用全局小方差高斯噪声；训练动态采样，验证固定。
+# 固定偏移用于让 mask 形状与验证噪声彼此独立。
+MASK_NOISE_SEED_OFFSET = 7_919
+MASK_INPUT_SEMANTICS = "stage_split_dynamic_gaussian_bernoulli_mask_vehicle_v4"
+MASK_GENERATION_SEMANTICS = (
+    "informed_ellipse_two_stage_obstacle_curriculum_segment_aware_v5"
+)
+MASK_NOISE_STD = 0.25
+
+# 不完整地图允许大面积缺失，但必须保留类似 Informed RRT 的示范椭圆；
+# 主动障碍随后只在轨迹中段局部挖去。
+INFORMED_ELLIPSE_CLEARANCE_METERS = 0.5
+STAGE2_MAX_MASKED_FRACTION = 0.60
+STAGE2_MAX_DEMO_BLOCKED_FRACTION = 0.15
+STAGE2_MAX_CONTIGUOUS_BLOCKED_FRACTION = 0.10
+
+
+def normalize_mask(mask, shape, source="mask"):
+    """校验唯一的输入 mask，并统一为 1=允许、0=禁止的 float32 数组。
+
+    mask=0 可以源于地图未观测，也可以源于锥桶等实体障碍；模型不区分原因。
+    """
+    value = np.squeeze(np.asarray(mask))
+    if value.shape != tuple(shape):
+        raise ValueError(
+            f"{source} 应为 {tuple(shape)}，实际为 {value.shape}"
+        )
+    if not np.all(np.isfinite(value)):
+        raise ValueError(f"{source} 含 NaN/Inf")
+    return (value > 0.5).astype(np.float32)
+
+
+def build_masked_normal_input(normals, mask, seed=None, noise_std=MASK_NOISE_STD):
+    """构造四通道输入；mask=0 处法向量替换为 N(0,noise_std²)。
+
+    ``seed=None`` 用于训练，每次访问动态重采样；传入固定 seed 用于验证、
+    测试和可视化，保证相同样本可复现。
+    """
+    normals = np.asarray(normals, dtype=np.float32)
+    mask = np.asarray(mask, dtype=np.float32)
+    if normals.ndim != 3 or normals.shape[-1] != 3:
+        raise ValueError(f"normals 应为 (H,W,3)，实际为 {normals.shape}")
+    if mask.shape != normals.shape[:2]:
+        raise ValueError(
+            f"mask 应为 {normals.shape[:2]}，实际为 {mask.shape}"
+        )
+    mask = (mask > 0.5).astype(np.float32)
+    if noise_std <= 0.0:
+        raise ValueError("noise_std 必须为正数")
+    # seed=None 时每次访问动态重采样；显式 seed 用于验证和测试复现。
+    rng = np.random.default_rng(None if seed is None else np.uint64(seed))
+    gaussian = rng.normal(
+        0.0, float(noise_std), size=normals.shape
+    ).astype(np.float32)
+    masked_normals = np.where(mask[..., None] > 0.5, normals, gaussian)
+    return np.concatenate([masked_normals, mask[..., None]], axis=-1)
+
+
+def fit_demo_bspline_control_points(
+    trajectory,
+    num_control_points=26,
+    degree=3,
+):
+    """拟合与 Stage 2 hard contract 一致的平滑示范控制点。
+
+    旧实现先做欠定最小二乘，再单独旋转首尾控制柄；这会让第二个控制点与
+    后续控制点形成尖角，在端点制造并不存在于原路径中的曲率峰值。现在把
+    端点位置、exact endpoint yaw 和内部控制点放进同一个正则化最小二乘问题。
+    """
+    trajectory = np.asarray(trajectory, dtype=np.float32)
+    if trajectory.ndim != 2 or trajectory.shape[0] < 2:
+        raise ValueError(
+            f"示范轨迹必须至少为 (2,2)，实际为 {trajectory.shape}"
+        )
+    if trajectory.shape[0] == 2:
+        # mask 单元测试和旧接口可能只提供起终点；线性补一个中点即可。
+        trajectory = np.stack(
+            [trajectory[0], 0.5 * (trajectory[0] + trajectory[1]), trajectory[1]],
+            axis=0,
+        )
+    if trajectory.shape[1] < 3:
+        # 旧二维测试数据没有任务 yaw，使用首尾线段方向作为端点切向。
+        start_vector = trajectory[1, :2] - trajectory[0, :2]
+        goal_vector = trajectory[-1, :2] - trajectory[-2, :2]
+        start_yaw = float(np.arctan2(start_vector[1], start_vector[0]))
+        goal_yaw = float(np.arctan2(goal_vector[1], goal_vector[0]))
+        trajectory = np.concatenate(
+            [
+                trajectory[:, :2],
+                np.linspace(
+                    start_yaw,
+                    goal_yaw,
+                    trajectory.shape[0],
+                    dtype=np.float32,
+                )[:, None],
+            ],
+            axis=1,
+        )
+    return _fit_demo_bspline_control_points_cached(
+        trajectory.astype(np.float32, copy=False).tobytes(),
+        tuple(trajectory.shape),
+        int(num_control_points),
+        int(degree),
+        float(SAFETY_COST_CONFIG.start_yaw_tolerance_rad),
+        float(SAFETY_COST_CONFIG.goal_yaw_tolerance_rad),
+        float(SAFETY_COST_CONFIG.curvature_limit),
+    ).copy()
+
+
+def _arc_length_resample_numpy(points, count):
+    """按弧长重采样折线，避免原始点密度改变最小二乘权重。"""
+    points = np.asarray(points, dtype=np.float64)
+    segment_length = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_length)])
+    if cumulative[-1] <= 1e-8:
+        raise ValueError("示范轨迹总长度接近零，无法拟合 B 样条")
+    target = np.linspace(0.0, cumulative[-1], int(count))
+    return np.stack(
+        [
+            np.interp(target, cumulative, points[:, axis])
+            for axis in range(2)
+        ],
+        axis=1,
+    )
+
+
+def _closest_allowed_tangent(task_yaw, raw_vector, tolerance):
+    """在 hard yaw 容差内选取最贴近原示范切向的方向。"""
+    raw_yaw = float(np.arctan2(raw_vector[1], raw_vector[0]))
+    difference = float(
+        np.arctan2(
+            np.sin(raw_yaw - float(task_yaw)),
+            np.cos(raw_yaw - float(task_yaw)),
+        )
+    )
+    selected_yaw = float(task_yaw) + float(
+        np.clip(difference, -float(tolerance), float(tolerance))
+    )
+    return np.asarray(
+        [np.cos(selected_yaw), np.sin(selected_yaw)],
+        dtype=np.float64,
+    )
+
+
+def _max_discrete_curvature_numpy(points):
+    """与 Stage 2 ``discrete_turning_curvature`` 相同的 numpy 诊断。"""
+    points = np.asarray(points, dtype=np.float64)
+    incoming = points[1:-1] - points[:-2]
+    outgoing = points[2:] - points[1:-1]
+    incoming_length = np.linalg.norm(incoming, axis=1)
+    outgoing_length = np.linalg.norm(outgoing, axis=1)
+    cross = incoming[:, 0] * outgoing[:, 1] - incoming[:, 1] * outgoing[:, 0]
+    dot = np.sum(incoming * outgoing, axis=1)
+    angle = np.arctan2(np.abs(cross), dot)
+    minimum = float(SAFETY_COST_CONFIG.curvature_min_segment_meters)
+    degenerate = (incoming_length < minimum) | (outgoing_length < minimum)
+    angle[degenerate] = np.pi
+    local_length = 0.5 * (incoming_length + outgoing_length)
+    return float(np.max(angle / np.maximum(local_length, minimum)))
+
+
+@lru_cache(maxsize=32_768)
+def _fit_demo_bspline_control_points_cached(
+    trajectory_bytes,
+    trajectory_shape,
+    num_control_points,
+    degree,
+    start_yaw_tolerance,
+    goal_yaw_tolerance,
+    curvature_limit,
+):
+    """缓存确定性拟合；默认单进程 DataLoader 下每条路径只求解一次。"""
+    from scipy.optimize import lsq_linear
+
+    trajectory = np.frombuffer(
+        trajectory_bytes,
+        dtype=np.float32,
+    ).reshape(trajectory_shape).astype(np.float64)
+    raw_points = trajectory[:, :2]
+    # 50 个弧长点足以稳定约束 26 个控制点，同时避免每个 epoch 重复大矩阵拟合。
+    fit_points = _arc_length_resample_numpy(raw_points, 50)
+    evaluation_points = _arc_length_resample_numpy(
+        raw_points,
+        DENSE_TRAJECTORY_POINTS,
+    )
+    count = int(num_control_points)
+    if count < 5:
+        raise ValueError("带端点 yaw 约束的 B 样条至少需要 5 个控制点")
+    basis, _ = create_bspline_basis_matrix(
+        len(fit_points),
+        count,
+        int(degree),
+    )
+    start = fit_points[0]
+    goal = fit_points[-1]
+    start_direction = _closest_allowed_tangent(
+        trajectory[0, 2],
+        raw_points[1] - raw_points[0],
+        start_yaw_tolerance,
+    )
+    goal_direction = _closest_allowed_tangent(
+        trajectory[-1, 2],
+        raw_points[-1] - raw_points[-2],
+        goal_yaw_tolerance,
+    )
+
+    # 未知量为首尾控制柄长度，以及 C2...C[-3] 的 xy。
+    unknowns = 2 + 2 * (count - 4)
+    design = np.zeros((2 * len(fit_points), unknowns), dtype=np.float64)
+    target = np.zeros(2 * len(fit_points), dtype=np.float64)
+    for sample_index in range(len(fit_points)):
+        constant = (
+            (basis[sample_index, 0] + basis[sample_index, 1]) * start
+            + (basis[sample_index, -2] + basis[sample_index, -1]) * goal
+        )
+        for axis in range(2):
+            row = 2 * sample_index + axis
+            target[row] = fit_points[sample_index, axis] - constant[axis]
+            design[row, 0] = basis[sample_index, 1] * start_direction[axis]
+            design[row, 1] = -basis[sample_index, -2] * goal_direction[axis]
+            for control_index in range(2, count - 2):
+                column = 2 + 2 * (control_index - 2) + axis
+                design[row, column] = basis[sample_index, control_index]
+
+    control_constant = np.zeros((count, 2), dtype=np.float64)
+    control_constant[:2] = start
+    control_constant[-2:] = goal
+    transform = np.zeros((2 * count, unknowns), dtype=np.float64)
+    transform[2:4, 0] = start_direction
+    transform[-4:-2, 1] = -goal_direction
+    for control_index in range(2, count - 2):
+        for axis in range(2):
+            transform[
+                2 * control_index + axis,
+                2 + 2 * (control_index - 2) + axis,
+            ] = 1.0
+
+    second_difference = np.zeros(
+        (2 * (count - 2), 2 * count),
+        dtype=np.float64,
+    )
+    for control_index in range(count - 2):
+        for axis in range(2):
+            row = 2 * control_index + axis
+            second_difference[row, 2 * control_index + axis] = 1.0
+            second_difference[row, 2 * (control_index + 1) + axis] = -2.0
+            second_difference[row, 2 * (control_index + 2) + axis] = 1.0
+
+    path_length = float(
+        np.linalg.norm(np.diff(fit_points, axis=0), axis=1).sum()
+    )
+    lower = np.full(unknowns, -np.inf)
+    upper = np.full(unknowns, np.inf)
+    lower[:2] = max(path_length / max(count - 1, 1) * 0.25, 1e-4)
+    upper[:2] = max(path_length * 0.25, lower[0] * 2.0)
+
+    def solve(smooth_weight):
+        scale = np.sqrt(float(smooth_weight))
+        augmented_design = np.concatenate(
+            [design, scale * second_difference @ transform],
+            axis=0,
+        )
+        augmented_target = np.concatenate(
+            [
+                target,
+                -scale
+                * second_difference
+                @ control_constant.reshape(-1),
+            ],
+            axis=0,
+        )
+        solution = lsq_linear(
+            augmented_design,
+            augmented_target,
+            bounds=(lower, upper),
+        ).x
+        control = (
+            control_constant.reshape(-1) + transform @ solution
+        ).reshape(count, 2)
+        dense = reconstruct_from_control_points(
+            control,
+            DENSE_TRAJECTORY_POINTS,
+            degree=int(degree),
+        )
+        curvature = _max_discrete_curvature_numpy(dense)
+        rmse = float(np.sqrt(np.mean(np.square(dense - evaluation_points))))
+        return control, curvature, rmse
+
+    candidates = [solve(0.005)]
+    if candidates[0][1] > float(curvature_limit):
+        # 仅对约 1% 的困难示范尝试更强平滑，主路径仍只需求解一次。
+        candidates.extend(
+            solve(weight)
+            for weight in (0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.1, 0.2)
+        )
+    feasible = [
+        item
+        for item in candidates
+        if item[1]
+        <= float(curvature_limit)
+        + float(SAFETY_COST_CONFIG.hard_constraint_epsilon)
+    ]
+    selected = (
+        min(feasible, key=lambda item: item[2])
+        if feasible
+        else min(candidates, key=lambda item: item[1])
+    )
+    return selected[0].astype(np.float32)
+
+
+def dense_demo_bspline(
+    trajectory,
+    num_points=DENSE_TRAJECTORY_POINTS,
+):
+    """按 mask 构造专用的容差-yaw规则重建稠密示范 B 样条。
+
+    Stage 1 的真实 44D target 由 ``BoundaryConstrainedPathRepresentation``
+    构造，并保持 exact endpoint yaw；两者不可再混称为同一个拟合器。
+    """
+    control_points = fit_demo_bspline_control_points(trajectory)
+    return reconstruct_from_control_points(
+        control_points, num_output_points=int(num_points), degree=3
+    ).astype(np.float32)
+
+
+def erode_mask_for_vehicle(
+    mask,
+    *,
+    vehicle_radius_meters=SAFETY_COST_CONFIG.vehicle_radius_meters,
+    resolution=MAP_RESOLUTION,
+):
+    """把几何 mask 转成车辆中心可行的配置空间 mask。"""
+    from scipy.ndimage import binary_erosion
+
+    mask = np.asarray(mask, dtype=np.float32) > 0.5
+    radius_pixels = int(np.ceil(float(vehicle_radius_meters) / float(resolution)))
+    if radius_pixels <= 0:
+        return mask.astype(np.float32)
+    yy, xx = np.mgrid[
+        -radius_pixels : radius_pixels + 1,
+        -radius_pixels : radius_pixels + 1,
+    ]
+    footprint = np.square(xx) + np.square(yy) <= radius_pixels**2
+    # 地图外边界由独立 box cost 处理；这里只膨胀 mask 内部遮挡。
+    eroded = binary_erosion(mask, structure=footprint, border_value=1)
+    return eroded.astype(np.float32)
+
+
+def _sample_trajectory_for_mask(trajectory_xy, *, spacing_m=None):
+    """按固定物理间隔生成有序折线样本，端点和每个折点均保留。"""
+    points = np.asarray(trajectory_xy, dtype=np.float32)[..., :2]
+    if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] == 0:
+        raise ValueError(f"trajectory_xy 应为 (N,2)，实际为 {points.shape}")
+    if spacing_m is None:
+        spacing_m = 0.5 * MAP_RESOLUTION
+    if float(spacing_m) <= 0.0:
+        raise ValueError("spacing_m 必须为正数")
+
+    dense = [points[:1]]
+    for start, end in zip(points[:-1], points[1:]):
+        distance = float(np.linalg.norm(end - start))
+        steps = max(1, int(np.ceil(distance / float(spacing_m))))
+        # 上一段的终点就是本段的起点；只追加本段的非重复采样点。
+        dense.append(
+            np.linspace(
+                start,
+                end,
+                steps + 1,
+                endpoint=True,
+                dtype=np.float32,
+            )[1:]
+        )
+    return np.concatenate(dense, axis=0)
+
+
+def _trajectory_mask_pixel_sequence(trajectory_xy, shape):
+    """返回与连续折线顺序一致的 (row, col) mask 像素序列。"""
+    shape = tuple(int(value) for value in shape)
+    if len(shape) != 2 or min(shape) <= 0:
+        raise ValueError(f"mask shape 必须是正二维尺寸，实际为 {shape}")
+    dense = _sample_trajectory_for_mask(trajectory_xy)
+    rows_cols = [geom2pix(point, size=shape) for point in dense]
+    return np.asarray(rows_cols, dtype=np.int64)
+
+
+def rasterize_trajectory(trajectory_xy, shape):
+    """把连续折线按半像素加密后栅格化。"""
+    pixels = _trajectory_mask_pixel_sequence(trajectory_xy, shape)
+    raster = np.zeros(tuple(shape), dtype=bool)
+    raster[pixels[:, 0], pixels[:, 1]] = True
+    return raster
+
+
+def trajectory_is_allowed(trajectory_xy, mask):
+    """检查连续轨迹是否始终位于 mask=1。"""
+    mask = np.asarray(mask, dtype=np.float32)
+    if mask.ndim != 2:
+        raise ValueError(f"mask 应为二维数组，实际为 {mask.shape}")
+    pixels = _trajectory_mask_pixel_sequence(trajectory_xy, mask.shape)
+    return bool(np.all(mask[pixels[:, 0], pixels[:, 1]] > 0.5))
+
+
+def trajectory_mask_blockage_metrics(trajectory_xy, mask):
+    """统计 mask 沿稠密轨迹造成的总阻断量和最长连续阻断段。
+
+    这不是有效性判据。Stage 2 用它限制随机干预的任务变化幅度：允许局部
+    障碍挡住旧路线，但不把局部纠正问题变成完全不同的全局重规划问题。
+    """
+    mask = np.asarray(mask, dtype=np.float32)
+    if mask.ndim != 2:
+        raise ValueError(f"mask 应为二维数组，实际为 {mask.shape}")
+    pixels = _trajectory_mask_pixel_sequence(trajectory_xy, mask.shape)
+    blocked = mask[pixels[:, 0], pixels[:, 1]] <= 0.5
+    if blocked.size == 0:
+        return {
+            "blocked_fraction": 0.0,
+            "max_contiguous_blocked_fraction": 0.0,
+        }
+    padded = np.pad(blocked.astype(np.int8), (1, 1))
+    changes = np.flatnonzero(np.diff(padded))
+    longest = (
+        int(np.max(changes[1::2] - changes[::2]))
+        if changes.size
+        else 0
+    )
+    return {
+        "blocked_fraction": float(blocked.mean()),
+        "max_contiguous_blocked_fraction": float(longest / blocked.size),
+    }
+
+
+def informed_demo_ellipse(
+    shape,
+    trajectory_xy,
+    *,
+    clearance_meters=INFORMED_ELLIPSE_CLEARANCE_METERS,
+):
+    """返回包含示范路径的 Informed-RRT 风格椭圆区域。
+
+    起终点是两个焦点，长轴长度取稠密示范路径长度并增加固定余量。按照
+    三角不等式，示范路径位于该椭圆内；不完整地图只能遮挡椭圆外部。
+    """
+    trajectory = np.asarray(trajectory_xy, dtype=np.float32)[..., :2]
+    if trajectory.ndim != 2 or len(trajectory) < 2:
+        raise ValueError(f"trajectory_xy 至少应为 (2,2)，实际为 {trajectory.shape}")
+    height, width = tuple(shape)
+    rows, cols = np.mgrid[0:height, 0:width]
+    grid_x = (
+        MAP_CONFIG.origin_xy[0] + (cols.astype(np.float32) + 0.5) * MAP_RESOLUTION
+    )
+    grid_y = (
+        MAP_CONFIG.origin_xy[1] + (rows.astype(np.float32) + 0.5) * MAP_RESOLUTION
+    )
+    start = trajectory[0]
+    goal = trajectory[-1]
+    path_length = float(
+        np.linalg.norm(np.diff(trajectory, axis=0), axis=1).sum()
+    )
+    focal_distance = float(np.linalg.norm(goal - start))
+    major_axis = max(path_length, focal_distance) + 2.0 * float(
+        clearance_meters
+    )
+    distance_sum = np.hypot(grid_x - start[0], grid_y - start[1]) + np.hypot(
+        grid_x - goal[0], grid_y - goal[1]
+    )
+    return distance_sum <= major_axis
+
+
+def endpoint_yaw_corridors(
+    trajectory,
+    *,
+    corridor_meters=SAFETY_COST_CONFIG.endpoint_mask_corridor_meters,
+):
+    """构造起点前向和终点反向的局部中心线通道。
+
+    输入含 yaw 时严格使用任务端点 yaw；旧的二维测试轨迹则用首尾线段方向
+    回退。mask 已经按车辆半径转为配置空间，因此这里只检查车辆中心线。
+    """
+    trajectory = np.asarray(trajectory, dtype=np.float32)
+    if trajectory.ndim != 2 or trajectory.shape[0] < 2 or trajectory.shape[1] < 2:
+        raise ValueError(f"trajectory 至少应为 (2,2)，实际为 {trajectory.shape}")
+    length = float(corridor_meters)
+    if length < 0.0:
+        raise ValueError("corridor_meters 不能为负数")
+
+    if trajectory.shape[1] >= 3:
+        start_direction = np.array(
+            [np.cos(trajectory[0, 2]), np.sin(trajectory[0, 2])],
+            dtype=np.float32,
+        )
+        goal_direction = np.array(
+            [np.cos(trajectory[-1, 2]), np.sin(trajectory[-1, 2])],
+            dtype=np.float32,
+        )
+    else:
+        start_direction = trajectory[1, :2] - trajectory[0, :2]
+        goal_direction = trajectory[-1, :2] - trajectory[-2, :2]
+        start_direction /= max(float(np.linalg.norm(start_direction)), 1e-8)
+        goal_direction /= max(float(np.linalg.norm(goal_direction)), 1e-8)
+
+    # 半像素采样，和连续轨迹 mask 检查保持相同空间精度。
+    steps = max(1, int(np.ceil(length / (0.5 * MAP_RESOLUTION))))
+    distance = np.linspace(0.0, length, steps + 1, dtype=np.float32)
+    start_corridor = (
+        trajectory[0, :2][None] + distance[:, None] * start_direction[None]
+    )
+    goal_corridor = (
+        trajectory[-1, :2][None] - distance[:, None] * goal_direction[None]
+    )
+    return start_corridor.astype(np.float32), goal_corridor.astype(np.float32)
+
+
+def mask_start_goal_connected(mask, start_xy, goal_xy):
+    """检查腐蚀后的配置空间 mask 中，起终点是否属于同一可通行分量。
+
+    这里使用八邻域，只做随机 mask 是否显然不可解的必要条件检查。通过该
+    检查不代表一定存在满足地形、曲率和航向约束的轨迹。
+    """
+    from scipy.ndimage import label
+
+    mask = np.asarray(mask, dtype=np.float32)
+    if mask.ndim != 2:
+        raise ValueError(f"mask 应为二维数组，实际为 {mask.shape}")
+    start_row, start_col = geom2pix(
+        np.asarray(start_xy, dtype=np.float32)[:2], size=mask.shape
+    )
+    goal_row, goal_col = geom2pix(
+        np.asarray(goal_xy, dtype=np.float32)[:2], size=mask.shape
+    )
+    allowed = mask > 0.5
+    if not allowed[start_row, start_col] or not allowed[goal_row, goal_col]:
+        return False
+    components, _ = label(
+        allowed,
+        structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    component = int(components[start_row, start_col])
+    return component != 0 and component == int(components[goal_row, goal_col])
+
+
+def generate_random_mask(
+    shape,
+    seed,
+    trajectory_xy,
+    *,
+    p_mask=0.5,
+    require_trajectory_clear=True,
+    vehicle_radius_meters=SAFETY_COST_CONFIG.vehicle_radius_meters,
+    endpoint_corridor_meters=SAFETY_COST_CONFIG.endpoint_mask_corridor_meters,
+    max_attempts=128,
+    return_metadata=False,
+):
+    """按训练阶段生成唯一 mask。
+
+    不完整地图与主动障碍最终合并为同一张 mask：前者只能遮挡示范的
+    Informed-RRT 风格椭圆之外，后者只在轨迹中段放置小型局部障碍。
+    Stage 1 只生成不完整地图；Stage 2 可随机组合两种语义。
+    """
+    if not 0.0 <= p_mask <= 1.0:
+        raise ValueError("p_mask 必须在 [0,1]")
+    height, width = tuple(shape)
+    yy, xx = np.mgrid[0:height, 0:width]
+    dense_trajectory = dense_demo_bspline(trajectory_xy)
+    informed_region = informed_demo_ellipse(
+        (height, width),
+        dense_trajectory,
+    )
+    # 随机缺失先额外保护一个车辆半径，随后配置空间腐蚀也不会侵入目标椭圆。
+    incomplete_carve_protection = informed_demo_ellipse(
+        (height, width),
+        dense_trajectory,
+        clearance_meters=(
+            INFORMED_ELLIPSE_CLEARANCE_METERS
+            + float(vehicle_radius_meters)
+        ),
+    )
+    task_endpoints = np.asarray(trajectory_xy, dtype=np.float32)[[0, -1], :2]
+    start_corridor, goal_corridor = endpoint_yaw_corridors(
+        trajectory_xy,
+        corridor_meters=endpoint_corridor_meters,
+    )
+
+    def task_rejection_reason(mask):
+        # 起终点始终必须可用；Stage 2 只取消对旧示范中间段的条件化。
+        endpoints_clear = all(
+            trajectory_is_allowed(point[None], mask)
+            for point in task_endpoints
+        )
+        if not endpoints_clear:
+            return "endpoint_blocked", {
+                "blocked_fraction": 0.0,
+                "max_contiguous_blocked_fraction": 0.0,
+            }
+        if not trajectory_is_allowed(start_corridor, mask):
+            return "start_corridor_blocked", {
+                "blocked_fraction": 0.0,
+                "max_contiguous_blocked_fraction": 0.0,
+            }
+        if not trajectory_is_allowed(goal_corridor, mask):
+            return "goal_corridor_blocked", {
+                "blocked_fraction": 0.0,
+                "max_contiguous_blocked_fraction": 0.0,
+            }
+        blockage = trajectory_mask_blockage_metrics(dense_trajectory, mask)
+        if require_trajectory_clear:
+            # Stage 1 必须与 get_item 的最终校验使用完全相同的连续折线
+            # 栅格化；仅查询 200 个样条点会漏掉相邻点之间的薄障碍。
+            if not trajectory_is_allowed(dense_trajectory, mask):
+                return "demo_blocked", blockage
+            return None, blockage
+        if not mask_start_goal_connected(
+            mask,
+            task_endpoints[0],
+            task_endpoints[1],
+        ):
+            return "start_goal_disconnected", blockage
+        if (
+            blockage["blocked_fraction"]
+            > STAGE2_MAX_DEMO_BLOCKED_FRACTION
+        ):
+            return "demo_blockage_too_large", blockage
+        if (
+            blockage["max_contiguous_blocked_fraction"]
+            > STAGE2_MAX_CONTIGUOUS_BLOCKED_FRACTION
+        ):
+            return "demo_blockage_too_long", blockage
+        return None, blockage
+
+    def mask_type(has_large, has_small):
+        if has_large and has_small:
+            return "mixed"
+        if has_large:
+            return "large_only"
+        if has_small:
+            return "small_only"
+        return "complete"
+
+    proposed_type_counts = {}
+    rejected_type_counts = {}
+    rejection_reason_counts = {}
+    raw_connectivity_counts = {"connected": 0, "disconnected": 0}
+
+    def increment(counter, key):
+        counter[key] = counter.get(key, 0) + 1
+
+    base_seed = int(seed)
+
+    # 顶层 Bernoulli：x=0 表示本样本完全不加遮挡，返回全 1 mask。
+    activation_rng = np.random.default_rng(base_seed)
+    mask_active = bool(activation_rng.binomial(1, float(p_mask)))
+    if not mask_active:
+        full = np.ones((height, width), dtype=np.float32)
+        metadata = {
+            "mask_active": False,
+            "has_large_cutout": False,
+            "has_small_obstacles": False,
+            "has_route_local_obstacle": False,
+            "has_global_entity_obstacles": False,
+            "trajectory_obstacle_mode": "none",
+            "semantic_mode": "complete",
+            "attempts": 1,
+            "sampling_attempts": 1,
+            "resamples": 0,
+            "masked_fraction": 0.0,
+            "endpoint_corridor_meters": float(endpoint_corridor_meters),
+            "accepted_type": "complete",
+            "mask_profile": (
+                "stage1_demo_valid"
+                if require_trajectory_clear
+                else "stage2_local_intervention"
+            ),
+            "demo_blocked_fraction": 0.0,
+            "demo_max_contiguous_blocked_fraction": 0.0,
+            "informed_ellipse_fraction": float(informed_region.mean()),
+            "proposed_type_counts": {"complete": 1},
+            "rejected_type_counts": {},
+            "rejection_reason_counts": {},
+            "raw_connectivity_counts": {"connected": 1, "disconnected": 0},
+            "used_fallback": False,
+        }
+        return (full, metadata) if return_metadata else full
+
+    def carve_ellipse(
+        mask,
+        rng,
+        radius_range,
+        center=None,
+        protected_region=None,
+    ):
+        if center is None:
+            cx = rng.uniform(0, width - 1)
+            cy = rng.uniform(0, height - 1)
+        else:
+            cx, cy = center
+        rx = rng.uniform(*radius_range) * width
+        ry = rng.uniform(*radius_range) * height
+        angle = rng.uniform(0.0, 2.0 * np.pi)
+        dx, dy = xx - cx, yy - cy
+        u = np.cos(angle) * dx + np.sin(angle) * dy
+        v = -np.sin(angle) * dx + np.cos(angle) * dy
+        carved = (u / rx) ** 2 + (v / ry) ** 2 <= 1.0
+        if protected_region is not None:
+            carved &= ~protected_region
+        mask[carved] = False
+
+    for attempt in range(int(max_attempts)):
+        rng = np.random.default_rng(base_seed + 17 + attempt * 104_729)
+        mask = np.ones((height, width), dtype=bool)
+        # 两阶段都训练不完整地图和实体障碍语义。Stage 1 的轨迹附近障碍
+        # 保持安全间距；Stage 2 才把障碍直接放到中段轨迹上制造绕行目标。
+        has_incomplete_observation = (
+            True if require_trajectory_clear else bool(rng.random() < 0.70)
+        )
+        has_route_local_obstacle = (
+            bool(rng.random() < 0.65)
+            if require_trajectory_clear
+            else bool(rng.random() < 0.50)
+        )
+        has_global_entity_obstacles = bool(
+            require_trajectory_clear and rng.random() < 0.25
+        )
+        if not (has_incomplete_observation or has_route_local_obstacle):
+            has_incomplete_observation = True
+
+        has_large = (
+            has_incomplete_observation and bool(rng.random() < 0.65)
+        )
+        has_small = (
+            has_incomplete_observation and bool(rng.random() < 0.65)
+        )
+        if has_incomplete_observation and not (has_large or has_small):
+            has_large = bool(rng.integers(0, 2))
+            has_small = not has_large
+        # 主动障碍也属于最终 mask 中的小孔洞。
+        has_small = (
+            has_small
+            or has_route_local_obstacle
+            or has_global_entity_obstacles
+        )
+        large_count = (1, 4)
+        large_radius = (0.14, 0.34)
+        small_count = (3, 11)
+        small_radius = (0.015, 0.055)
+        semantic_mode = (
+            "mixed"
+            if has_incomplete_observation
+            and (has_route_local_obstacle or has_global_entity_obstacles)
+            else (
+                "incomplete_observation"
+                if has_incomplete_observation
+                else "route_obstacle"
+            )
+        )
+        trajectory_obstacle_mode = (
+            "near_route_nonblocking"
+            if require_trajectory_clear and has_route_local_obstacle
+            else (
+                "on_route_blocking"
+                if has_route_local_obstacle
+                else "none"
+            )
+        )
+        candidate_type = mask_type(has_large, has_small)
+        increment(proposed_type_counts, candidate_type)
+
+        if has_large:
+            for _ in range(int(rng.integers(*large_count))):
+                carve_ellipse(
+                    mask,
+                    rng,
+                    large_radius,
+                    protected_region=incomplete_carve_protection,
+                )
+        if has_route_local_obstacle:
+            # 只在旧路线中间 60% 放一个小障碍，制造局部绕行监督；后面的
+            # 阻断比例门槛仍会拒绝尺寸偶然过大的候选。
+            lower = max(1, int(round(0.20 * len(dense_trajectory))))
+            upper = min(
+                len(dense_trajectory) - 1,
+                int(round(0.80 * len(dense_trajectory))),
+            )
+            route_index = int(rng.integers(lower, max(lower + 1, upper)))
+            center_xy = dense_trajectory[route_index].copy()
+            if require_trajectory_clear:
+                tangent = (
+                    dense_trajectory[min(route_index + 2, len(dense_trajectory) - 1)]
+                    - dense_trajectory[max(route_index - 2, 0)]
+                )
+                tangent /= max(float(np.linalg.norm(tangent)), 1e-6)
+                normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float32)
+                side = -1.0 if rng.random() < 0.5 else 1.0
+                center_xy += (
+                    side * rng.uniform(0.9, 1.4) * normal
+                ).astype(np.float32)
+            route_row, route_col = geom2pix(
+                center_xy,
+                size=(height, width),
+            )
+            carve_ellipse(
+                mask,
+                rng,
+                (0.015, 0.030),
+                center=(route_col, route_row),
+            )
+        if has_global_entity_obstacles:
+            # 少量全局小障碍提高位置泛化；若碰到示范 footprint，Stage 1
+            # 的既有 hard rejection 会重新采样，不产生矛盾监督。
+            for _ in range(int(rng.integers(1, 4))):
+                carve_ellipse(mask, rng, (0.010, 0.025))
+        if has_small:
+            if has_incomplete_observation:
+                for _ in range(int(rng.integers(*small_count))):
+                    carve_ellipse(
+                        mask,
+                        rng,
+                        small_radius,
+                        protected_region=incomplete_carve_protection,
+                    )
+
+        # Stage 1 只排除几乎删掉全图的候选；Stage 2 在车辆腐蚀后使用更
+        # 明确的上限，避免隐藏一个极窄但像素上仍连通的通道。
+        stage1_too_sparse = bool(
+            require_trajectory_clear and mask.mean() < 0.20
+        )
+        mask_float = erode_mask_for_vehicle(
+            mask.astype(np.float32),
+            vehicle_radius_meters=vehicle_radius_meters,
+        )
+        connected = mask_start_goal_connected(
+            mask_float,
+            task_endpoints[0],
+            task_endpoints[1],
+        )
+        increment(
+            raw_connectivity_counts,
+            "connected" if connected else "disconnected",
+        )
+        if stage1_too_sparse:
+            rejection_reason = "too_sparse"
+            blockage = trajectory_mask_blockage_metrics(
+                dense_trajectory, mask_float
+            )
+        elif (
+            not require_trajectory_clear
+            and 1.0 - float(mask_float.mean())
+            > STAGE2_MAX_MASKED_FRACTION
+        ):
+            rejection_reason = "masked_fraction_too_large"
+            blockage = trajectory_mask_blockage_metrics(
+                dense_trajectory, mask_float
+            )
+        else:
+            rejection_reason, blockage = task_rejection_reason(mask_float)
+        if rejection_reason is None:
+            metadata = {
+                "mask_active": True,
+                "has_large_cutout": has_large,
+                "has_small_obstacles": has_small,
+                "has_route_local_obstacle": has_route_local_obstacle,
+                "has_global_entity_obstacles": has_global_entity_obstacles,
+                "trajectory_obstacle_mode": trajectory_obstacle_mode,
+                "semantic_mode": semantic_mode,
+                "attempts": attempt + 1,
+                "sampling_attempts": attempt + 1,
+                "resamples": attempt,
+                "masked_fraction": float(1.0 - mask_float.mean()),
+                "endpoint_corridor_meters": float(endpoint_corridor_meters),
+                "accepted_type": candidate_type,
+                "mask_profile": (
+                    "stage1_demo_valid"
+                    if require_trajectory_clear
+                    else "stage2_local_intervention"
+                ),
+                "demo_blocked_fraction": blockage["blocked_fraction"],
+                "demo_max_contiguous_blocked_fraction": blockage[
+                    "max_contiguous_blocked_fraction"
+                ],
+                "informed_ellipse_fraction": float(informed_region.mean()),
+                "proposed_type_counts": proposed_type_counts,
+                "rejected_type_counts": rejected_type_counts,
+                "rejection_reason_counts": rejection_reason_counts,
+                "raw_connectivity_counts": raw_connectivity_counts,
+                "used_fallback": False,
+            }
+            return (mask_float, metadata) if return_metadata else mask_float
+        increment(rejected_type_counts, candidate_type)
+        increment(rejection_reason_counts, rejection_reason)
+
+    # 极少数候选持续过度遮挡时，回退为逐个尝试小孔洞；接受条件仍由
+    # require_trajectory_clear 决定，不会沿轨迹人工刻出走廊。
+    rng = np.random.default_rng(base_seed + int(max_attempts) * 104_729)
+    mask = np.ones((height, width), dtype=bool)
+    accepted = 0
+    fallback_attempts = 0
+    for _ in range(64):
+        fallback_attempts += 1
+        increment(proposed_type_counts, "small_only")
+        candidate = mask.copy()
+        carve_ellipse(
+            candidate,
+            rng,
+            (0.015, 0.055),
+            protected_region=incomplete_carve_protection,
+        )
+        candidate_float = candidate.astype(np.float32)
+        candidate_float = erode_mask_for_vehicle(
+            candidate_float,
+            vehicle_radius_meters=vehicle_radius_meters,
+        )
+        connected = mask_start_goal_connected(
+            candidate_float,
+            task_endpoints[0],
+            task_endpoints[1],
+        )
+        increment(
+            raw_connectivity_counts,
+            "connected" if connected else "disconnected",
+        )
+        if (
+            not require_trajectory_clear
+            and 1.0 - float(candidate_float.mean())
+            > STAGE2_MAX_MASKED_FRACTION
+        ):
+            rejection_reason = "masked_fraction_too_large"
+        else:
+            rejection_reason, _ = task_rejection_reason(candidate_float)
+        if rejection_reason is None:
+            mask = candidate
+            accepted += 1
+        else:
+            increment(rejected_type_counts, "small_only")
+            increment(rejection_reason_counts, rejection_reason)
+        if accepted >= 6:
+            break
+    mask_float = erode_mask_for_vehicle(
+        mask.astype(np.float32),
+        vehicle_radius_meters=vehicle_radius_meters,
+    )
+    blockage = trajectory_mask_blockage_metrics(
+        dense_trajectory, mask_float
+    )
+    metadata = {
+        "mask_active": True,
+        "has_large_cutout": False,
+        "has_small_obstacles": accepted > 0,
+        "has_route_local_obstacle": False,
+        "has_global_entity_obstacles": False,
+        "trajectory_obstacle_mode": "none",
+        "semantic_mode": "incomplete_observation",
+        "attempts": int(max_attempts),
+        "sampling_attempts": int(max_attempts) + fallback_attempts,
+        "resamples": int(max_attempts) + fallback_attempts - 1,
+        "masked_fraction": float(1.0 - mask_float.mean()),
+        "endpoint_corridor_meters": float(endpoint_corridor_meters),
+        "accepted_type": "small_only" if accepted > 0 else "complete",
+        "mask_profile": (
+            "stage1_demo_valid"
+            if require_trajectory_clear
+            else "stage2_local_intervention"
+        ),
+        "demo_blocked_fraction": blockage["blocked_fraction"],
+        "demo_max_contiguous_blocked_fraction": blockage[
+            "max_contiguous_blocked_fraction"
+        ],
+        "informed_ellipse_fraction": float(informed_region.mean()),
+        "proposed_type_counts": proposed_type_counts,
+        "rejected_type_counts": rejected_type_counts,
+        "rejection_reason_counts": rejection_reason_counts,
+        "raw_connectivity_counts": raw_connectivity_counts,
+        "used_fallback": True,
+    }
+    return (mask_float, metadata) if return_metadata else mask_float
 
 # 【锚点网格系统构建】
 # 将连续的地图空间离散化为12x12的锚点网格，用于Transformer的token化处理
@@ -646,8 +1688,15 @@ def compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=18):
     # 确保输入是torch张量
     if not isinstance(normal_x, torch.Tensor):
         normal_x = torch.tensor(normal_x, dtype=torch.float32)
-        normal_y = torch.tensor(normal_y, dtype=torch.float32) 
+        normal_y = torch.tensor(normal_y, dtype=torch.float32)
         normal_z = torch.tensor(normal_z, dtype=torch.float32)
+
+    # PCL surface normals have an arbitrary sign.  The saved dataset already
+    # uses the intended horizontal convention, while nz is predominantly
+    # negative.  Orient the normal upward before *all* angular calculations;
+    # using abs(nz) only in the slope magnitude but signed nz below rotates the
+    # yaw feasibility intervals even though the underlying plane is unchanged.
+    normal_z = torch.abs(normal_z)
     
     device = normal_x.device
     H, W = normal_x.shape
@@ -835,6 +1884,8 @@ def compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=18):
         for idx, (i, j) in enumerate(zip(complex_indices[0], complex_indices[1])):
             yaw_stability[i, j, unreachable_mask[idx]] = 0.0
 
+    # Contract: axis 0 remains map row/y and axis 1 remains map column/x.
+    # Do not transpose here; downstream converts HWD -> DHW explicitly.
     return yaw_stability
 
 def sigmoid(x):
@@ -861,6 +1912,23 @@ def generate_sdf_from_yaw_stability(
 
     H, W, Y = ys.shape
     occupied = (ys <= 0.5)
+
+    # scipy's EDT assumes an implicit background when no target voxel exists.
+    # Handle uniform maps explicitly so they do not acquire a position-dependent
+    # pseudo-distance unrelated to the finite map.
+    max_xy = math.hypot(H * voxel_size_xy, W * voxel_size_xy)
+    max_yaw = math.pi * yaw_weight
+    max_dist = math.sqrt(max_xy**2 + max_yaw**2) + 1.0
+    if not occupied.any():
+        esdf = np.full((H, W, Y), max_dist, dtype=np.float32)
+        if input_is_torch:
+            return torch.from_numpy(esdf).to(device=device, dtype=torch.float32)
+        return esdf
+    if occupied.all():
+        esdf = np.full((H, W, Y), -max_dist, dtype=np.float32)
+        if input_is_torch:
+            return torch.from_numpy(esdf).to(device=device, dtype=torch.float32)
+        return esdf
 
     if use_scipy:
         try:
@@ -902,10 +1970,6 @@ def generate_sdf_from_yaw_stability(
     N = H * W * Y
 
     # 特殊情况
-    max_xy = math.hypot(H * voxel_size_xy, W * voxel_size_xy)
-    max_yaw = math.pi * yaw_weight
-    max_dist = math.sqrt(max_xy**2 + max_yaw**2) + 1.0
-
     if M == 0 and F == 0:
         esdf_map = torch.zeros((H, W, Y), dtype=torch.float32)
         if input_is_torch:
@@ -1328,6 +2392,15 @@ class UnevenPathDataLoader(Dataset):
         use_precomputed_stability=False,
         stability_map_filename='stability_map.npz',
         compute_stability_if_missing=False,
+        partial_observation=False,
+        include_mask=False,
+        mask_seed=2026,
+        p_mask=0.5,
+        dynamic_mask_noise=False,
+        mask_mode="stage1_demo_valid",
+        vehicle_radius_meters=SAFETY_COST_CONFIG.vehicle_radius_meters,
+        encode_path_coordinates=False,
+        encode_gauge_state=None,
     ):
         self.num_env = len(env_list)
         self.env_list = env_list
@@ -1336,6 +2409,35 @@ class UnevenPathDataLoader(Dataset):
         self.use_precomputed_stability = use_precomputed_stability
         self.stability_map_filename = stability_map_filename
         self.compute_stability_if_missing = compute_stability_if_missing
+        self.partial_observation = bool(partial_observation)
+        self.include_mask = bool(include_mask)
+        self.mask_seed = int(mask_seed)
+        self.p_mask = float(p_mask)
+        self.dynamic_mask_noise = bool(dynamic_mask_noise)
+        if mask_mode not in {"stage1_demo_valid", "stage2_independent"}:
+            raise ValueError(
+                "mask_mode 必须为 stage1_demo_valid 或 stage2_independent"
+            )
+        self.mask_mode = mask_mode
+        self.vehicle_radius_meters = float(vehicle_radius_meters)
+        if encode_gauge_state is not None:
+            if encode_path_coordinates:
+                raise ValueError(
+                    "同时设置了 encode_path_coordinates 和旧参数 "
+                    "encode_gauge_state。"
+                )
+            encode_path_coordinates = bool(encode_gauge_state)
+        self.encode_path_coordinates = bool(encode_path_coordinates)
+        self._path_representation = (
+            BoundaryConstrainedPathRepresentation()
+            if self.encode_path_coordinates
+            else None
+        )
+        self._path_coordinate_cache = {}
+        if self.vehicle_radius_meters < 0.0:
+            raise ValueError("vehicle_radius_meters 不能为负数")
+        if not 0.0 <= self.p_mask <= 1.0:
+            raise ValueError("p_mask 必须在 [0,1]")
         self.env_index = {env_name: i for i, env_name in enumerate(env_list)}
         self.indexDict = []
         self.env_static_cache = {}  # 每个环境的静态缓存：地图通道/编码输入/stability等
@@ -1372,6 +2474,26 @@ class UnevenPathDataLoader(Dataset):
     
     def __len__(self):
         return len(self.indexDict)
+
+    def _make_partial_mask(
+        self,
+        idx,
+        shape,
+        trajectory_xy,
+        mask_variant=0,
+        return_metadata=False,
+    ):
+        """生成可按轮次变化、同时可由索引和 variant 精确重建的 mask。"""
+        variant = int(mask_variant)
+        return generate_random_mask(
+            shape,
+            self.mask_seed + int(idx) * 1_000_003 + variant * 15_485_863,
+            trajectory_xy,
+            p_mask=self.p_mask,
+            require_trajectory_clear=(self.mask_mode == "stage1_demo_valid"),
+            vehicle_radius_meters=self.vehicle_radius_meters,
+            return_metadata=return_metadata,
+        )
 
     def _get_env_static_data(self, env_name):
         """
@@ -1415,6 +2537,17 @@ class UnevenPathDataLoader(Dataset):
             normal_y[:, :, None],
             normal_z[:, :, None]
         ), axis=2).astype(np.float32)
+        if not np.all(np.isfinite(encoded_input)):
+            raise ValueError(f"{map_file} 的法向量含 NaN/Inf")
+        map_mask = (
+            normalize_mask(
+                map_data["mask"],
+                map_tensor.shape[:2],
+                source=f"{map_file}['mask']",
+            )
+            if "mask" in map_data
+            else None
+        )
 
         env_static = {
             'elevation': elevation,
@@ -1423,14 +2556,34 @@ class UnevenPathDataLoader(Dataset):
             'normal_z': normal_z,
             'encoded_input': encoded_input,
             'map_shape': map_tensor.shape[:2],
+            'mask': map_mask,
         }
 
         if self.compute_stability_map and self.use_precomputed_stability:
             stability_file = osp.join(env_path, self.stability_map_filename)
             if osp.exists(stability_file):
                 with np.load(stability_file) as stability_data:
-                    env_static['yaw_stability'] = stability_data['yaw_stability'].astype(np.float32)
-                    env_static['cost_map'] = stability_data['cost_map'].astype(np.float32)
+                    compatible = stability_cache_is_compatible(
+                        stability_data,
+                        map_shape=map_tensor.shape[:2],
+                        resolution=map_resolution,
+                        yaw_bins=MAP_YAW_BINS,
+                        yaw_weight=SAFETY_COST_CONFIG.yaw_esdf_weight,
+                        source_map_sha256=stability_source_map_sha256(map_file),
+                    )
+                    if compatible:
+                        env_static['yaw_stability'] = stability_data[
+                            'yaw_stability'
+                        ].astype(np.float32)
+                        env_static['cost_map'] = stability_data[
+                            'cost_map'
+                        ].astype(np.float32)
+                    elif not self.compute_stability_if_missing:
+                        raise ValueError(
+                            f"stability cache 语义或源地图不匹配: "
+                            f"{stability_file}. 请用当前代码和 --overwrite "
+                            "重建，或显式允许在线回退计算。"
+                        )
             elif not self.compute_stability_if_missing:
                 raise FileNotFoundError(
                     f"预计算stability文件不存在: {stability_file}. "
@@ -1440,7 +2593,20 @@ class UnevenPathDataLoader(Dataset):
         self.env_static_cache[env_name] = env_static
         return env_static
     
-    def __getitem__(self, idx):
+    def get_item(
+        self,
+        idx,
+        *,
+        mask_variant=0,
+        noise_seed=None,
+        return_mask_metadata=False,
+    ):
+        """读取一个样本，并允许 Stage 2 显式指定本轮 mask/noise 版本。
+
+        普通 DataLoader 仍通过 ``__getitem__`` 使用 variant=0。Stage 2 收集
+        时传入轮次 variant 和固定 noise seed，replay 随后用这两个值重建
+        完全相同的四通道条件，而不是读取当前轮的新 mask。
+        """
         env_index, path_index = self.indexDict[idx]
         env_name = self.env_list[env_index]
         env_path = osp.join(self.dataFolder, env_name)
@@ -1463,6 +2629,40 @@ class UnevenPathDataLoader(Dataset):
         cost = path_data.get('cost', 0.0)  # 路径成本（如果有）
         
         trajectory = path_data['path']  # [N+2, 3]
+        path_coordinates = None
+        path_fit_rmse = None
+        path_fit_max_curvature = None
+        path_fit_curvature_feasible = None
+        path_fit_smoothness_weight = None
+        path_fit_minimum_candidate_max_curvature = None
+        path_fit_minimum_curvature_smoothness_weight = None
+        if self._path_representation is not None:
+            cached = self._path_coordinate_cache.get(int(idx))
+            if cached is None:
+                state, diagnostics = self._path_representation.fit_demonstration(
+                    trajectory
+                )
+                cached = (
+                    state.to(dtype=torch.float32),
+                    float(diagnostics.control_reconstruction_rmse),
+                    float(diagnostics.max_curvature),
+                    bool(diagnostics.curvature_feasible),
+                    float(diagnostics.smoothness_weight),
+                    float(diagnostics.minimum_candidate_max_curvature),
+                    float(
+                        diagnostics.minimum_curvature_smoothness_weight
+                    ),
+                )
+                self._path_coordinate_cache[int(idx)] = cached
+            (
+                path_coordinates,
+                path_fit_rmse,
+                path_fit_max_curvature,
+                path_fit_curvature_feasible,
+                path_fit_smoothness_weight,
+                path_fit_minimum_candidate_max_curvature,
+                path_fit_minimum_curvature_smoothness_weight,
+            ) = cached
         
         # 3. 生成编码输入
         path = trajectory[:, :3]  # [N+2, 3]
@@ -1486,7 +2686,129 @@ class UnevenPathDataLoader(Dataset):
         # goal_pose = torch.tensor([path[-1, 0], path[-1, 1], np.cos(path[-1, 2]), np.sin(path[-1, 2])], dtype=torch.float32)  # [4] 终点位姿 [x, y, cos(yaw), sin(yaw)]
         # pose_input = torch.stack((start_pose, goal_pose), dim=0)  # [2, 4] 起点和终点位姿
         
-        encoded_input = env_static['encoded_input']  # [H, W, 3]
+        full_encoded_input = env_static['encoded_input']  # [H, W, 3]
+        # 优先使用样本或地图直接提供的唯一 mask。它已经同时表达地图缺失和
+        # 实体障碍；只有旧数据完全没有 mask 时，才生成不完整观测 mask。
+        if "mask" in path_data:
+            mask = normalize_mask(
+                path_data["mask"],
+                env_static["map_shape"],
+                source=f"{path_file}['mask']",
+            )
+            mask_source = "path"
+        elif env_static["mask"] is not None:
+            mask = env_static["mask"].copy()
+            mask_source = "map"
+        elif self.partial_observation:
+            mask, mask_metadata = self._make_partial_mask(
+                idx,
+                env_static['map_shape'],
+                trajectory,
+                mask_variant=mask_variant,
+                return_metadata=True,
+            )
+            mask_source = "generated"
+        else:
+            mask = np.ones(
+                env_static['map_shape'], dtype=np.float32
+            )
+            mask_source = "complete"
+        dense_trajectory = dense_demo_bspline(trajectory)
+        # 外部 mask 也统一转换为考虑车辆半径的配置空间；随机 mask 已经处理，
+        # 重复腐蚀会过度扩大障碍，因此只处理直接提供的 mask。
+        if "mask" in path_data or env_static["mask"] is not None:
+            mask = erode_mask_for_vehicle(
+                mask,
+                vehicle_radius_meters=self.vehicle_radius_meters,
+            )
+        if mask_source != "generated":
+            is_complete = bool(np.all(mask > 0.5))
+            accepted_type = "complete" if is_complete else "external"
+            blockage = trajectory_mask_blockage_metrics(
+                dense_trajectory, mask
+            )
+            connected = mask_start_goal_connected(
+                mask,
+                trajectory[0, :2],
+                trajectory[-1, :2],
+            )
+            mask_metadata = {
+                "mask_active": not is_complete,
+                "has_large_cutout": False,
+                "has_small_obstacles": False,
+                "has_route_local_obstacle": False,
+                "has_global_entity_obstacles": False,
+                "trajectory_obstacle_mode": "none",
+                "semantic_mode": "external" if not is_complete else "complete",
+                "attempts": 1,
+                "sampling_attempts": 1,
+                "resamples": 0,
+                "masked_fraction": float(1.0 - mask.mean()),
+                "endpoint_corridor_meters": float(
+                    SAFETY_COST_CONFIG.endpoint_mask_corridor_meters
+                ),
+                "accepted_type": accepted_type,
+                "mask_profile": self.mask_mode,
+                "demo_blocked_fraction": blockage["blocked_fraction"],
+                "demo_max_contiguous_blocked_fraction": blockage[
+                    "max_contiguous_blocked_fraction"
+                ],
+                "informed_ellipse_fraction": float(
+                    informed_demo_ellipse(
+                        env_static["map_shape"],
+                        dense_trajectory,
+                    ).mean()
+                ),
+                "proposed_type_counts": {accepted_type: 1},
+                "rejected_type_counts": {},
+                "rejection_reason_counts": {},
+                "raw_connectivity_counts": {
+                    "connected": int(connected),
+                    "disconnected": int(not connected),
+                },
+                "used_fallback": False,
+            }
+        mask_metadata["source"] = mask_source
+        endpoints_valid = all(
+            trajectory_is_allowed(point[None], mask)
+            for point in dense_trajectory[[0, -1]]
+        )
+        if not endpoints_valid:
+            raise ValueError(f"{path_file} 的起点或终点位于 mask=0")
+        start_corridor, goal_corridor = endpoint_yaw_corridors(trajectory)
+        if not trajectory_is_allowed(start_corridor, mask):
+            raise ValueError(f"{path_file} 的起步 yaw 通道位于 mask=0")
+        if not trajectory_is_allowed(goal_corridor, mask):
+            raise ValueError(f"{path_file} 的到达 yaw 通道位于 mask=0")
+        demo_mask_valid = trajectory_is_allowed(dense_trajectory, mask)
+        if self.mask_mode == "stage1_demo_valid" and not demo_mask_valid:
+            raise ValueError(
+                f"{path_file} 的稠密 B 样条或车辆 footprint 经过 mask=0；"
+                "训练数据不满足约束"
+            )
+
+        if noise_seed is not None:
+            effective_noise_seed = int(noise_seed)
+        elif self.dynamic_mask_noise:
+            effective_noise_seed = None
+        else:
+            effective_noise_seed = (
+                self.mask_seed
+                + int(idx) * 1_000_003
+                + int(mask_variant) * 15_485_863
+                + MASK_NOISE_SEED_OFFSET
+            )
+        encoded_input = build_masked_normal_input(
+            full_encoded_input,
+            mask,
+            effective_noise_seed,
+        )
+
+        if self.include_mask:
+            # build_masked_normal_input 已经附加统一 mask 通道。
+            pass
+        else:
+            encoded_input = encoded_input[:, :, :3]
         
         # encoded_input = get_encoder_input(
         #     np.abs(normal_z),        # 确保使用的法向量z分量为正值
@@ -1614,7 +2936,7 @@ class UnevenPathDataLoader(Dataset):
                 cost_map = generate_sdf_from_yaw_stability(
                     yaw_stability,
                     voxel_size_xy=MAP_RESOLUTION,
-                    yaw_weight=1.4
+                    yaw_weight=SAFETY_COST_CONFIG.yaw_esdf_weight,
                 )
                 if isinstance(yaw_stability, torch.Tensor):
                     yaw_stability = yaw_stability.detach().cpu().numpy().astype(np.float32)
@@ -1635,6 +2957,56 @@ class UnevenPathDataLoader(Dataset):
             'elevation': torch.as_tensor(elevation, dtype=torch.float),  # 高程图：[H, W]
             'cost': torch.tensor(cost, dtype=torch.float)  # 路径成本
         }
+        if path_coordinates is not None:
+            result["path_coordinates"] = path_coordinates.clone()
+            # Compatibility key for checkpoints and analysis scripts created
+            # before terminology standardization.
+            result["trajectory_state_44d"] = path_coordinates.clone()
+            result["trajectory_state_fit_rmse_m"] = torch.tensor(
+                path_fit_rmse, dtype=torch.float32
+            )
+            result["trajectory_state_fit_max_curvature"] = torch.tensor(
+                path_fit_max_curvature, dtype=torch.float32
+            )
+            result["trajectory_state_fit_curvature_feasible"] = torch.tensor(
+                path_fit_curvature_feasible, dtype=torch.bool
+            )
+            result["trajectory_state_fit_smoothness_weight"] = torch.tensor(
+                path_fit_smoothness_weight, dtype=torch.float32
+            )
+            result[
+                "trajectory_state_fit_minimum_candidate_max_curvature"
+            ] = torch.tensor(
+                path_fit_minimum_candidate_max_curvature,
+                dtype=torch.float32,
+            )
+            result[
+                "trajectory_state_fit_minimum_curvature_smoothness_weight"
+            ] = torch.tensor(
+                path_fit_minimum_curvature_smoothness_weight,
+                dtype=torch.float32,
+            )
+        result['mask'] = torch.as_tensor(
+            mask, dtype=torch.float
+        )
+        # 仅作数据聚合诊断，不会作为模型输入。
+        result['demo_mask_valid'] = torch.tensor(
+            demo_mask_valid, dtype=torch.bool
+        )
+        result['dataset_index'] = torch.tensor(idx, dtype=torch.long)
+        result['env_index'] = torch.tensor(env_index, dtype=torch.long)
+        result['path_index'] = torch.tensor(path_index, dtype=torch.long)
+        result['mask_variant'] = torch.tensor(
+            int(mask_variant), dtype=torch.long
+        )
+        result['mask_noise_seed'] = torch.tensor(
+            -1 if effective_noise_seed is None else effective_noise_seed,
+            dtype=torch.long,
+        )
+        if return_mask_metadata:
+            # 仅供逐轮特权约束蒸馏统计；不放入普通 DataLoader，避免嵌套字典参与
+            # batch collate。
+            result['mask_metadata'] = mask_metadata
         
         # 条件性地添加stability相关数据
         if self.compute_stability_map:
@@ -1645,5 +3017,9 @@ class UnevenPathDataLoader(Dataset):
             ], dim=0)  # 法线：(3, H, W)
             result['yaw_stability'] = torch.as_tensor(yaw_stability, dtype=torch.float)  # yaw分箱倾覆状态：[H, W, 36]
             result['cost_map'] = torch.as_tensor(cost_map, dtype=torch.float)  # 成本图：[H, W, yaw_bins]
-        
+
         return result
+
+    def __getitem__(self, idx):
+        """标准数据集接口；Stage 1 和普通评估固定使用默认 mask 版本。"""
+        return self.get_item(idx)

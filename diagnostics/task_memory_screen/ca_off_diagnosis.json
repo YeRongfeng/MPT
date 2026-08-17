@@ -1,0 +1,639 @@
+{
+  "status": "inference_only_path_xy_screen_diagnosis",
+  "contexts": 32,
+  "sources": 4,
+  "arms": [
+    {
+      "name": "spatial_map",
+      "run_dir": "diagnostics/path_xy_screen/baseline",
+      "checkpoint": "diagnostics/path_xy_screen/baseline/stage1_best.pth",
+      "update": 2500
+    },
+    {
+      "name": "task_memory",
+      "run_dir": "diagnostics/task_memory_screen/task_memory",
+      "checkpoint": "diagnostics/task_memory_screen/task_memory/stage1_best.pth",
+      "update": 2250
+    }
+  ],
+  "component_norm_rows": [
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.4308528900146484,
+      "median": 2.928973913192749,
+      "p90": 5.108671188354492,
+      "max": 9.338773727416992
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.5251026153564453,
+      "median": 3.043548822402954,
+      "p90": 5.131687164306641,
+      "max": 9.349960327148438
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_mlp",
+      "mean": 3.5374090671539307,
+      "median": 3.049852132797241,
+      "p90": 5.128407001495361,
+      "max": 9.190893173217773
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_index_pe",
+      "mean": 0.6819316148757935,
+      "median": 0.6377155184745789,
+      "p90": 0.7847563624382019,
+      "max": 1.031266450881958
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_tokens",
+      "mean": 3.6249008178710938,
+      "median": 3.159867525100708,
+      "p90": 5.149677276611328,
+      "max": 9.182624816894531
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.4511096477508545,
+      "median": 2.9909002780914307,
+      "p90": 5.14420223236084,
+      "max": 8.239728927612305
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.5439181327819824,
+      "median": 3.0681984424591064,
+      "p90": 5.170628547668457,
+      "max": 8.266074180603027
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_mlp",
+      "mean": 3.5484187602996826,
+      "median": 3.097545623779297,
+      "p90": 5.153266906738281,
+      "max": 8.22104263305664
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_index_pe",
+      "mean": 0.6819316148757935,
+      "median": 0.6377155184745789,
+      "p90": 0.7847563624382019,
+      "max": 1.031266450881958
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_tokens",
+      "mean": 3.6349995136260986,
+      "median": 3.2037487030029297,
+      "p90": 5.193308353424072,
+      "max": 8.275214195251465
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.324615001678467,
+      "median": 3.006606340408325,
+      "p90": 4.9709320068359375,
+      "max": 7.590794086456299
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.413552761077881,
+      "median": 3.1057045459747314,
+      "p90": 5.04424524307251,
+      "max": 7.596170425415039
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_mlp",
+      "mean": 3.429034948348999,
+      "median": 3.1340768337249756,
+      "p90": 4.979659557342529,
+      "max": 7.254542827606201
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_index_pe",
+      "mean": 0.6819316148757935,
+      "median": 0.6377155184745789,
+      "p90": 0.7847563624382019,
+      "max": 1.031266450881958
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_tokens",
+      "mean": 3.511054754257202,
+      "median": 3.203585624694824,
+      "p90": 5.041940689086914,
+      "max": 7.261927127838135
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_mlp",
+      "mean": 3.3176610469818115,
+      "median": 3.109790802001953,
+      "p90": 4.700839996337891,
+      "max": 7.459039688110352
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_index_pe",
+      "mean": 0.6890934109687805,
+      "median": 0.6386917233467102,
+      "p90": 0.8245721459388733,
+      "max": 1.0605000257492065
+    },
+    {
+      "arm": "spatial_map",
+      "component": "path_tokens",
+      "mean": 3.409221649169922,
+      "median": 3.1972875595092773,
+      "p90": 4.73956298828125,
+      "max": 7.541661262512207
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_mlp",
+      "mean": 3.4291417598724365,
+      "median": 3.2403383255004883,
+      "p90": 4.7405500411987305,
+      "max": 7.383228778839111
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_index_pe",
+      "mean": 0.6819316148757935,
+      "median": 0.6377155184745789,
+      "p90": 0.7847563624382019,
+      "max": 1.031266450881958
+    },
+    {
+      "arm": "task_memory",
+      "component": "path_tokens",
+      "mean": 3.51277494430542,
+      "median": 3.315438985824585,
+      "p90": 4.798056602478027,
+      "max": 7.380727291107178
+    }
+  ],
+  "map_sensitivity_rows": [
+    {
+      "arm": "spatial_map",
+      "context": 0,
+      "map_swap_trajectory_rms_m": 0.005782076623290777,
+      "ca_off_trajectory_rms_m": 0.04185660183429718
+    },
+    {
+      "arm": "spatial_map",
+      "context": 12,
+      "map_swap_trajectory_rms_m": 0.005162987858057022,
+      "ca_off_trajectory_rms_m": 0.021558638662099838
+    },
+    {
+      "arm": "spatial_map",
+      "context": 25,
+      "map_swap_trajectory_rms_m": 0.0,
+      "ca_off_trajectory_rms_m": 0.02672768197953701
+    },
+    {
+      "arm": "spatial_map",
+      "context": 38,
+      "map_swap_trajectory_rms_m": 0.04909919947385788,
+      "ca_off_trajectory_rms_m": 0.018246078863739967
+    },
+    {
+      "arm": "spatial_map",
+      "context": 51,
+      "map_swap_trajectory_rms_m": 0.04922674223780632,
+      "ca_off_trajectory_rms_m": 0.07001592963933945
+    },
+    {
+      "arm": "spatial_map",
+      "context": 64,
+      "map_swap_trajectory_rms_m": 0.0009165675146505237,
+      "ca_off_trajectory_rms_m": 0.021735578775405884
+    },
+    {
+      "arm": "spatial_map",
+      "context": 77,
+      "map_swap_trajectory_rms_m": 0.001859568990767002,
+      "ca_off_trajectory_rms_m": 0.013198262080550194
+    },
+    {
+      "arm": "spatial_map",
+      "context": 90,
+      "map_swap_trajectory_rms_m": 0.0073100063018500805,
+      "ca_off_trajectory_rms_m": 0.017107199877500534
+    },
+    {
+      "arm": "task_memory",
+      "context": 0,
+      "map_swap_trajectory_rms_m": 0.004355072975158691,
+      "ca_off_trajectory_rms_m": 0.9920911192893982
+    },
+    {
+      "arm": "task_memory",
+      "context": 12,
+      "map_swap_trajectory_rms_m": 0.06972593814134598,
+      "ca_off_trajectory_rms_m": 1.1511409282684326
+    },
+    {
+      "arm": "task_memory",
+      "context": 25,
+      "map_swap_trajectory_rms_m": 0.0,
+      "ca_off_trajectory_rms_m": 0.9770433306694031
+    },
+    {
+      "arm": "task_memory",
+      "context": 38,
+      "map_swap_trajectory_rms_m": 0.04244033247232437,
+      "ca_off_trajectory_rms_m": 0.6441959738731384
+    },
+    {
+      "arm": "task_memory",
+      "context": 51,
+      "map_swap_trajectory_rms_m": 0.04904027283191681,
+      "ca_off_trajectory_rms_m": 0.49441060423851013
+    },
+    {
+      "arm": "task_memory",
+      "context": 64,
+      "map_swap_trajectory_rms_m": 0.0070316242054104805,
+      "ca_off_trajectory_rms_m": 0.5088684558868408
+    },
+    {
+      "arm": "task_memory",
+      "context": 77,
+      "map_swap_trajectory_rms_m": 0.026594005525112152,
+      "ca_off_trajectory_rms_m": 1.0725809335708618
+    },
+    {
+      "arm": "task_memory",
+      "context": 90,
+      "map_swap_trajectory_rms_m": 0.060970842838287354,
+      "ca_off_trajectory_rms_m": 0.48801669478416443
+    },
+    {
+      "arm": "spatial_map",
+      "context": 102,
+      "map_swap_trajectory_rms_m": 0.030764281749725342,
+      "ca_off_trajectory_rms_m": 0.03283613175153732
+    },
+    {
+      "arm": "spatial_map",
+      "context": 115,
+      "map_swap_trajectory_rms_m": 0.007187541574239731,
+      "ca_off_trajectory_rms_m": 0.06809066236019135
+    },
+    {
+      "arm": "spatial_map",
+      "context": 128,
+      "map_swap_trajectory_rms_m": 0.011244766414165497,
+      "ca_off_trajectory_rms_m": 0.04678826406598091
+    },
+    {
+      "arm": "spatial_map",
+      "context": 141,
+      "map_swap_trajectory_rms_m": 0.02205478772521019,
+      "ca_off_trajectory_rms_m": 0.0135004548355937
+    },
+    {
+      "arm": "spatial_map",
+      "context": 154,
+      "map_swap_trajectory_rms_m": 0.005445671733468771,
+      "ca_off_trajectory_rms_m": 0.021036691963672638
+    },
+    {
+      "arm": "spatial_map",
+      "context": 167,
+      "map_swap_trajectory_rms_m": 0.006410802714526653,
+      "ca_off_trajectory_rms_m": 0.03113817423582077
+    },
+    {
+      "arm": "spatial_map",
+      "context": 180,
+      "map_swap_trajectory_rms_m": 0.021427521482110023,
+      "ca_off_trajectory_rms_m": 0.06438892334699631
+    },
+    {
+      "arm": "spatial_map",
+      "context": 193,
+      "map_swap_trajectory_rms_m": 0.011915408074855804,
+      "ca_off_trajectory_rms_m": 0.008487194776535034
+    },
+    {
+      "arm": "task_memory",
+      "context": 102,
+      "map_swap_trajectory_rms_m": 0.013123249635100365,
+      "ca_off_trajectory_rms_m": 1.0251623392105103
+    },
+    {
+      "arm": "task_memory",
+      "context": 115,
+      "map_swap_trajectory_rms_m": 0.11424162983894348,
+      "ca_off_trajectory_rms_m": 1.5086066722869873
+    },
+    {
+      "arm": "task_memory",
+      "context": 128,
+      "map_swap_trajectory_rms_m": 0.01126184407621622,
+      "ca_off_trajectory_rms_m": 1.1381851434707642
+    },
+    {
+      "arm": "task_memory",
+      "context": 141,
+      "map_swap_trajectory_rms_m": 0.01774679496884346,
+      "ca_off_trajectory_rms_m": 0.2697080373764038
+    },
+    {
+      "arm": "task_memory",
+      "context": 154,
+      "map_swap_trajectory_rms_m": 0.04573722183704376,
+      "ca_off_trajectory_rms_m": 0.6621302962303162
+    },
+    {
+      "arm": "task_memory",
+      "context": 167,
+      "map_swap_trajectory_rms_m": 0.06331034004688263,
+      "ca_off_trajectory_rms_m": 0.9338687062263489
+    },
+    {
+      "arm": "task_memory",
+      "context": 180,
+      "map_swap_trajectory_rms_m": 0.014496550895273685,
+      "ca_off_trajectory_rms_m": 0.8679195046424866
+    },
+    {
+      "arm": "task_memory",
+      "context": 193,
+      "map_swap_trajectory_rms_m": 0.014858531765639782,
+      "ca_off_trajectory_rms_m": 0.25727710127830505
+    },
+    {
+      "arm": "spatial_map",
+      "context": 205,
+      "map_swap_trajectory_rms_m": 0.0017026962013915181,
+      "ca_off_trajectory_rms_m": 0.02241646498441696
+    },
+    {
+      "arm": "spatial_map",
+      "context": 218,
+      "map_swap_trajectory_rms_m": 0.009362788870930672,
+      "ca_off_trajectory_rms_m": 0.009458348155021667
+    },
+    {
+      "arm": "spatial_map",
+      "context": 231,
+      "map_swap_trajectory_rms_m": 0.010732539929449558,
+      "ca_off_trajectory_rms_m": 0.013562524691224098
+    },
+    {
+      "arm": "spatial_map",
+      "context": 244,
+      "map_swap_trajectory_rms_m": 0.010913252830505371,
+      "ca_off_trajectory_rms_m": 0.019346391782164574
+    },
+    {
+      "arm": "spatial_map",
+      "context": 257,
+      "map_swap_trajectory_rms_m": 0.013080541975796223,
+      "ca_off_trajectory_rms_m": 0.020954402163624763
+    },
+    {
+      "arm": "spatial_map",
+      "context": 270,
+      "map_swap_trajectory_rms_m": 0.02215508185327053,
+      "ca_off_trajectory_rms_m": 0.03975247964262962
+    },
+    {
+      "arm": "spatial_map",
+      "context": 283,
+      "map_swap_trajectory_rms_m": 0.0055308714509010315,
+      "ca_off_trajectory_rms_m": 0.01701780967414379
+    },
+    {
+      "arm": "spatial_map",
+      "context": 296,
+      "map_swap_trajectory_rms_m": 0.06066884472966194,
+      "ca_off_trajectory_rms_m": 0.005838599056005478
+    },
+    {
+      "arm": "task_memory",
+      "context": 205,
+      "map_swap_trajectory_rms_m": 0.04247933253645897,
+      "ca_off_trajectory_rms_m": 0.9361327886581421
+    },
+    {
+      "arm": "task_memory",
+      "context": 218,
+      "map_swap_trajectory_rms_m": 0.015657544136047363,
+      "ca_off_trajectory_rms_m": 0.5597690343856812
+    },
+    {
+      "arm": "task_memory",
+      "context": 231,
+      "map_swap_trajectory_rms_m": 0.04908408969640732,
+      "ca_off_trajectory_rms_m": 0.7936250567436218
+    },
+    {
+      "arm": "task_memory",
+      "context": 244,
+      "map_swap_trajectory_rms_m": 0.02319382131099701,
+      "ca_off_trajectory_rms_m": 0.9972476959228516
+    },
+    {
+      "arm": "task_memory",
+      "context": 257,
+      "map_swap_trajectory_rms_m": 0.10801586508750916,
+      "ca_off_trajectory_rms_m": 0.7610785365104675
+    },
+    {
+      "arm": "task_memory",
+      "context": 270,
+      "map_swap_trajectory_rms_m": 0.022019539028406143,
+      "ca_off_trajectory_rms_m": 1.3629947900772095
+    },
+    {
+      "arm": "task_memory",
+      "context": 283,
+      "map_swap_trajectory_rms_m": 0.04815158247947693,
+      "ca_off_trajectory_rms_m": 0.6566141843795776
+    },
+    {
+      "arm": "task_memory",
+      "context": 296,
+      "map_swap_trajectory_rms_m": 0.019390638917684555,
+      "ca_off_trajectory_rms_m": 0.8548811078071594
+    },
+    {
+      "arm": "spatial_map",
+      "context": 308,
+      "map_swap_trajectory_rms_m": 0.006781978532671928,
+      "ca_off_trajectory_rms_m": 0.02850101888179779
+    },
+    {
+      "arm": "spatial_map",
+      "context": 321,
+      "map_swap_trajectory_rms_m": 0.009407540783286095,
+      "ca_off_trajectory_rms_m": 0.03760338947176933
+    },
+    {
+      "arm": "spatial_map",
+      "context": 334,
+      "map_swap_trajectory_rms_m": 0.005525468848645687,
+      "ca_off_trajectory_rms_m": 0.03182006999850273
+    },
+    {
+      "arm": "spatial_map",
+      "context": 347,
+      "map_swap_trajectory_rms_m": 0.008873051032423973,
+      "ca_off_trajectory_rms_m": 0.0028506179805845022
+    },
+    {
+      "arm": "spatial_map",
+      "context": 360,
+      "map_swap_trajectory_rms_m": 0.0011379665229469538,
+      "ca_off_trajectory_rms_m": 0.020382601767778397
+    },
+    {
+      "arm": "spatial_map",
+      "context": 373,
+      "map_swap_trajectory_rms_m": 0.004197370260953903,
+      "ca_off_trajectory_rms_m": 0.045387912541627884
+    },
+    {
+      "arm": "spatial_map",
+      "context": 386,
+      "map_swap_trajectory_rms_m": 0.0023953181225806475,
+      "ca_off_trajectory_rms_m": 0.010430125519633293
+    },
+    {
+      "arm": "spatial_map",
+      "context": 399,
+      "map_swap_trajectory_rms_m": 0.013566751964390278,
+      "ca_off_trajectory_rms_m": 0.020231883972883224
+    },
+    {
+      "arm": "task_memory",
+      "context": 308,
+      "map_swap_trajectory_rms_m": 0.01352661568671465,
+      "ca_off_trajectory_rms_m": 0.9678004384040833
+    },
+    {
+      "arm": "task_memory",
+      "context": 321,
+      "map_swap_trajectory_rms_m": 0.013191377744078636,
+      "ca_off_trajectory_rms_m": 1.1859296560287476
+    },
+    {
+      "arm": "task_memory",
+      "context": 334,
+      "map_swap_trajectory_rms_m": 0.009393424727022648,
+      "ca_off_trajectory_rms_m": 0.5851598978042603
+    },
+    {
+      "arm": "task_memory",
+      "context": 347,
+      "map_swap_trajectory_rms_m": 0.029550470411777496,
+      "ca_off_trajectory_rms_m": 0.409173846244812
+    },
+    {
+      "arm": "task_memory",
+      "context": 360,
+      "map_swap_trajectory_rms_m": 0.07116065174341202,
+      "ca_off_trajectory_rms_m": 0.9991186261177063
+    },
+    {
+      "arm": "task_memory",
+      "context": 373,
+      "map_swap_trajectory_rms_m": 0.1144934594631195,
+      "ca_off_trajectory_rms_m": 0.6924194693565369
+    },
+    {
+      "arm": "task_memory",
+      "context": 386,
+      "map_swap_trajectory_rms_m": 0.026787376031279564,
+      "ca_off_trajectory_rms_m": 0.45248785614967346
+    },
+    {
+      "arm": "task_memory",
+      "context": 399,
+      "map_swap_trajectory_rms_m": 0.07442005723714828,
+      "ca_off_trajectory_rms_m": 0.6221888065338135
+    }
+  ],
+  "component_aggregate": {
+    "spatial_map": {
+      "path_mlp": {
+        "mean": 3.3810596466064453,
+        "median": 3.0090678334236145
+      },
+      "path_index_pe": {
+        "mean": 0.6890934109687805,
+        "median": 0.6386917233467102
+      },
+      "path_tokens": {
+        "mean": 3.4729487895965576,
+        "median": 3.1036848425865173
+      }
+    },
+    "task_memory": {
+      "path_mlp": {
+        "mean": 3.486001133918762,
+        "median": 3.1304532289505005
+      },
+      "path_index_pe": {
+        "mean": 0.6819316148757935,
+        "median": 0.6377155184745789
+      },
+      "path_tokens": {
+        "mean": 3.5709325075149536,
+        "median": 3.2206602096557617
+      }
+    }
+  },
+  "sensitivity_means": {
+    "spatial_map": {
+      "map_swap": 0.013182499824324623,
+      "ca_off": 0.026945847166643944
+    },
+    "task_memory": {
+      "map_swap": 0.03860781557159498,
+      "ca_off": 0.8071196135133505
+    }
+  }
+}

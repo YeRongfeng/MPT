@@ -1,0 +1,50 @@
+{
+  "status": "completed_screen_not_final",
+  "implementation": "task_memory_patch_sg_sa_v1",
+  "protocol": "diagnostics/task_memory_protocol.json",
+  "independent_eval": {
+    "spatial_map_2500": {
+      "architecture": "spatial_map",
+      "update": 2500,
+      "val_loss": 0.16783958464860915,
+      "safe1": 0.0625,
+      "safe8": 0.155,
+      "curvature1": 0.08500000089406967,
+      "forbidden1": 0.9225000143051147,
+      "stability1": 0.8025000095367432
+    },
+    "task_memory_best_2250": {
+      "architecture": "task_memory",
+      "update": 2250,
+      "val_loss": 0.14579127758741378,
+      "safe1": 0.09,
+      "safe8": 0.2825,
+      "curvature1": 0.11749999970197678,
+      "forbidden1": 0.9049999713897705,
+      "stability1": 0.7925000190734863
+    },
+    "task_memory_last_2500": {
+      "architecture": "task_memory",
+      "update": 2500,
+      "val_loss": 0.16314576864242553,
+      "safe1": 0.0575,
+      "safe8": 0.195,
+      "curvature1": 0.07500000298023224,
+      "forbidden1": 0.925000011920929,
+      "stability1": 0.7724999785423279
+    }
+  },
+  "ca_off_note": "CA-off removes both map and S/G because S/G live only in task memory",
+  "ca_off_rms_m": {
+    "spatial_map": {
+      "map_swap": 0.013182499824324623,
+      "ca_off": 0.026945847166643944
+    },
+    "task_memory": {
+      "map_swap": 0.03860781557159498,
+      "ca_off": 0.8071196135133505
+    }
+  },
+  "decision": "keep_positive_signal",
+  "decision_reason": "Val-best 2250: Safe@1 9.0% vs baseline 6.25%, Safe@8 28.25% vs 15.5%, Curvature 11.75% vs 8.5%. Last 2500 is closer to baseline. Worth keeping as a Stage-1 forward candidate."
+}

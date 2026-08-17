@@ -1,0 +1,57 @@
+{
+  "status": "screening_not_a_final_result",
+  "experiment": "Stage-1 2500-update architecture screen",
+  "science_question": "Does a weak Linear path-token XY hint help, or at least not hurt, relative to spatial_map/single_12?",
+  "arms": [
+    {
+      "name": "baseline",
+      "architecture": "spatial_map",
+      "map_layout": "single_12",
+      "output_dir": "diagnostics/path_xy_screen/baseline"
+    },
+    {
+      "name": "path_xy",
+      "architecture": "path_xy",
+      "map_layout": "single_12",
+      "path_xy_alpha": 0.1,
+      "output_dir": "diagnostics/path_xy_screen/path_xy"
+    }
+  ],
+  "protocol_source": "diagnostics/q1_protocol.json",
+  "updates": 2500,
+  "eval_every_updates": 250,
+  "batch_size": 16,
+  "lr": 0.0001,
+  "optimizer": "AdamW(weight_decay=1e-4)",
+  "gradient_clip": 1.0,
+  "seed": 20260813,
+  "split_seed": 20260814,
+  "eval_seed": 20260815,
+  "train_environments": 80,
+  "validation_environments": 20,
+  "validation_contexts": 400,
+  "validation_batches": 25,
+  "patience_evals": 1000,
+  "min_delta": 0.0001,
+  "p_mask": 0.5,
+  "mask_mode": "stage1_demo_valid",
+  "model_width": {
+    "n_layers": 6,
+    "n_heads": 8,
+    "d_model": 512,
+    "d_inner": 1024,
+    "dropout": 0.1,
+    "map_channels": 4,
+    "coordinate_scale": 10.0
+  },
+  "single_variable": "path token alpha * Linear(canonical_xy) only",
+  "not_swept": ["path_xy_alpha", "map_layout", "condition_path"],
+  "required_metrics": [
+    "val_loss",
+    "Safe@1",
+    "Safe@8",
+    "Curvature",
+    "map_ca_off_trajectory_rms_m"
+  ],
+  "decision_rule": "eliminate if clearly worse on Safe@1/Safe@8/Curvature; keep if comparable or positive; no 13750 conclusion from this screen"
+}

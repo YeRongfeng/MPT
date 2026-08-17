@@ -1,0 +1,28 @@
+{
+  "status": "screening_not_a_final_result",
+  "experiment": "Stage-1 2500-update task_memory screen",
+  "science_question": "If map patches and S/G tokens first mix by shallow SA, then path tokens read that memory by CA, is that better than baseline CNN map CA + joint (S,G,t) AdaLN?",
+  "arms": [
+    {
+      "name": "baseline",
+      "architecture": "spatial_map",
+      "reuse": "diagnostics/path_xy_screen/baseline"
+    },
+    {
+      "name": "task_memory",
+      "architecture": "task_memory",
+      "map_layout": "single_12",
+      "output_dir": "diagnostics/task_memory_screen/task_memory"
+    }
+  ],
+  "protocol_source": "diagnostics/q1_protocol.json",
+  "updates": 2500,
+  "single_variable": "patch-embed map + S/G tokens + 2-layer condition SA; time-only AdaLN",
+  "not_included": [
+    "path_xy",
+    "S/G heatmap",
+    "CNN pooling",
+    "global h_SG broadcast",
+    "geometric bias"
+  ]
+}

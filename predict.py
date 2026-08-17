@@ -20,6 +20,10 @@ from transformer import Models
 from dataLoader_uneven import get_encoder_input, receptive_field
 from eval_model_uneven import getHashTable, get_patch
 import torch
+from tools._paths import PREDICTIONS_ROOT
+
+
+DEFAULT_PREDICTIONS_DIR = str(PREDICTIONS_ROOT)
 
 dataset_path = 'data/sim_dataset/val'
 # dataset_path = 'data/sim_dataset/train'
@@ -144,7 +148,7 @@ def plot_single_trajectory(ax, elevation_masked, trajectory, predTraj=None, outp
     ax.set_title(title, fontsize=12, pad=8)
     ax.axis('off')
 
-def plot_elevation_map(pathNums, envType, save_path='predictions'):
+def plot_elevation_map(pathNums, envType, save_path=DEFAULT_PREDICTIONS_DIR):
     """绘制多组轨迹对比图"""
     if not isinstance(pathNums, list):
         pathNums = [pathNums]  # 确保pathNums是列表
@@ -237,7 +241,7 @@ def plot_elevation_map(pathNums, envType, save_path='predictions'):
     print(f"Saved multi-trajectory comparison figure for paths {path_ids_str} in {envType} environment.")
     print("fig saved to", osp.join(save_path, f'multi_trajectories_{path_ids_str}.png'))
     
-def plot_predProb_map(pathNum, envType, save_path='predictions'):
+def plot_predProb_map(pathNum, envType, save_path=DEFAULT_PREDICTIONS_DIR):
     """
     绘制单条轨迹的预测概率分布图和对应的ground truth标签图
     显示output_dim个时间步，每个时间步包含预测概率图和GT标签图
@@ -361,7 +365,7 @@ if __name__ == "__main__":
     envType_list = ['env000005']  # 生成环境列表，格式为 env000000, env000001, ..., env000009
     # envType_list = ['desert','map1','map3','map4']
     # envType_list = ['hill']
-    save_path = 'predictions'
+    save_path = DEFAULT_PREDICTIONS_DIR
 
     # modelFolder = 'data/uneven'
     # modelFolder = 'data/mamba'

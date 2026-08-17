@@ -1,0 +1,267 @@
+{
+  "status": "completed_midcourse_not_final",
+  "protocol": "diagnostics/task_memory_mid_protocol.json",
+  "curve": [
+    {
+      "arch": "spatial_map",
+      "update": 2500,
+      "role": "stage1_best.pth",
+      "val": 0.16783958464860915,
+      "safe1": 0.0625,
+      "safe8": 0.155,
+      "curv": 0.08500000089406967,
+      "forb": 0.9225000143051147,
+      "stab": 0.8025000095367432
+    },
+    {
+      "arch": "spatial_map",
+      "update": 2750,
+      "role": "stage1_update_2750.pth",
+      "val": 0.1756211042404175,
+      "safe1": 0.055,
+      "safe8": 0.19,
+      "curv": 0.07249999791383743,
+      "forb": 0.9200000166893005,
+      "stab": 0.8025000095367432
+    },
+    {
+      "arch": "spatial_map",
+      "update": 3000,
+      "role": "stage1_update_3000.pth",
+      "val": 0.18245166510343552,
+      "safe1": 0.0725,
+      "safe8": 0.1775,
+      "curv": 0.0925000011920929,
+      "forb": 0.8999999761581421,
+      "stab": 0.7724999785423279
+    },
+    {
+      "arch": "spatial_map",
+      "update": 3250,
+      "role": "stage1_update_3250.pth",
+      "val": 0.19611665606498718,
+      "safe1": 0.0375,
+      "safe8": 0.1625,
+      "curv": 0.06499999761581421,
+      "forb": 0.9125000238418579,
+      "stab": 0.7649999856948853
+    },
+    {
+      "arch": "spatial_map",
+      "update": 3500,
+      "role": "stage1_update_3500.pth",
+      "val": 0.18133171856403352,
+      "safe1": 0.0425,
+      "safe8": 0.16,
+      "curv": 0.06499999761581421,
+      "forb": 0.9049999713897705,
+      "stab": 0.8025000095367432
+    },
+    {
+      "arch": "spatial_map",
+      "update": 3750,
+      "role": "stage1_update_3750.pth",
+      "val": 0.14973662197589874,
+      "safe1": 0.07,
+      "safe8": 0.205,
+      "curv": 0.0949999988079071,
+      "forb": 0.9024999737739563,
+      "stab": 0.7799999713897705
+    },
+    {
+      "arch": "spatial_map",
+      "update": 4000,
+      "role": "stage1_update_4000.pth",
+      "val": 0.1634093102812767,
+      "safe1": 0.0625,
+      "safe8": 0.2825,
+      "curv": 0.08500000089406967,
+      "forb": 0.9125000238418579,
+      "stab": 0.7900000214576721
+    },
+    {
+      "arch": "spatial_map",
+      "update": 4250,
+      "role": "stage1_update_4250.pth",
+      "val": 0.13441933423280716,
+      "safe1": 0.115,
+      "safe8": 0.28,
+      "curv": 0.1525000035762787,
+      "forb": 0.9125000238418579,
+      "stab": 0.7950000166893005
+    },
+    {
+      "arch": "spatial_map",
+      "update": 4500,
+      "role": "stage1_update_4500.pth",
+      "val": 0.13420715034008027,
+      "safe1": 0.0425,
+      "safe8": 0.265,
+      "curv": 0.07750000059604645,
+      "forb": 0.9100000262260437,
+      "stab": 0.7975000143051147
+    },
+    {
+      "arch": "spatial_map",
+      "update": 4750,
+      "role": "stage1_update_4750.pth",
+      "val": 0.15740714550018312,
+      "safe1": 0.1075,
+      "safe8": 0.2975,
+      "curv": 0.15000000596046448,
+      "forb": 0.9075000286102295,
+      "stab": 0.7900000214576721
+    },
+    {
+      "arch": "spatial_map",
+      "update": 5000,
+      "role": "stage1_update_5000.pth",
+      "val": 0.1300408810377121,
+      "safe1": 0.1275,
+      "safe8": 0.385,
+      "curv": 0.18250000476837158,
+      "forb": 0.9075000286102295,
+      "stab": 0.7925000190734863
+    },
+    {
+      "arch": "task_memory",
+      "update": 2250,
+      "role": "stage1_best.pth",
+      "val": 0.14579127758741378,
+      "safe1": 0.09,
+      "safe8": 0.2825,
+      "curv": 0.11749999970197678,
+      "forb": 0.9049999713897705,
+      "stab": 0.7925000190734863
+    },
+    {
+      "arch": "task_memory",
+      "update": 2500,
+      "role": "stage1_last.pth",
+      "val": 0.16314576864242553,
+      "safe1": 0.0575,
+      "safe8": 0.195,
+      "curv": 0.07500000298023224,
+      "forb": 0.925000011920929,
+      "stab": 0.7724999785423279
+    },
+    {
+      "arch": "task_memory",
+      "update": 2750,
+      "role": "stage1_update_2750.pth",
+      "val": 0.1697314602136612,
+      "safe1": 0.095,
+      "safe8": 0.305,
+      "curv": 0.12999999523162842,
+      "forb": 0.9150000214576721,
+      "stab": 0.762499988079071
+    },
+    {
+      "arch": "task_memory",
+      "update": 3000,
+      "role": "stage1_update_3000.pth",
+      "val": 0.15675330758094788,
+      "safe1": 0.0725,
+      "safe8": 0.265,
+      "curv": 0.10249999910593033,
+      "forb": 0.9075000286102295,
+      "stab": 0.7699999809265137
+    },
+    {
+      "arch": "task_memory",
+      "update": 3250,
+      "role": "stage1_update_3250.pth",
+      "val": 0.18578778833150864,
+      "safe1": 0.0475,
+      "safe8": 0.2475,
+      "curv": 0.07999999821186066,
+      "forb": 0.9024999737739563,
+      "stab": 0.7250000238418579
+    },
+    {
+      "arch": "task_memory",
+      "update": 3500,
+      "role": "stage1_update_3500.pth",
+      "val": 0.13760474145412446,
+      "safe1": 0.13,
+      "safe8": 0.3275,
+      "curv": 0.17249999940395355,
+      "forb": 0.9175000190734863,
+      "stab": 0.7749999761581421
+    },
+    {
+      "arch": "task_memory",
+      "update": 3750,
+      "role": "stage1_update_3750.pth",
+      "val": 0.1394011500477791,
+      "safe1": 0.0975,
+      "safe8": 0.335,
+      "curv": 0.15000000596046448,
+      "forb": 0.9125000238418579,
+      "stab": 0.7825000286102295
+    },
+    {
+      "arch": "task_memory",
+      "update": 4000,
+      "role": "stage1_update_4000.pth",
+      "val": 0.16820503532886505,
+      "safe1": 0.0875,
+      "safe8": 0.3,
+      "curv": 0.125,
+      "forb": 0.8999999761581421,
+      "stab": 0.7699999809265137
+    },
+    {
+      "arch": "task_memory",
+      "update": 4250,
+      "role": "stage1_update_4250.pth",
+      "val": 0.13616877883672715,
+      "safe1": 0.115,
+      "safe8": 0.325,
+      "curv": 0.1550000011920929,
+      "forb": 0.9200000166893005,
+      "stab": 0.7850000262260437
+    },
+    {
+      "arch": "task_memory",
+      "update": 4500,
+      "role": "stage1_update_4500.pth",
+      "val": 0.1327359238266945,
+      "safe1": 0.11,
+      "safe8": 0.34,
+      "curv": 0.1550000011920929,
+      "forb": 0.9049999713897705,
+      "stab": 0.800000011920929
+    },
+    {
+      "arch": "task_memory",
+      "update": 4750,
+      "role": "stage1_update_4750.pth",
+      "val": 0.13975241765379906,
+      "safe1": 0.1275,
+      "safe8": 0.365,
+      "curv": 0.19750000536441803,
+      "forb": 0.9049999713897705,
+      "stab": 0.7875000238418579
+    },
+    {
+      "arch": "task_memory",
+      "update": 5000,
+      "role": "stage1_update_5000.pth",
+      "val": 0.1455731651186943,
+      "safe1": 0.1175,
+      "safe8": 0.37,
+      "curv": 0.16500000655651093,
+      "forb": 0.9150000214576721,
+      "stab": 0.7674999833106995
+    }
+  ],
+  "matched_wins": {
+    "s1": 7,
+    "s8": 10,
+    "c": 9,
+    "n": 11
+  },
+  "decision": "keep_but_not_yet_new_mainline",
+  "decision_reason": "task_memory repeatedly produces strong checkpoints (e.g. 3500 Safe@1 13.0%, 4750 12.75%) and usually wins Safe@8, but baseline also reaches Safe@1 12.75% at 5000. The 2250 spike was not unique; advantage is real but noisy and not uniformly ahead at every step."
+}

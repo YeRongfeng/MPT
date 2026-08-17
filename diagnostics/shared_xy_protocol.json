@@ -1,0 +1,43 @@
+{
+  "status": "screening_not_a_final_result",
+  "experiment": "Stage-1 2500-update shared_xy screen",
+  "science_question": "Does giving path and map the same weak Linear XY language add value over path_xy?",
+  "arms": [
+    {
+      "name": "baseline",
+      "architecture": "spatial_map",
+      "reuse": "diagnostics/path_xy_screen/baseline"
+    },
+    {
+      "name": "path_xy",
+      "architecture": "path_xy",
+      "reuse": "diagnostics/path_xy_screen/path_xy"
+    },
+    {
+      "name": "shared_xy",
+      "architecture": "shared_xy",
+      "map_layout": "single_12",
+      "path_xy_alpha": 0.1,
+      "output_dir": "diagnostics/path_xy_screen/shared_xy"
+    }
+  ],
+  "protocol_source": "diagnostics/q1_protocol.json",
+  "updates": 2500,
+  "single_variable": "same Linear(2,d) applied to canonical map feature centers",
+  "not_changed": [
+    "path_xy path injection",
+    "map CNN",
+    "grid PE",
+    "cross-attention",
+    "raw S/G + time condition",
+    "decoder",
+    "path_xy_alpha"
+  ],
+  "required_metrics": [
+    "val_loss",
+    "Safe@1",
+    "Safe@8",
+    "Curvature",
+    "map_ca_off_trajectory_rms_m"
+  ]
+}

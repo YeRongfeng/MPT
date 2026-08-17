@@ -1,0 +1,16 @@
+{
+  "title": "Method overview v4 - model provenance with terrain-backed task thumbnails",
+  "canvas": {"width": 1600, "height": 760},
+  "composition": {
+    "top": "model provenance: demonstrations -> route learning -> physical adaptation -> trained generator",
+    "bottom": "deployment spine: observation -> generator -> task-aligned free coordinates -> analytic decoder -> path",
+    "shared_anchor": "adapted weights transfer through one labeled orthogonal connector into the deployed generator"
+  },
+  "visual_rules": [
+    "no explicit backpropagation loop in the overview",
+    "only two contribution badges",
+    "training-only complete terrain terminates inside physical adaptation",
+    "deployment path is the strongest visual line",
+    "input and output thumbnails use a muted repository terrain map rather than generic scenery"
+  ]
+}

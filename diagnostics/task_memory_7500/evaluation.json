@@ -1,0 +1,738 @@
+{
+  "diagnostics/task_memory_7500/baseline": {
+    "run_dir": "diagnostics/task_memory_7500/baseline",
+    "architecture": "spatial_map",
+    "map_layout": "single_12",
+    "validation_contexts": 400,
+    "checkpoints": [
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_best.pth",
+        "update": 6250,
+        "validation_meanflow": {
+          "loss": 0.10658702448010444,
+          "flow": 0.09418166682124138,
+          "endpoint": 0.04962143257260323,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.2075,
+            "strict_valid_rate": 0.20749999582767487,
+            "forbidden_ok_rate": 0.9300000071525574,
+            "stability_ok_rate": 0.8199999928474426,
+            "curvature_ok_rate": 0.2800000011920929,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.7289246916770935
+          },
+          "8": {
+            "safe_at_k": 0.425,
+            "strict_valid_rate": 0.1978124976158142,
+            "forbidden_ok_rate": 0.9206249713897705,
+            "stability_ok_rate": 0.7981250286102295,
+            "curvature_ok_rate": 0.2671875059604645,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.7842603325843811
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_last.pth",
+        "update": 7500,
+        "validation_meanflow": {
+          "loss": 0.11655895918607712,
+          "flow": 0.10215440511703491,
+          "endpoint": 0.05761821500957012,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.165,
+            "strict_valid_rate": 0.16500000655651093,
+            "forbidden_ok_rate": 0.9200000166893005,
+            "stability_ok_rate": 0.800000011920929,
+            "curvature_ok_rate": 0.23749999701976776,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8127381205558777
+          },
+          "8": {
+            "safe_at_k": 0.4325,
+            "strict_valid_rate": 0.18062500655651093,
+            "forbidden_ok_rate": 0.9140625,
+            "stability_ok_rate": 0.7900000214576721,
+            "curvature_ok_rate": 0.24156250059604645,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8546820282936096
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_5250.pth",
+        "update": 5250,
+        "validation_meanflow": {
+          "loss": 0.11943428725004196,
+          "flow": 0.10644870653748512,
+          "endpoint": 0.05194232307374477,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1425,
+            "strict_valid_rate": 0.14249999821186066,
+            "forbidden_ok_rate": 0.9175000190734863,
+            "stability_ok_rate": 0.8100000023841858,
+            "curvature_ok_rate": 0.19750000536441803,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.839381992816925
+          },
+          "8": {
+            "safe_at_k": 0.3325,
+            "strict_valid_rate": 0.14218750596046448,
+            "forbidden_ok_rate": 0.9121875166893005,
+            "stability_ok_rate": 0.7893750071525574,
+            "curvature_ok_rate": 0.203125,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.81488436460495
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_5500.pth",
+        "update": 5500,
+        "validation_meanflow": {
+          "loss": 0.13489711612462998,
+          "flow": 0.120626160800457,
+          "endpoint": 0.05708382084965706,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1275,
+            "strict_valid_rate": 0.1274999976158142,
+            "forbidden_ok_rate": 0.9150000214576721,
+            "stability_ok_rate": 0.7975000143051147,
+            "curvature_ok_rate": 0.17249999940395355,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9283378720283508
+          },
+          "8": {
+            "safe_at_k": 0.29,
+            "strict_valid_rate": 0.13124999403953552,
+            "forbidden_ok_rate": 0.9150000214576721,
+            "stability_ok_rate": 0.792187511920929,
+            "curvature_ok_rate": 0.1678124964237213,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8929603695869446
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_5750.pth",
+        "update": 5750,
+        "validation_meanflow": {
+          "loss": 0.13921300262212755,
+          "flow": 0.121530821621418,
+          "endpoint": 0.07072872549295425,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.2075,
+            "strict_valid_rate": 0.20749999582767487,
+            "forbidden_ok_rate": 0.9150000214576721,
+            "stability_ok_rate": 0.7925000190734863,
+            "curvature_ok_rate": 0.26750001311302185,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8863611817359924
+          },
+          "8": {
+            "safe_at_k": 0.45,
+            "strict_valid_rate": 0.2006250023841858,
+            "forbidden_ok_rate": 0.9150000214576721,
+            "stability_ok_rate": 0.7828124761581421,
+            "curvature_ok_rate": 0.2853125035762787,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8913154006004333
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_6000.pth",
+        "update": 6000,
+        "validation_meanflow": {
+          "loss": 0.12247515618801116,
+          "flow": 0.10892118558287621,
+          "endpoint": 0.0542158842086792,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.175,
+            "strict_valid_rate": 0.17499999701976776,
+            "forbidden_ok_rate": 0.9100000262260437,
+            "stability_ok_rate": 0.8224999904632568,
+            "curvature_ok_rate": 0.27000001072883606,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8764190077781677
+          },
+          "8": {
+            "safe_at_k": 0.45,
+            "strict_valid_rate": 0.19218750298023224,
+            "forbidden_ok_rate": 0.9175000190734863,
+            "stability_ok_rate": 0.8006250262260437,
+            "curvature_ok_rate": 0.28031250834465027,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8568453788757324
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_6250.pth",
+        "update": 6250,
+        "validation_meanflow": {
+          "loss": 0.10658702448010444,
+          "flow": 0.09418166682124138,
+          "endpoint": 0.04962143257260323,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.2075,
+            "strict_valid_rate": 0.20749999582767487,
+            "forbidden_ok_rate": 0.9300000071525574,
+            "stability_ok_rate": 0.8199999928474426,
+            "curvature_ok_rate": 0.2800000011920929,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.7289246916770935
+          },
+          "8": {
+            "safe_at_k": 0.425,
+            "strict_valid_rate": 0.1978124976158142,
+            "forbidden_ok_rate": 0.9206249713897705,
+            "stability_ok_rate": 0.7981250286102295,
+            "curvature_ok_rate": 0.2671875059604645,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.7842603325843811
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_6500.pth",
+        "update": 6500,
+        "validation_meanflow": {
+          "loss": 0.12560543939471244,
+          "flow": 0.11038216784596443,
+          "endpoint": 0.06089308470487595,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1925,
+            "strict_valid_rate": 0.19249999523162842,
+            "forbidden_ok_rate": 0.9125000238418579,
+            "stability_ok_rate": 0.8125,
+            "curvature_ok_rate": 0.24500000476837158,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9142826199531555
+          },
+          "8": {
+            "safe_at_k": 0.4725,
+            "strict_valid_rate": 0.18406249582767487,
+            "forbidden_ok_rate": 0.9100000262260437,
+            "stability_ok_rate": 0.7962499856948853,
+            "curvature_ok_rate": 0.2562499940395355,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8820716738700867
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_6750.pth",
+        "update": 6750,
+        "validation_meanflow": {
+          "loss": 0.1266489554941654,
+          "flow": 0.11141148194670678,
+          "endpoint": 0.060949890166521074,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1875,
+            "strict_valid_rate": 0.1875,
+            "forbidden_ok_rate": 0.9125000238418579,
+            "stability_ok_rate": 0.7975000143051147,
+            "curvature_ok_rate": 0.2475000023841858,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9462119936943054
+          },
+          "8": {
+            "safe_at_k": 0.3925,
+            "strict_valid_rate": 0.1837500035762787,
+            "forbidden_ok_rate": 0.9143750071525574,
+            "stability_ok_rate": 0.7950000166893005,
+            "curvature_ok_rate": 0.25093749165534973,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.889812171459198
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_7000.pth",
+        "update": 7000,
+        "validation_meanflow": {
+          "loss": 0.13607596397399901,
+          "flow": 0.11800032749772071,
+          "endpoint": 0.07230254173278809,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.2275,
+            "strict_valid_rate": 0.22750000655651093,
+            "forbidden_ok_rate": 0.9125000238418579,
+            "stability_ok_rate": 0.8025000095367432,
+            "curvature_ok_rate": 0.3199999928474426,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9778028726577759
+          },
+          "8": {
+            "safe_at_k": 0.575,
+            "strict_valid_rate": 0.2331250011920929,
+            "forbidden_ok_rate": 0.9090625047683716,
+            "stability_ok_rate": 0.7825000286102295,
+            "curvature_ok_rate": 0.3243750035762787,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9283392429351807
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_7250.pth",
+        "update": 7250,
+        "validation_meanflow": {
+          "loss": 0.15470437824726105,
+          "flow": 0.13756222873926163,
+          "endpoint": 0.0685685981810093,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.2325,
+            "strict_valid_rate": 0.23250000178813934,
+            "forbidden_ok_rate": 0.9175000190734863,
+            "stability_ok_rate": 0.8224999904632568,
+            "curvature_ok_rate": 0.3375000059604645,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8406314849853516
+          },
+          "8": {
+            "safe_at_k": 0.51,
+            "strict_valid_rate": 0.21437500417232513,
+            "forbidden_ok_rate": 0.9137499928474426,
+            "stability_ok_rate": 0.7846875190734863,
+            "curvature_ok_rate": 0.3043749928474426,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8767811059951782
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/baseline/stage1_update_7500.pth",
+        "update": 7500,
+        "validation_meanflow": {
+          "loss": 0.11655895918607712,
+          "flow": 0.10215440511703491,
+          "endpoint": 0.05761821500957012,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.165,
+            "strict_valid_rate": 0.16500000655651093,
+            "forbidden_ok_rate": 0.9200000166893005,
+            "stability_ok_rate": 0.800000011920929,
+            "curvature_ok_rate": 0.23749999701976776,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8127381205558777
+          },
+          "8": {
+            "safe_at_k": 0.4325,
+            "strict_valid_rate": 0.18062500655651093,
+            "forbidden_ok_rate": 0.9140625,
+            "stability_ok_rate": 0.7900000214576721,
+            "curvature_ok_rate": 0.24156250059604645,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8546820282936096
+          }
+        }
+      }
+    ]
+  },
+  "diagnostics/task_memory_7500/task_memory": {
+    "run_dir": "diagnostics/task_memory_7500/task_memory",
+    "architecture": "task_memory",
+    "map_layout": "single_12",
+    "validation_contexts": 400,
+    "checkpoints": [
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_best.pth",
+        "update": 7500,
+        "validation_meanflow": {
+          "loss": 0.12411839261651039,
+          "flow": 0.10783390641212463,
+          "endpoint": 0.06513794645667076,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1325,
+            "strict_valid_rate": 0.13249999284744263,
+            "forbidden_ok_rate": 0.9175000190734863,
+            "stability_ok_rate": 0.7825000286102295,
+            "curvature_ok_rate": 0.17499999701976776,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9152873158454895
+          },
+          "8": {
+            "safe_at_k": 0.3875,
+            "strict_valid_rate": 0.1431249976158142,
+            "forbidden_ok_rate": 0.9143750071525574,
+            "stability_ok_rate": 0.7737500071525574,
+            "curvature_ok_rate": 0.1953125,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9177595376968384
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_last.pth",
+        "update": 7500,
+        "validation_meanflow": {
+          "loss": 0.12411839261651039,
+          "flow": 0.10783390641212463,
+          "endpoint": 0.06513794645667076,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1325,
+            "strict_valid_rate": 0.13249999284744263,
+            "forbidden_ok_rate": 0.9175000190734863,
+            "stability_ok_rate": 0.7825000286102295,
+            "curvature_ok_rate": 0.17499999701976776,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9152873158454895
+          },
+          "8": {
+            "safe_at_k": 0.3875,
+            "strict_valid_rate": 0.1431249976158142,
+            "forbidden_ok_rate": 0.9143750071525574,
+            "stability_ok_rate": 0.7737500071525574,
+            "curvature_ok_rate": 0.1953125,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9177595376968384
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_5250.pth",
+        "update": 5250,
+        "validation_meanflow": {
+          "loss": 0.1288667306303978,
+          "flow": 0.11276247516274453,
+          "endpoint": 0.06441701635718346,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.16,
+            "strict_valid_rate": 0.1599999964237213,
+            "forbidden_ok_rate": 0.9150000214576721,
+            "stability_ok_rate": 0.7975000143051147,
+            "curvature_ok_rate": 0.22750000655651093,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8192157745361328
+          },
+          "8": {
+            "safe_at_k": 0.4075,
+            "strict_valid_rate": 0.15781250596046448,
+            "forbidden_ok_rate": 0.910937488079071,
+            "stability_ok_rate": 0.7784374952316284,
+            "curvature_ok_rate": 0.21843749284744263,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9086605310440063
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_5500.pth",
+        "update": 5500,
+        "validation_meanflow": {
+          "loss": 0.12490403354167938,
+          "flow": 0.10702616333961487,
+          "endpoint": 0.07151148110628128,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1225,
+            "strict_valid_rate": 0.12250000238418579,
+            "forbidden_ok_rate": 0.9100000262260437,
+            "stability_ok_rate": 0.8075000047683716,
+            "curvature_ok_rate": 0.17000000178813934,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9911938309669495
+          },
+          "8": {
+            "safe_at_k": 0.37,
+            "strict_valid_rate": 0.13218750059604645,
+            "forbidden_ok_rate": 0.9125000238418579,
+            "stability_ok_rate": 0.785937488079071,
+            "curvature_ok_rate": 0.1821874976158142,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9732853770256042
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_5750.pth",
+        "update": 5750,
+        "validation_meanflow": {
+          "loss": 0.2180950289964676,
+          "flow": 0.18712817639112472,
+          "endpoint": 0.12386740833520889,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.06,
+            "strict_valid_rate": 0.05999999865889549,
+            "forbidden_ok_rate": 0.9049999713897705,
+            "stability_ok_rate": 0.7400000095367432,
+            "curvature_ok_rate": 0.0949999988079071,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.105371117591858
+          },
+          "8": {
+            "safe_at_k": 0.3125,
+            "strict_valid_rate": 0.09531249850988388,
+            "forbidden_ok_rate": 0.9084374904632568,
+            "stability_ok_rate": 0.7590625286102295,
+            "curvature_ok_rate": 0.1353124976158142,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.0662730932235718
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_6000.pth",
+        "update": 6000,
+        "validation_meanflow": {
+          "loss": 0.13712988793849945,
+          "flow": 0.118867779225111,
+          "endpoint": 0.07304843589663505,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.16,
+            "strict_valid_rate": 0.1599999964237213,
+            "forbidden_ok_rate": 0.9075000286102295,
+            "stability_ok_rate": 0.7825000286102295,
+            "curvature_ok_rate": 0.23000000417232513,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9828959107398987
+          },
+          "8": {
+            "safe_at_k": 0.4075,
+            "strict_valid_rate": 0.1496874988079071,
+            "forbidden_ok_rate": 0.9068750143051147,
+            "stability_ok_rate": 0.7809374928474426,
+            "curvature_ok_rate": 0.2096875011920929,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.982147753238678
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_6250.pth",
+        "update": 6250,
+        "validation_meanflow": {
+          "loss": 0.13640425756573676,
+          "flow": 0.11976305767893791,
+          "endpoint": 0.06656479820609093,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1425,
+            "strict_valid_rate": 0.14249999821186066,
+            "forbidden_ok_rate": 0.9100000262260437,
+            "stability_ok_rate": 0.7850000262260437,
+            "curvature_ok_rate": 0.19249999523162842,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.8524477481842041
+          },
+          "8": {
+            "safe_at_k": 0.395,
+            "strict_valid_rate": 0.13249999284744263,
+            "forbidden_ok_rate": 0.9131249785423279,
+            "stability_ok_rate": 0.7728124856948853,
+            "curvature_ok_rate": 0.19343750178813934,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9032453298568726
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_6500.pth",
+        "update": 6500,
+        "validation_meanflow": {
+          "loss": 0.14250462085008622,
+          "flow": 0.1222278717160225,
+          "endpoint": 0.0811069966852665,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.14,
+            "strict_valid_rate": 0.14000000059604645,
+            "forbidden_ok_rate": 0.9049999713897705,
+            "stability_ok_rate": 0.7649999856948853,
+            "curvature_ok_rate": 0.20250000059604645,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.010745644569397
+          },
+          "8": {
+            "safe_at_k": 0.3175,
+            "strict_valid_rate": 0.12562499940395355,
+            "forbidden_ok_rate": 0.9003124833106995,
+            "stability_ok_rate": 0.7806249856948853,
+            "curvature_ok_rate": 0.17499999701976776,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.054009199142456
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_6750.pth",
+        "update": 6750,
+        "validation_meanflow": {
+          "loss": 0.12482080101966858,
+          "flow": 0.10651989325881005,
+          "endpoint": 0.07320362895727157,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.155,
+            "strict_valid_rate": 0.1550000011920929,
+            "forbidden_ok_rate": 0.8999999761581421,
+            "stability_ok_rate": 0.7825000286102295,
+            "curvature_ok_rate": 0.2199999988079071,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9517442584037781
+          },
+          "8": {
+            "safe_at_k": 0.4025,
+            "strict_valid_rate": 0.14906249940395355,
+            "forbidden_ok_rate": 0.9078124761581421,
+            "stability_ok_rate": 0.7878124713897705,
+            "curvature_ok_rate": 0.20999999344348907,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9509821534156799
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_7000.pth",
+        "update": 7000,
+        "validation_meanflow": {
+          "loss": 0.14421662896871568,
+          "flow": 0.12258934646844864,
+          "endpoint": 0.0865091286599636,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1125,
+            "strict_valid_rate": 0.11249999701976776,
+            "forbidden_ok_rate": 0.9100000262260437,
+            "stability_ok_rate": 0.7774999737739563,
+            "curvature_ok_rate": 0.16750000417232513,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.0276447534561157
+          },
+          "8": {
+            "safe_at_k": 0.4,
+            "strict_valid_rate": 0.14499999582767487,
+            "forbidden_ok_rate": 0.9096875190734863,
+            "stability_ok_rate": 0.7740625143051147,
+            "curvature_ok_rate": 0.19718749821186066,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 1.0085759162902832
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_7250.pth",
+        "update": 7250,
+        "validation_meanflow": {
+          "loss": 0.1235863921046257,
+          "flow": 0.10471793696284294,
+          "endpoint": 0.07547382161021232,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.135,
+            "strict_valid_rate": 0.13500000536441803,
+            "forbidden_ok_rate": 0.9024999737739563,
+            "stability_ok_rate": 0.7799999713897705,
+            "curvature_ok_rate": 0.19499999284744263,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9391432404518127
+          },
+          "8": {
+            "safe_at_k": 0.43,
+            "strict_valid_rate": 0.14156250655651093,
+            "forbidden_ok_rate": 0.9059374928474426,
+            "stability_ok_rate": 0.776562511920929,
+            "curvature_ok_rate": 0.2043749988079071,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9724331498146057
+          }
+        }
+      },
+      {
+        "checkpoint": "diagnostics/task_memory_7500/task_memory/stage1_update_7500.pth",
+        "update": 7500,
+        "validation_meanflow": {
+          "loss": 0.12411839261651039,
+          "flow": 0.10783390641212463,
+          "endpoint": 0.06513794645667076,
+          "batches": 25
+        },
+        "endpoint_metrics": {
+          "1": {
+            "safe_at_k": 0.1325,
+            "strict_valid_rate": 0.13249999284744263,
+            "forbidden_ok_rate": 0.9175000190734863,
+            "stability_ok_rate": 0.7825000286102295,
+            "curvature_ok_rate": 0.17499999701976776,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9152873158454895
+          },
+          "8": {
+            "safe_at_k": 0.3875,
+            "strict_valid_rate": 0.1431249976158142,
+            "forbidden_ok_rate": 0.9143750071525574,
+            "stability_ok_rate": 0.7737500071525574,
+            "curvature_ok_rate": 0.1953125,
+            "yaw_ok_rate": 1.0,
+            "task_cost": 0.9177595376968384
+          }
+        }
+      }
+    ]
+  }
+}

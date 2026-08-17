@@ -15,28 +15,35 @@ import pandas as pd
 from typing import Dict, List, Tuple
 import time
 
-from dit.Models import PathDiffusionTransformer
+from dit.Models import PathMeanFlowTransformer
 from evaluator import TrajectoryEvaluator
 from dataLoader_dit import compute_map_yaw_bins, generate_sdf_from_yaw_stability
 from map_config import (
+    DENSE_TRAJECTORY_POINTS,
     MAP_BOUNDS,
     MAP_CONFIG,
     MAP_HALF_EXTENT,
     MAP_RESOLUTION,
     MAP_YAW_BINS,
 )
+from boundary_constrained_path import (
+    BoundaryConstrainedPathRepresentation,
+    PATH_REPRESENTATION_SEMANTIC_VERSION,
+)
+from tools._paths import evaluation_results_dir
 
 
 def generate_paths(model, map_input, start_point, goal_point, num_paths=1, device='cuda',
                    solver='pmf_refined', num_steps=3,
-                   reconstruct_trajectory=True, num_traj_points=100,
+                   reconstruct_trajectory=True,
+                   num_traj_points=DENSE_TRAJECTORY_POINTS,
                    use_guided_sampling=False, cost_map=None, map_info=None,
                    guidance_scale=0.15, guidance_start_step=0.7):
     """
     生成完整路径（绝对坐标版本，使用新 Rectified Flow 采样接口）
     
     Args:
-        model: 训练好的PathDiffusionTransformer
+        model: 训练好的 Path MeanFlow 生成器
         map_input: (1, 3, H, W) 已包含地形信息的地图
         start_point: (3,) [x, y, yaw] 起点坐标（真实坐标）
         goal_point: (3,) [x, y, yaw] 终点坐标（真实坐标）
@@ -84,62 +91,53 @@ def generate_paths(model, map_input, start_point, goal_point, num_paths=1, devic
     start_time = time.time()
     
     if use_guided_sampling:
-        if not hasattr(model, 'guided_sample'):
-            raise NotImplementedError("当前模型未实现 guided_sample，无法启用guided sampling")
-        if cost_map is None or map_info is None:
-            raise ValueError("cost_map and map_info are required for guided sampling")
-        
-        traj_xy = model.guided_sample(
-            map_input,
-            start_normalized,
-            goal_normalized,
-            cost_map,
-            map_info,
-            num_samples=num_paths,
-            num_steps=num_steps,
-            solver=solver,
-            reconstruct_trajectory=reconstruct_trajectory,
-            num_traj_points=num_traj_points,
-            guidance_scale=guidance_scale,
-            guidance_start_step=guidance_start_step
+        raise NotImplementedError(
+            "旧 guided sampler 使用有限差分几何，已从一阶边界约束路径"
+            "的生产评估中禁用。"
         )
     else:
         with torch.no_grad():
-            traj_xy = model.sample(
+            state = base_model.sample(
                 map_input,
                 start_normalized,
                 goal_normalized,
                 num_samples=num_paths,
                 num_steps=num_steps,
                 solver=solver,
-                reconstruct_trajectory=reconstruct_trajectory,
-                num_traj_points=num_traj_points
-            )  # (num_paths, N, 2)
+                reconstruct_trajectory=False,
+                num_traj_points=num_traj_points,
+                return_residual=True,
+            )
+            start_batch = start_normalized.repeat_interleave(
+                num_paths, dim=0
+            )
+            goal_batch = goal_normalized.repeat_interleave(
+                num_paths, dim=0
+            )
+            geometry = base_model.evaluate_trajectory_state(
+                state, start_batch, goal_batch
+            )
+            traj_xy = geometry["position"]
+            yaw = geometry["yaw"]
     
     # 结束计时
     inference_time = time.time() - start_time
 
-    # 计算 yaw（从轨迹切向量估计）
     if not isinstance(traj_xy, torch.Tensor):
         traj_xy = torch.tensor(traj_xy, dtype=torch.float32, device=device)
     else:
         traj_xy = traj_xy.to(device)
 
-    B, N, _ = traj_xy.shape
-    if N < 2:
-        yaw = torch.zeros(B, N, device=traj_xy.device)
-    else:
-        dx = torch.zeros(B, N, device=traj_xy.device)
-        dy = torch.zeros(B, N, device=traj_xy.device)
-        dx[:, 1:-1] = traj_xy[:, 2:, 0] - traj_xy[:, :-2, 0]
-        dy[:, 1:-1] = traj_xy[:, 2:, 1] - traj_xy[:, :-2, 1]
-        dx[:, 0] = traj_xy[:, 1, 0] - traj_xy[:, 0, 0]
-        dy[:, 0] = traj_xy[:, 1, 1] - traj_xy[:, 0, 1]
-        dx[:, -1] = traj_xy[:, -1, 0] - traj_xy[:, -2, 0]
-        dy[:, -1] = traj_xy[:, -1, 1] - traj_xy[:, -2, 1]
-        yaw = torch.atan2(dy, dx)
-
-    traj_full = torch.cat([traj_xy, yaw.unsqueeze(-1)], dim=-1)  # (B, N, 3)
+    traj_full = torch.cat(
+        [
+            traj_xy,
+            yaw.unsqueeze(-1),
+            geometry["first_derivative"],
+            geometry["second_derivative"],
+            geometry["curvature"].unsqueeze(-1),
+        ],
+        dim=-1,
+    )
     
     return traj_full.detach().cpu().numpy(), inference_time
 
@@ -187,16 +185,17 @@ def prepare_map_input(normal_x: np.ndarray, normal_y: np.ndarray, normal_z: np.n
     encoder_input = torch.tensor(np.concatenate((
         normal_x[:, :, None],  # [H, W, 1]
         normal_y[:, :, None],  # [H, W, 1]
-        normal_z[:, :, None]   # [H, W, 1]
-    ), axis=2), dtype=torch.float32)  # [H, W, 3]
+        normal_z[:, :, None],  # [H, W, 1]
+        np.ones_like(normal_z)[:, :, None],  # 完整地图 mask
+    ), axis=2), dtype=torch.float32)  # [H, W, 4]
     
-    # 转换为 [1, 3, H, W] 格式
+    # 转换为 [1, 4, H, W] 格式
     map_input = encoder_input.permute(2, 0, 1).unsqueeze(0).to(device)
     return map_input
 
 
-def evaluate_single_path(model_stage1: PathDiffusionTransformer,
-                        model_stage2: PathDiffusionTransformer,
+def evaluate_single_path(model_stage1: PathMeanFlowTransformer,
+                        model_stage2: PathMeanFlowTransformer,
                         evaluator: TrajectoryEvaluator,
                         env_folder: str,
                         path_num: int,
@@ -214,7 +213,7 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
                         solver: str = 'pmf_refined',
                         num_steps: int = 3,
                         reconstruct_trajectory: bool = True,
-                        num_traj_points: int = 100) -> Tuple[Dict[str, float], List[Dict[str, float]], List[Dict[str, float]], np.ndarray, np.ndarray, float, float]:
+                        num_traj_points: int = DENSE_TRAJECTORY_POINTS) -> Tuple[Dict[str, float], List[Dict[str, float]], List[Dict[str, float]], np.ndarray, np.ndarray, float, float]:
     """
     评估单条路径（同时评估两个阶段的模型）
     
@@ -325,24 +324,51 @@ def evaluate_single_path(model_stage1: PathDiffusionTransformer,
             num_traj_points=num_traj_points
         )  # (num_pred_paths, N, 3), float
     
-    # 评估真实轨迹
-    gt_trajectory_tensor = torch.tensor(trajectory, dtype=torch.float32, device=device)
-    gt_metrics = evaluator.evaluate_trajectory(gt_trajectory_tensor)
+    def evaluate_packed(packed):
+        packed = torch.as_tensor(
+            packed, dtype=torch.float32, device=device
+        )
+        return evaluator.evaluate_trajectory(
+            packed[:, :3],
+            analytic_first_derivative=packed[:, 3:5],
+            analytic_second_derivative=packed[:, 5:7],
+            analytic_curvature=packed[:, 7],
+        )
+
+    # Ground truth uses the same canonical parameterization and path encoding.
+    path_representation = BoundaryConstrainedPathRepresentation(
+        dense_points=DENSE_TRAJECTORY_POINTS
+    ).to(device)
+    gt_state, _ = path_representation.fit_demonstration(trajectory)
+    gt_geometry = path_representation.evaluate(
+        gt_state.to(device=device, dtype=torch.float32).unsqueeze(0),
+        torch.as_tensor(start_pos, dtype=torch.float32, device=device).unsqueeze(0),
+        torch.as_tensor(goal_pos, dtype=torch.float32, device=device).unsqueeze(0),
+    )
+    gt_packed = torch.cat(
+        [
+            gt_geometry["position"],
+            gt_geometry["yaw"].unsqueeze(-1),
+            gt_geometry["first_derivative"],
+            gt_geometry["second_derivative"],
+            gt_geometry["curvature"].unsqueeze(-1),
+        ],
+        dim=-1,
+    )[0]
+    gt_metrics = evaluate_packed(gt_packed)
     
     # 评估阶段一预测轨迹
     stage1_metrics_list = []
     for i in range(num_pred_paths):
         pred_traj_single = stage1_trajs[i]  # (N, 3)
-        pred_trajectory_tensor = torch.tensor(pred_traj_single, dtype=torch.float32, device=device)
-        pred_metrics = evaluator.evaluate_trajectory(pred_trajectory_tensor)
+        pred_metrics = evaluate_packed(pred_traj_single)
         stage1_metrics_list.append(pred_metrics)
     
     # 评估阶段二预测轨迹
     stage2_metrics_list = []
     for i in range(num_pred_paths):
         pred_traj_single = stage2_trajs[i]  # (N, 3)
-        pred_trajectory_tensor = torch.tensor(pred_traj_single, dtype=torch.float32, device=device)
-        pred_metrics = evaluator.evaluate_trajectory(pred_trajectory_tensor)
+        pred_metrics = evaluate_packed(pred_traj_single)
         stage2_metrics_list.append(pred_metrics)
     
     return gt_metrics, stage1_metrics_list, stage2_metrics_list, stage1_trajs, stage2_trajs, stage1_time, stage2_time
@@ -419,7 +445,7 @@ def print_comparison_summary(gt_metrics_agg: Dict, stage1_metrics_agg: Dict, sta
         'curvature_mean',
         'curvature_abs_max',
         'curvature_abs_q99',
-        'curvature_abs_violation_ratio_1p4',
+        'curvature_abs_violation_ratio_2p1',
         'speed_mean',
         'out_of_bounds_ratio',
         'heading_error_mean'
@@ -470,7 +496,7 @@ def main():
     # =================== 配置参数 ===================
     dataset_path = str(MAP_CONFIG.dataset_root / 'val')
     # dataset_path = str(MAP_CONFIG.dataset_root / 'train')
-    save_path = 'evaluation_results'
+    save_path = str(evaluation_results_dir("dit"))
     os.makedirs(save_path, exist_ok=True)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -502,7 +528,7 @@ def main():
     solver = 'pmf_onestep'  # 'pmf_onestep' | 'pmf_refined' | 'euler' | 'heun'
     diffusion_step = 3
     reconstruct_trajectory = True
-    num_traj_points = 100
+    num_traj_points = DENSE_TRAJECTORY_POINTS
     
     # 选择要评估的环境和路径
     # envNum = np.random.randint(0, 99)
@@ -564,7 +590,7 @@ def main():
                 )
     
     # 加载阶段一模型
-    model_stage1 = PathDiffusionTransformer(**model_param['model_args'])
+    model_stage1 = PathMeanFlowTransformer(**model_param['model_args'])
     model_stage1 = model_stage1.to(device)
     
     # if best:
@@ -578,13 +604,21 @@ def main():
         osp.join(modelFolder, 'stage1_best_model.pth'),
         map_location=device,
     )
+    if (
+        checkpoint_stage1.get("representation_semantic_version")
+        != PATH_REPRESENTATION_SEMANTIC_VERSION
+    ):
+        raise ValueError(
+            "Stage 1 checkpoint is incompatible with the first-order "
+            "boundary-constrained path representation."
+        )
     print(f"Loaded best stage 1 model.")
     
     model_stage1.load_state_dict(checkpoint_stage1['model_state_dict'])
     model_stage1.eval()
     
     # 加载阶段二模型
-    model_stage2 = PathDiffusionTransformer(**model_param['model_args'])
+    model_stage2 = PathMeanFlowTransformer(**model_param['model_args'])
     model_stage2 = model_stage2.to(device)
     
     if best:
@@ -606,6 +640,14 @@ def main():
             map_location=device,
         )
         print(f"Loaded stage 2 model from epoch {epoch}.")
+    if (
+        checkpoint_stage2.get("representation_semantic_version")
+        != PATH_REPRESENTATION_SEMANTIC_VERSION
+    ):
+        raise ValueError(
+            "Stage 2 checkpoint is incompatible with the first-order "
+            "boundary-constrained path representation."
+        )
     
     model_stage2.load_state_dict(checkpoint_stage2['model_state_dict'])
     model_stage2.eval()
@@ -870,7 +912,7 @@ def main():
         'periodic_large_turn_ratio_pi_2',
         'tangent_norm_min', 'tangent_near_zero_ratio_1e-2', 'tangent_near_zero_ratio_5e-2',
         'curvature_mean', 'curvature_abs_max', 'curvature_abs_q99',
-        'curvature_abs_violation_ratio_1p4', 'speed_mean',
+        'curvature_abs_violation_ratio_2p1', 'speed_mean',
         'out_of_bounds_ratio', 'heading_error_mean'
     ]
     
@@ -941,7 +983,7 @@ def main():
                          'raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
                          'periodic_large_turn_ratio_pi_2', 'tangent_near_zero_ratio_1e-2',
                          'tangent_near_zero_ratio_5e-2', 'curvature_abs_max', 'curvature_abs_q99',
-                         'curvature_abs_violation_ratio_1p4']:
+                         'curvature_abs_violation_ratio_2p1']:
                 if diff_pct < 0:
                     stage1_improved.append((metric, abs(diff_pct)))
                 elif diff_pct > 0:
@@ -978,7 +1020,7 @@ def main():
                          'raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
                          'periodic_large_turn_ratio_pi_2', 'tangent_near_zero_ratio_1e-2',
                          'tangent_near_zero_ratio_5e-2', 'curvature_abs_max', 'curvature_abs_q99',
-                         'curvature_abs_violation_ratio_1p4']:
+                         'curvature_abs_violation_ratio_2p1']:
                 if diff_pct < 0:
                     stage2_improved.append((metric, abs(diff_pct)))
                 elif diff_pct > 0:
@@ -1015,7 +1057,7 @@ def main():
                          'raw_yaw_step_max', 'periodic_yaw_step_max', 'yaw_wrap_jump_ratio',
                          'periodic_large_turn_ratio_pi_2', 'tangent_near_zero_ratio_1e-2',
                          'tangent_near_zero_ratio_5e-2', 'curvature_abs_max', 'curvature_abs_q99',
-                         'curvature_abs_violation_ratio_1p4']:
+                         'curvature_abs_violation_ratio_2p1']:
                 if diff_pct < 0:
                     stage2_vs_stage1_improved.append((metric, abs(diff_pct)))
                 elif diff_pct > 0:

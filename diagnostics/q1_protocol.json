@@ -1,0 +1,59 @@
+{
+  "status": "frozen_not_started_from_dsh",
+  "experiment": "Q1 Stage-1 controlled training",
+  "science_question": "Does path/map CA canonical geometric addressing help when parameter count, condition path, and training protocol are identical?",
+  "arms": [
+    {
+      "name": "q1_baseline",
+      "architecture": "spatial_map",
+      "map_layout": "single_12",
+      "output_dir": "diagnostics/q1_baseline"
+    },
+    {
+      "name": "q1_alignment_only",
+      "architecture": "alignment_only",
+      "map_layout": "single_12",
+      "output_dir": "diagnostics/q1_alignment_only"
+    }
+  ],
+  "protocol_source": "diagnostics/spatial_map_resolution/single_12",
+  "updates": 13750,
+  "eval_every_updates": 250,
+  "batch_size": 16,
+  "lr": 0.0001,
+  "optimizer": "AdamW(weight_decay=1e-4)",
+  "gradient_clip": 1.0,
+  "seed": 20260813,
+  "split_seed": 20260814,
+  "eval_seed": 20260815,
+  "train_environments": 80,
+  "validation_environments": 20,
+  "validation_contexts": 400,
+  "validation_batches": 25,
+  "patience_evals": 1000,
+  "min_delta": 0.0001,
+  "p_mask": 0.5,
+  "mask_mode": "stage1_demo_valid",
+  "model_width": {
+    "n_layers": 6,
+    "n_heads": 8,
+    "d_model": 512,
+    "d_inner": 1024,
+    "dropout": 0.1,
+    "map_channels": 4,
+    "coordinate_scale": 10.0
+  },
+  "execution": "serial_on_gpu0",
+  "launcher": "diagnostics/q1_training_serial.sh",
+  "selection": "stage1_best.pth and stage1_last.pth both kept; report best and final update",
+  "required_metrics": [
+    "val_loss",
+    "Safe@1",
+    "Safe@8",
+    "Forbidden",
+    "Stability",
+    "Curvature",
+    "best_update",
+    "final_update"
+  ]
+}

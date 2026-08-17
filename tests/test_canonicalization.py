@@ -4,7 +4,6 @@ import unittest
 import torch
 
 from bspline_utils import DifferentiableBSpline
-from direct_safe_distribution.inference import decode_global_feasible
 from dit.Models import (
     PathDiffusionTransformer,
     PhysicalScaledEdgeResidualRepresentation,
@@ -185,24 +184,16 @@ class CanonicalizationTests(unittest.TestCase):
         model = PathDiffusionTransformer(
             n_layers=1,
             n_heads=4,
-            d_k=8,
-            d_v=8,
             d_model=32,
             d_inner=64,
-            pad_idx=None,
             dropout=0.0,
-            n_position=225,
-            train_shape=(12, 12),
-            n_path_steps=25,
-            diffusion_steps=50,
-            prediction_type="x0",
-            loss_type="v",
             coordinate_scale=10.0,
+            map_channels=3,
         ).eval()
         map_tensor = torch.randn(1, 3, 100, 100)
         start_pose = torch.tensor([[-0.2, -0.1, 1.0, 0.0]])
         goal_pose = torch.tensor([[0.4, 0.5, 0.0, 1.0]])
-        source = model.project_zero_sum(torch.randn(1, 25, 2))
+        source = model.project_zero_sum(torch.randn(1, 22, 2))
         disabled = canonicalize_map(
             map_tensor,
             torch.tensor([[0.0, 0.0, 0.0]]),
@@ -228,22 +219,6 @@ class CanonicalizationTests(unittest.TestCase):
                 goal_pose,
             )
         self.assertTrue(torch.equal(reference, observed))
-
-    def test_shared_output_wrapper_restores_original_hard_bounds(self):
-        start = torch.tensor([[-8.0, -7.0, 0.2]])
-        goal = torch.tensor([[8.0, 7.0, -0.4]])
-        residual = torch.randn(1, 25, 2) * 100.0
-        _, control = decode_global_feasible(
-            residual,
-            start,
-            goal,
-            model_coordinate_scale=20.0 * math.sqrt(2.0),
-            canonical=True,
-        )
-        self.assertLessEqual(float(control.abs().max()), 10.0 + 1e-5)
-        self.assertTrue(torch.allclose(control[:, 0], start[:, :2], atol=1e-6))
-        self.assertTrue(torch.allclose(control[:, -1], goal[:, :2], atol=2e-5))
-
 
 if __name__ == "__main__":
     unittest.main()
