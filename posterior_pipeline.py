@@ -33,6 +33,7 @@ from tqdm import tqdm
 
 from dataLoader_dit import (
     MASK_GENERATION_SEMANTICS,
+    STAGE2_MASK_GENERATION_SEMANTICS,
     MASK_INPUT_SEMANTICS,
     MASK_NOISE_STD,
     STAGE2_MAX_CONTIGUOUS_BLOCKED_FRACTION,
@@ -301,6 +302,7 @@ def make_partial_dataset(
     mask_seed=2026,
     p_mask=0.5,
     mask_mode="stage1_demo_valid",
+    mask_source="legacy",
     vehicle_radius_meters=SAFETY_COST_CONFIG.vehicle_radius_meters,
     environment_names=None,
     dynamic_mask_noise=None,
@@ -348,6 +350,7 @@ def make_partial_dataset(
             else bool(dynamic_mask_noise)
         ),
         mask_mode=mask_mode,
+        mask_source=mask_source,
         vehicle_radius_meters=vehicle_radius_meters,
         encode_path_coordinates=True,
     )
@@ -395,11 +398,11 @@ def stage1_environment_selection(args):
     """Resolve explicit environment-disjoint Stage-1 datasets from CLI args."""
     train_available = discover_environments(
         Path(args.dataFolder) / "train",
-        expected_count=MAP_CONFIG.expected_environments,
+        expected_count=None,
     )
     val_available = discover_environments(
         Path(args.dataFolder) / "val",
-        expected_count=MAP_CONFIG.expected_environments,
+        expected_count=None,
     )
     if train_available != val_available:
         raise ValueError("Stage-1 train/val environment names differ")
@@ -607,10 +610,10 @@ def _require_privileged_cost_semantics(checkpoint):
 def _require_stage2_mask_generation_semantics(checkpoint):
     """避免旧 replay 用新算法重建出不同的 Stage 2 mask。"""
     actual = checkpoint.get("mask_generation_semantics")
-    if actual != MASK_GENERATION_SEMANTICS:
+    if actual != STAGE2_MASK_GENERATION_SEMANTICS:
         raise ValueError(
             "Stage 2 checkpoint 的 mask 生成语义已过期："
-            f"期望 {MASK_GENERATION_SEMANTICS!r}，实际 {actual!r}。"
+            f"期望 {STAGE2_MASK_GENERATION_SEMANTICS!r}，实际 {actual!r}。"
             "局部干预 mask 规则已改变，请从 Stage 1 重新启动 Stage 2。"
         )
 
@@ -1305,9 +1308,11 @@ def train_stage1(args, device):
         mask_seed=args.mask_seed,
         p_mask=args.p_mask,
         mask_mode="stage1_demo_valid",
+        mask_source=args.mask_source,
         vehicle_radius_meters=args.vehicle_radius_meters,
         environment_names=environment_split["train"],
         dynamic_mask_noise=dynamic_train_noise,
+        expected_environment_count=None,
     )
     val_set, val_envs = make_partial_dataset(
         args.dataFolder,
@@ -1315,9 +1320,11 @@ def train_stage1(args, device):
         mask_seed=args.mask_seed,
         p_mask=args.p_mask,
         mask_mode="stage1_demo_valid",
+        mask_source=args.mask_source,
         vehicle_radius_meters=args.vehicle_radius_meters,
         environment_names=environment_split["validation"],
         dynamic_mask_noise=False,
+        expected_environment_count=None,
     )
     noise_eval_set, _ = make_partial_dataset(
         args.dataFolder,
@@ -1327,9 +1334,11 @@ def train_stage1(args, device):
         mask_seed=args.mask_seed,
         p_mask=args.p_mask,
         mask_mode="stage1_demo_valid",
+        mask_source=args.mask_source,
         vehicle_radius_meters=args.vehicle_radius_meters,
         environment_names=environment_split["validation"],
         dynamic_mask_noise=False,
+        expected_environment_count=None,
     )
     if args.max_contexts is not None:
         train_set = Subset(train_set, range(min(len(train_set), args.max_contexts)))
@@ -1675,6 +1684,7 @@ def train_stage1(args, device):
             "vehicle_radius_meters": args.vehicle_radius_meters,
             "input_mask_semantics": MASK_INPUT_SEMANTICS,
             "mask_generation_semantics": MASK_GENERATION_SEMANTICS,
+            "mask_source": args.mask_source,
             "demo_target_semantics": DEMO_TARGET_SEMANTICS,
             "mask_leakage_metrics": leakage_metrics,
             "mask_generation_metrics": mask_generation_metrics,
@@ -1689,7 +1699,9 @@ def train_stage1(args, device):
                 "validation": val_curvature_skipped,
             },
             "mask_distribution": (
-                "incomplete_observation_outside_informed_demo_ellipse"
+                "continuous_uav_footprint_observation_with_circular_obstacles"
+                if args.mask_source == "uav"
+                else "incomplete_observation_outside_informed_demo_ellipse"
             ),
             "configuration_mask": "single_vehicle_eroded_mask",
             "stage1_environment_split": environment_split,
@@ -1726,7 +1738,11 @@ def train_stage1(args, device):
                     "privileged_constraint_distillation"
                 ),
                 "stage1": "conditional_path_meanflow_pretraining",
-                "mask_distribution": "conditioned_on_dense_demo_validity",
+                "mask_distribution": (
+                    "continuous_uav_footprint_observation_with_circular_obstacles"
+                    if args.mask_source == "uav"
+                    else "conditioned_on_dense_demo_validity"
+                ),
                 "configuration_mask": "single_vehicle_eroded_mask",
                 "model_args": model_args,
                 "representation_semantic_version": (
@@ -1740,6 +1756,8 @@ def train_stage1(args, device):
                 "p_mask": args.p_mask,
                 "mask_noise_std": MASK_NOISE_STD,
                 "vehicle_radius_meters": args.vehicle_radius_meters,
+                "mask_source": args.mask_source,
+                "mask_generation_semantics": MASK_GENERATION_SEMANTICS,
                 "mask_noise_invariance": noise_metrics,
                 "representation_diagnostics": representation_metrics,
                 "input_mask_semantics": MASK_INPUT_SEMANTICS,
@@ -2954,7 +2972,7 @@ def train_stage2_privileged_distillation(args, device):
             configuration_mask=(
                 "single_vehicle_eroded_mask_with_endpoint_yaw_corridors"
             ),
-            mask_generation_semantics=MASK_GENERATION_SEMANTICS,
+            mask_generation_semantics=STAGE2_MASK_GENERATION_SEMANTICS,
             stage2_context_semantics=STAGE2_CONTEXT_SEMANTICS,
             endpoint_mask_corridor_meters=(
                 SAFETY_COST_CONFIG.endpoint_mask_corridor_meters
@@ -3000,7 +3018,7 @@ def train_stage2_privileged_distillation(args, device):
                 "configuration_mask": (
                     "single_vehicle_eroded_mask_with_endpoint_yaw_corridors"
                 ),
-                "mask_generation_semantics": MASK_GENERATION_SEMANTICS,
+                "mask_generation_semantics": STAGE2_MASK_GENERATION_SEMANTICS,
                 "stage2_context_semantics": STAGE2_CONTEXT_SEMANTICS,
                 "endpoint_mask_corridor_meters": (
                     SAFETY_COST_CONFIG.endpoint_mask_corridor_meters
@@ -3728,7 +3746,7 @@ def _save_direct_cost_checkpoint(
             if bool(getattr(args, "stage2_use_mgda", True))
             else "not_used_fixed_weight_task_cost"
         ),
-        mask_generation_semantics=MASK_GENERATION_SEMANTICS,
+        mask_generation_semantics=STAGE2_MASK_GENERATION_SEMANTICS,
         mask_seed=args.mask_seed,
         p_mask=args.stage2_p_mask,
         stage1_p_mask=getattr(args, "p_mask", None),

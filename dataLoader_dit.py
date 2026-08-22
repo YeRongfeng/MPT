@@ -37,6 +37,7 @@ from map_config import (
     MAP_YAW_BINS,
     SAFETY_COST_CONFIG,
 )
+from uav_mask import generate_uav_observation_mask
 
 # 添加兼容性处理
 import sys
@@ -126,8 +127,9 @@ def stability_cache_is_compatible(
 # 被 mask 挡住的法向量使用全局小方差高斯噪声；训练动态采样，验证固定。
 # 固定偏移用于让 mask 形状与验证噪声彼此独立。
 MASK_NOISE_SEED_OFFSET = 7_919
-MASK_INPUT_SEMANTICS = "stage_split_dynamic_gaussian_bernoulli_mask_vehicle_v4"
-MASK_GENERATION_SEMANTICS = (
+MASK_INPUT_SEMANTICS = "stage1_uav_observation_mask_gaussian_v1"
+MASK_GENERATION_SEMANTICS = "uav_footprint_observation_circle_obstacles_v1"
+STAGE2_MASK_GENERATION_SEMANTICS = (
     "informed_ellipse_two_stage_obstacle_curriculum_segment_aware_v5"
 )
 MASK_NOISE_STD = 0.25
@@ -2398,6 +2400,7 @@ class UnevenPathDataLoader(Dataset):
         p_mask=0.5,
         dynamic_mask_noise=False,
         mask_mode="stage1_demo_valid",
+        mask_source="legacy",
         vehicle_radius_meters=SAFETY_COST_CONFIG.vehicle_radius_meters,
         encode_path_coordinates=False,
         encode_gauge_state=None,
@@ -2419,6 +2422,9 @@ class UnevenPathDataLoader(Dataset):
                 "mask_mode 必须为 stage1_demo_valid 或 stage2_independent"
             )
         self.mask_mode = mask_mode
+        if mask_source not in {"uav", "legacy"}:
+            raise ValueError("mask_source 必须为 uav 或 legacy")
+        self.mask_source = mask_source
         self.vehicle_radius_meters = float(vehicle_radius_meters)
         if encode_gauge_state is not None:
             if encode_path_coordinates:
@@ -2481,13 +2487,28 @@ class UnevenPathDataLoader(Dataset):
         shape,
         trajectory_xy,
         mask_variant=0,
+        bounds=MAP_BOUNDS,
+        resolution=MAP_RESOLUTION,
         return_metadata=False,
     ):
         """生成可按轮次变化、同时可由索引和 variant 精确重建的 mask。"""
         variant = int(mask_variant)
+        seed = self.mask_seed + int(idx) * 1_000_003 + variant * 15_485_863
+        if self.mask_source == "uav":
+            return generate_uav_observation_mask(
+                shape,
+                trajectory_xy,
+                seed,
+                bounds=bounds,
+                resolution=resolution,
+                p_mask=self.p_mask,
+                vehicle_radius_m=self.vehicle_radius_meters,
+                require_trajectory_clear=(self.mask_mode == "stage1_demo_valid"),
+                return_metadata=return_metadata,
+            )
         return generate_random_mask(
             shape,
-            self.mask_seed + int(idx) * 1_000_003 + variant * 15_485_863,
+            seed,
             trajectory_xy,
             p_mask=self.p_mask,
             require_trajectory_clear=(self.mask_mode == "stage1_demo_valid"),
@@ -2556,6 +2577,8 @@ class UnevenPathDataLoader(Dataset):
             'normal_z': normal_z,
             'encoded_input': encoded_input,
             'map_shape': map_tensor.shape[:2],
+            'bounds': map_bounds,
+            'resolution': map_resolution,
             'mask': map_mask,
         }
 
@@ -2705,6 +2728,8 @@ class UnevenPathDataLoader(Dataset):
                 env_static['map_shape'],
                 trajectory,
                 mask_variant=mask_variant,
+                bounds=env_static['bounds'],
+                resolution=env_static['resolution'],
                 return_metadata=True,
             )
             mask_source = "generated"

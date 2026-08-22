@@ -2012,7 +2012,7 @@ def trajectory_validity_metrics(
     analytic_curvature_audit=None,
     mask=None,
     signed_mask_distance_map=None,
-    d_safe=SAFETY_COST_CONFIG.d_safe_meters,
+    d_safe=SAFETY_COST_CONFIG.hard_stability_margin_meters,
     curvature_limit=SAFETY_COST_CONFIG.curvature_limit,
     boundary_safe_pixels=SAFETY_COST_CONFIG.boundary_safe_pixels,
     constraint_epsilon=SAFETY_COST_CONFIG.hard_constraint_epsilon,
@@ -2026,7 +2026,11 @@ def trajectory_validity_metrics(
     goal_yaw_tolerance_rad=SAFETY_COST_CONFIG.goal_yaw_tolerance_rad,
     condition_ids=None,
 ):
-    """按与特权 cost 相同的采样/坐标/阈值执行 hard validity。
+    """按与特权 cost 相同的采样与坐标执行 hard validity。
+
+    倾覆硬条件是稳定性余量严格大于 ``d_safe``。论文评价默认
+    ``hard_stability_margin_meters=0``：余量 > 0 即未倾覆。Stage 2 软代价
+    仍用 ``d_safe_meters``，搜索器也可另设规划余量。
 
     ``analytic_curvature`` 必须与稠密轨迹逐点对齐，用于积分统计。可选的
     ``analytic_curvature_audit`` 可以使用更密的解析采样；提供时，它决定
@@ -2106,7 +2110,7 @@ def trajectory_validity_metrics(
         dim=1,
     )
     box_violation = F.relu(-box_constraint_signed_distance)
-    stable = stability_violation.amax(dim=1) <= float(constraint_epsilon)
+    stable = stability.amin(dim=1) > float(d_safe)
     curvature_ok = hard_curvature_violation <= float(constraint_epsilon)
     box_component_ok = (
         box_constraint_signed_distance.amin(dim=1)

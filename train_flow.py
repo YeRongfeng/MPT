@@ -54,6 +54,15 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--mask_source",
+        choices=("uav", "legacy"),
+        default="uav",
+        help=(
+            "Stage 1 mask source: uav=continuous accumulated nadir-LiDAR "
+            "footprints plus local circular obstacles; legacy=old ellipses."
+        ),
+    )
+    parser.add_argument(
         "--max_contexts",
         type=int,
         default=None,
@@ -267,11 +276,6 @@ def validate_args(args):
             raise ValueError("--stage1_train_environments 必须为正数")
         if args.stage1_val_environments <= 0:
             raise ValueError("--stage1_val_environments 必须为正数")
-        if (
-            args.stage1_train_environments + args.stage1_val_environments
-            > MAP_CONFIG.expected_environments
-        ):
-            raise ValueError("Stage 1 训练/验证地形总数超过数据集地形数量")
     if args.stage1_endpoint_curvature_weight < 0.0:
         raise ValueError("--stage1_endpoint_curvature_weight 不能为负数")
     if not 0.0 < args.stage1_endpoint_curvature_tail_ratio <= 1.0:

@@ -19,6 +19,16 @@
 # Native and Python build products
 **/build/
 **/dist/
+baselines/t_hybrid_ws/devel/
+baselines/t_hybrid_ws/logs/
+baselines/t_hybrid_ws/runtime/
+baselines/uneven_planner_ws/build/
+baselines/uneven_planner_ws/devel/
+baselines/uneven_planner_ws/logs/
+baselines/uneven_planner_ws/runtime/
+baselines/ros_home/log/
+baselines/evaluation_results/**/*.pcd
+baselines/evaluation_results/**/*.map
 *.egg-info/
 *.o
 *.so
@@ -69,6 +79,7 @@ log.log
 *.pdf
 
 # Third-party local copies
+/baselines/third_party/
 /vision_transformer/
 /vit-pytorch/
 /pytorch-receptive-field/

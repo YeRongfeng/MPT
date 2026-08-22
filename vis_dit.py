@@ -23,6 +23,7 @@ from dataLoader_dit import (
     generate_random_mask,
     normalize_mask,
 )
+from uav_mask import generate_uav_observation_mask
 from map_config import (
     DENSE_TRAJECTORY_POINTS,
     MAP_BOUNDS,
@@ -433,6 +434,7 @@ def plot_elevation_map(
     split="val",
     critic=None,
     critic_metadata=None,
+    mask_source="uav",
 ):
     """绘制多组轨迹对比图
     
@@ -449,6 +451,11 @@ def plot_elevation_map(
         raise ValueError(
             "mask_mode 必须为 full、stage1 或 stage2，"
             f"实际为 {mask_mode!r}"
+        )
+    if mask_source not in ("uav", "legacy"):
+        raise ValueError(
+            "mask_source 必须为 uav 或 legacy，"
+            f"实际为 {mask_source!r}"
         )
     require_trajectory_clear = mask_mode != "stage2"
 
@@ -583,6 +590,18 @@ def plot_elevation_map(
                     map_mask, vehicle_radius_meters=vehicle_radius_meters
                 )
                 mask_metadata = {"accepted_type": "map_data"}
+            elif mask_source == "uav":
+                mask, mask_metadata = generate_uav_observation_mask(
+                    elevation.shape,
+                    trajectory[:, :2],
+                    mask_seed + int(pathNum) * 1_000_003,
+                    bounds=tuple(env.get("bounds", MAP_BOUNDS)),
+                    resolution=float(env.get("resolution", MAP_CONFIG.resolution)),
+                    p_mask=p_mask,
+                    vehicle_radius_m=float(vehicle_radius_meters),
+                    require_trajectory_clear=require_trajectory_clear,
+                    return_metadata=True,
+                )
             else:
                 mask, mask_metadata = generate_random_mask(
                     elevation.shape,
@@ -594,7 +613,7 @@ def plot_elevation_map(
                     return_metadata=True,
                 )
             print(
-                f"Mask path={pathNum} mode={mask_mode} "
+                f"Mask path={pathNum} mode={mask_mode} source={mask_source} "
                 f"type={mask_metadata.get('accepted_type', 'dataset')} "
                 f"masked={float(mask_metadata.get('masked_fraction', 1.0 - mask.mean())):.1%} "
                 "demo_blocked="
@@ -655,6 +674,10 @@ def plot_elevation_map(
         record = {
             "path": int(pathNum),
             "mask_mode": mask_mode,
+            "mask_source": mask_source,
+            "mask_semantics": mask_metadata.get(
+                "mask_generation_semantics", mask_metadata.get("semantic_mode", "unknown")
+            ),
             "num_samples": int(num_pred_paths),
             "masked_fraction": float(1.0 - mask.mean()),
             **box_metrics,
@@ -923,6 +946,12 @@ def plot_elevation_map(
         "split": str(split),
         "environment": envType,
         "mask_mode": mask_mode,
+        "mask_source": mask_source,
+        "mask_semantics": (
+            condition_records[0].get("mask_semantics", "unknown")
+            if condition_records
+            else "unknown"
+        ),
         "solver": solver,
         "num_steps": int(num_steps),
         "mask_seed": int(mask_seed),
@@ -1105,6 +1134,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--mask_source",
+        choices=("uav", "legacy"),
+        default="uav",
+        help=(
+            "uav=累积下视 LiDAR footprint + 独立局部障碍；"
+            "legacy=旧版椭圆随机 mask。"
+        ),
+    )
+    parser.add_argument(
         "--stage",
         type=int,
         choices=(1, 2),
@@ -1214,6 +1252,7 @@ if __name__ == "__main__":
         source_seed=args.source_seed,
         p_mask=p_mask,
         mask_mode=mask_mode,
+        mask_source=args.mask_source,
         solver=args.solver,
         num_steps=args.num_steps,
         device=device,

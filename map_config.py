@@ -107,6 +107,12 @@ class SafetyCostConfig:
     # 在 signed-distance medial axis 上提供极小确定性斜率，避免完全零梯度。
     mask_medial_axis_tiebreak_per_pixel: float = 1e-3
     d_safe_meters: float = 0.15
+    # Hard evaluation of capsizing: a pose is legal iff the signed stability
+    # margin is strictly greater than this value. The paper reports Feasible@1
+    # with 0, i.e. gravity still inside the support polygon.
+    hard_stability_margin_meters: float = 0.0
+    # Search/optimization planners may require extra clearance while planning.
+    planning_stability_margin_meters: float = 0.15
     softplus_alpha: float = 10.0
     # 车辆已确认的最大几何曲率，等价于约 0.476 m 的最小转弯半径。
     curvature_limit: float = 2.1
